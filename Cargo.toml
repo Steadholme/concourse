@@ -1,0 +1,35 @@
+[package]
+name = "concourse"
+version = "0.1.0"
+edition = "2021"
+description = "Concourse — one deployable hosting the HOLDFAST communication surfaces (chat / calendar / notifications / inbox) behind a Host-based vhost demux. Each surface keeps its own database, routes, subdomain and tokens; this binary just composes the four library crates so the estate runs one container instead of four. Klaxon stays reachable BOTH at notify.w33d.xyz (SSO console) and at the bare internal `klaxon` name (Bearer ingest from tempo/pulse/vitals)."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "concourse"
+path = "src/main.rs"
+
+[dependencies]
+# The four communication surfaces, vendored as path-dep library crates and reused VERBATIM (their
+# code, schemas, routes, templates and tests are unchanged). Concourse only adds the vhost demux,
+# so each surface behaves exactly as its standalone service did — Murmur keeps its WebSocket /ws,
+# Klaxon keeps its VAPID/webhook/SMTP egress + its own Bearer ingest, Almanac its calendar DB, and
+# Atrium read-only federates Murmur/Klaxon/Current.
+murmur = { path = "crates/murmur" }
+almanac = { path = "crates/almanac" }
+klaxon = { path = "crates/klaxon" }
+atrium = { path = "crates/atrium" }
+
+# HTTP framework — the outer Host-demux router + the per-surface routers returned by each crate's
+# `app()`. Same axum the surfaces use; Murmur's `ws` feature is unified in via its path dep, so the
+# WebSocket upgrade on chat.w33d.xyz/ws is carried by the demux oneshot unchanged.
+axum = "0.8"
+# Async runtime: connect/migrate the three owned Postgres stores at startup, start each surface's
+# audit emitter, then serve. `net` backs the dependency-free `healthcheck` subcommand's loopback
+# probe.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+# `ServiceExt::oneshot` drives the chosen per-surface Router for one request inside the demux.
+tower = { version = "0.5", features = ["util"] }
+# Structured logging (shared with the surfaces).
+tracing = "0.1"
+tracing-subscriber = "0.3"

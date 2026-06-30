@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Notifications · HOLDFAST Klaxon</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-reading">
+{{TOPBAR}}
+<main class="reader">
+  <div class="reader__head">
+    <div>
+      <h1 class="reader__title">Notifications<span class="count" data-zero="0">{{UNREAD}}</span></h1>
+      <p class="reader__sub">Alerts and updates from across the HOLDFAST estate.</p>
+    </div>
+    <div class="reader__actions">
+      {{MARK_ALL}}
+    </div>
+  </div>
+
+  <section class="prefs">
+    <div class="prefs__text">
+      <strong>Web Push</strong>
+      <span>Get desktop notifications in this browser. {{PUSH_STATE}}</span>
+    </div>
+    <div class="prefs__status">
+      <span id="push-msg"></span>
+      <button id="push-btn" class="btn btn-secondary btn-sm" type="button">Register this browser</button>
+    </div>
+  </section>
+
+  <div class="note-list">
+    {{ITEMS}}
+  </div>
+</main>
+
+<div id="live-toast" class="live-toast">
+  <span id="live-toast-text">New notification</span>
+  <a href="/">Refresh</a>
+</div>
+
+<script>
+(function () {
+  var CSRF = "{{CSRF}}";
+  var VAPID_PUBLIC = "{{VAPID_PUBLIC}}";
+
+  // ---- Live updates over SSE ------------------------------------------------
+  try {
+    var es = new EventSource("/api/stream");
+    es.addEventListener("notification", function (ev) {
+      var title = "New notification";
+      try { title = (JSON.parse(ev.data).title) || title; } catch (e) {}
+      var toast = document.getElementById("live-toast");
+      document.getElementById("live-toast-text").textContent = title;
+      toast.style.display = "flex";
+    });
+  } catch (e) { /* SSE unsupported — the page still works on reload */ }
+
+  // ---- Web Push registration ------------------------------------------------
+  var btn = document.getElementById("push-btn");
+  var msg = document.getElementById("push-msg");
+
+  function setMsg(t) { if (msg) msg.textContent = t; }
+
+  function urlB64ToUint8Array(base64String) {
+    var padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+    var base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+    var raw = atob(base64);
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; ++i) { out[i] = raw.charCodeAt(i); }
+    return out;
+  }
+
+  function b64(buf) {
+    var bytes = new Uint8Array(buf);
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) { bin += String.fromCharCode(bytes[i]); }
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+    if (btn) { btn.disabled = true; }
+    setMsg("Not supported in this browser");
+    return;
+  }
+  if (!VAPID_PUBLIC) {
+    if (btn) { btn.disabled = true; }
+    setMsg("Server push keys not configured");
+    return;
+  }
+
+  btn.addEventListener("click", function () {
+    btn.disabled = true;
+    setMsg("Registering…");
+    navigator.serviceWorker.register("/sw.js").then(function (reg) {
+      return Notification.requestPermission().then(function (perm) {
+        if (perm !== "granted") { throw new Error("permission " + perm); }
+        return reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlB64ToUint8Array(VAPID_PUBLIC)
+        });
+      });
+    }).then(function (sub) {
+      var json = sub.toJSON();
+      var body = new URLSearchParams();
+      body.set("csrf_token", CSRF);
+      body.set("endpoint", sub.endpoint);
+      body.set("p256dh", (json.keys && json.keys.p256dh) || b64(sub.getKey("p256dh")));
+      body.set("auth", (json.keys && json.keys.auth) || b64(sub.getKey("auth")));
+      return fetch("/api/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        credentials: "same-origin",
+        body: body.toString()
+      });
+    }).then(function () {
+      setMsg("This browser is registered");
+    }).catch(function (err) {
+      btn.disabled = false;
+      setMsg("Could not register: " + err.message);
+    });
+  });
+})();
+</script>
+</body>
+</html>

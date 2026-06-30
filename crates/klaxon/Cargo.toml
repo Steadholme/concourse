@@ -1,0 +1,51 @@
+[package]
+name = "klaxon"
+version = "0.1.0"
+edition = "2021"
+description = "Klaxon — notification & push fan-out hub for the HOLDFAST stack (internal ingest API + SSO notification inbox, live SSE stream, Web Push subscriptions)."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "klaxon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "klaxon"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP framework (shared with keystone/sanctum/inkwell): Form/State/Json extractors, SSE
+# responses, server-rendered HTML.
+axum = "0.8"
+# Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
+# PgStore drives sqlx natively, so a worker thread is NEVER blocked (no block_in_place, no
+# sync-over-async bridge). The audit emitter + the best-effort fan-out workers `tokio::spawn`.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "io-util", "time"] }
+# Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (same seam as the
+# rest of the estate; a fresh InMemoryStore drops in for tests).
+async-trait = "0.1"
+# Deserialize the ingest JSON envelope + the HTML form bodies; serialize notifications for the
+# JSON ingest response and the SSE data frames.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ergonomic error enums -> HTTP shape.
+thiserror = "2"
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Epoch -> UTC components for the inbox timestamps (std only — no extra C deps).
+time = { version = "0.3", default-features = false, features = ["std"] }
+# CSPRNG (OsRng) for notification ids + the double-submit CSRF token. rand 0.8 lineage matches
+# the rest of the estate (keystone/sanctum/cellar).
+rand = "0.8"
+# Stateful async generator for the `/api/stream` Server-Sent-Events poller. Pure Rust
+# (futures-core only) — no OpenSSL, no extra runtime.
+async-stream = "0.3"
+# Portable PostgreSQL data layer. Runtime queries only (sqlx::query/Row) — NO compile-time
+# macros, so the build needs NO database. rustls TLS (ring) — no openssl. The same standard SQL
+# later runs unchanged on FusionDB over pgwire.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the Router in-process for the end-to-end tests (no port bind).
+tower = { version = "0.5", features = ["util"] }

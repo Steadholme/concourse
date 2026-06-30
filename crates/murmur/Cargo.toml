@@ -1,0 +1,53 @@
+[package]
+name = "murmur"
+version = "0.1.0"
+edition = "2021"
+description = "Murmur — real-time team chat / IM server for the HOLDFAST stack."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "murmur"
+path = "src/lib.rs"
+
+[[bin]]
+name = "murmur"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP framework (shared with keystone/inkwell/sanctum). The `ws` feature pulls in the
+# `axum::extract::ws` WebSocket upgrade used by `GET /ws` for the live message stream.
+axum = { version = "0.8", features = ["ws"] }
+# Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
+# PgStore drives sqlx natively, so a worker thread is NEVER blocked (no sync-over-async bridge).
+# `sync` brings in `broadcast`/`mpsc` for the in-process fan-out hub + the non-blocking audit sink.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (handlers depend
+# only on the trait, exactly like the inkwell/sanctum seam).
+async-trait = "0.1"
+# Deserialize the JSON request bodies (create room / send message).
+serde = { version = "1", features = ["derive"] }
+# Serialize message/presence frames for the WS hub + the JSON API responses.
+serde_json = "1"
+# Ergonomic error/store enums -> JSON error envelope.
+thiserror = "2"
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Epoch -> UTC clock components for the timeline timestamps (std only — no C deps). Same crate
+# the rest of the estate pins.
+time = { version = "0.3", default-features = false, features = ["std"] }
+# CSPRNG bytes for the double-submit CSRF token + message/room ids. `getrandom` is a tiny
+# libc-backed shim, and `hex` (already used by watchtower) encodes the bytes.
+getrandom = "0.2"
+hex = "0.4"
+# Split the WebSocket into a Sink/Stream pair so the send loop (broadcast fan-out) and the
+# receive loop (client close/keepalive) run concurrently over one socket.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# Portable PostgreSQL data layer. Runtime queries only (sqlx::query/Row) — NO compile-time
+# macros, so the build needs NO database. rustls TLS (no openssl). Standard SQL only, so the
+# same statements later run unchanged on FusionDB over pgwire.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the Router in-process for the end-to-end tests (no port bind).
+tower = { version = "0.5", features = ["util"] }

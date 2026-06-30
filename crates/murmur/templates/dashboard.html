@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Murmur · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-chat">
+{{TOPBAR}}
+<main class="chat">
+  <aside class="sidebar">
+    <div class="sidebar__head">
+      <h1 class="sidebar__title">Rooms</h1>
+      <button id="new-room" class="btn btn-secondary btn-sm" type="button">New</button>
+    </div>
+    <ul id="room-list" class="room-list">
+      {{ROOMS}}
+    </ul>
+  </aside>
+  <section class="room-view">
+    <header class="room-view__head">
+      <h2 id="room-title" class="room-view__title">{{ROOM_TITLE}}</h2>
+      <span id="presence" class="room-view__presence"></span>
+    </header>
+    <div id="timeline" class="timeline">
+      {{MESSAGES}}
+    </div>
+    <form id="composer" class="composer" autocomplete="off">
+      <textarea id="composer-input" class="composer__input" rows="1" maxlength="8192"
+        placeholder="Message {{ROOM_TITLE}}&hellip;"></textarea>
+      <button class="btn btn-primary" type="submit">Send</button>
+    </form>
+  </section>
+</main>
+<script>
+  window.MURMUR = {
+    csrf: "{{CSRF}}",
+    me: "{{ME}}",
+    selected: "{{SELECTED}}"
+  };
+</script>
+<script>{{JS}}</script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Atrium · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-app">
+{{TOPBAR}}
+<main class="shell">
+  <div class="shell__head">
+    <div>
+      <h1 class="shell__title">Activity inbox</h1>
+      <p class="shell__sub">Everything new across the keep — chat, notifications, and your feeds in one pane.</p>
+    </div>
+  </div>
+
+  {{SUMMARY}}
+
+  <div class="columns">
+    {{CHAT}}
+    {{NOTIFS}}
+    {{FEED}}
+  </div>
+
+  <nav class="quicklinks" aria-label="Quick links">
+    <span class="quicklinks__label">Jump to</span>
+    <a class="quicklinks__link" href="https://mail.w33d.xyz">Mail</a>
+    <a class="quicklinks__link" href="https://forum.w33d.xyz">Forum</a>
+    <a class="quicklinks__link" href="https://wiki.w33d.xyz">Wiki</a>
+    <a class="quicklinks__link" href="https://w33d.xyz">Home</a>
+  </nav>
+</main>
+</body>
+</html>

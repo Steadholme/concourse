@@ -1,0 +1,564 @@
+//! Chat storage: rooms, memberships, messages.
+//!
+//! `Store` is a small async trait with an in-memory and a PostgreSQL implementation, mirroring
+//! the inkwell/sanctum seam: handlers depend only on the trait, so a FusionDB-backed store can
+//! drop in later. The PostgreSQL layer uses ONLY portable standard SQL (TEXT/BIGINT,
+//! PK/UNIQUE/NOT NULL/DEFAULT, `INSERT … ON CONFLICT DO NOTHING`, parameterized queries, a
+//! `CREATE INDEX`) and runtime queries (no compile-time macros), so the build needs NO database
+//! and the same statements later run unchanged on FusionDB over pgwire.
+//!
+//! The methods are `async`: the axum handlers `.await` them directly on the serving runtime, and
+//! `PgStore` drives sqlx natively — there is NO `block_in_place` and NO sync-over-async bridge,
+//! so a DB round-trip never blocks a worker thread. The pinned schema (read read-only by Atrium)
+//! is reproduced EXACTLY in [`PgStore::migrate`].
+
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use serde::Serialize;
+use thiserror::Error;
+
+/// A chat room (maps 1:1 to a `rooms` row).
+#[derive(Clone, Debug, Serialize)]
+pub struct Room {
+    pub id: String,
+    pub name: String,
+    /// `room` (default) or `dm`.
+    pub kind: String,
+    pub created_by: String,
+    pub created_at: i64,
+}
+
+/// A room the requesting user is a member of, with that membership's read cursor.
+#[derive(Clone, Debug, Serialize)]
+pub struct UserRoom {
+    #[serde(flatten)]
+    pub room: Room,
+    pub last_read_at: i64,
+}
+
+/// A chat message (maps 1:1 to a `messages` row).
+#[derive(Clone, Debug, Serialize)]
+pub struct Message {
+    pub id: String,
+    pub room_id: String,
+    pub sender_sub: String,
+    pub sender_email: String,
+    pub body: String,
+    pub created_at: i64,
+}
+
+/// Storage failure surfaced to the handler layer (always maps to a 500 — there are no
+/// user-facing conflicts: room create + join are idempotent).
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("store error: {0}")]
+    Backend(String),
+}
+
+/// Pluggable chat store.
+#[async_trait]
+pub trait Store: Send + Sync {
+    /// Create a room if one with this id does not already exist (idempotent — used for the
+    /// auto-provisioned lobby and for user-created rooms).
+    async fn ensure_room(&self, room: &Room) -> Result<(), StoreError>;
+    /// One room by id.
+    async fn get_room(&self, id: &str) -> Option<Room>;
+    /// Rooms the user is a member of, oldest-created first (so the lobby leads), with each
+    /// membership's `last_read_at`. Capped at [`crate::config::ROOM_LIST_LIMIT`].
+    async fn list_user_rooms(&self, user_sub: &str) -> Vec<UserRoom>;
+    /// Add a membership if one does not already exist (idempotent join).
+    async fn ensure_membership(
+        &self,
+        room_id: &str,
+        user_sub: &str,
+        user_email: &str,
+        joined_at: i64,
+    ) -> Result<(), StoreError>;
+    /// Whether `user_sub` is a member of `room_id`.
+    async fn is_member(&self, room_id: &str, user_sub: &str) -> bool;
+    /// Advance a membership's read cursor (no-op if not a member).
+    async fn update_last_read(
+        &self,
+        room_id: &str,
+        user_sub: &str,
+        last_read_at: i64,
+    ) -> Result<(), StoreError>;
+    /// Recent messages in a room, NEWEST-first. When `before` is `Some`, only messages strictly
+    /// older than that `created_at` are returned (keyset pagination). Capped at `limit`.
+    async fn list_messages(&self, room_id: &str, before: Option<i64>, limit: i64) -> Vec<Message>;
+    /// Insert a new message.
+    async fn create_message(&self, message: &Message) -> Result<(), StoreError>;
+}
+
+// --------------------------------------------------------------------------------------
+// In-memory store (the default; keeps the whole service database-free for dev + tests).
+// --------------------------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct InMemoryStore {
+    rooms: Mutex<Vec<Room>>,
+    memberships: Mutex<Vec<MembershipRow>>,
+    messages: Mutex<Vec<Message>>,
+}
+
+/// In-memory membership row (the PK is `(room_id, user_sub)`).
+#[derive(Clone, Debug)]
+struct MembershipRow {
+    room_id: String,
+    user_sub: String,
+    #[allow(dead_code)]
+    user_email: String,
+    #[allow(dead_code)]
+    joined_at: i64,
+    last_read_at: i64,
+}
+
+impl InMemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl Store for InMemoryStore {
+    // The std `Mutex` is fine throughout: each critical section is fully synchronous (no `.await`
+    // inside), so a guard is never held across a yield point.
+    async fn ensure_room(&self, room: &Room) -> Result<(), StoreError> {
+        let mut rooms = self.rooms.lock().expect("rooms lock poisoned");
+        if !rooms.iter().any(|r| r.id == room.id) {
+            rooms.push(room.clone());
+        }
+        Ok(())
+    }
+
+    async fn get_room(&self, id: &str) -> Option<Room> {
+        self.rooms
+            .lock()
+            .expect("rooms lock poisoned")
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+    }
+
+    async fn list_user_rooms(&self, user_sub: &str) -> Vec<UserRoom> {
+        let memberships = self.memberships.lock().expect("memberships lock poisoned");
+        let rooms = self.rooms.lock().expect("rooms lock poisoned");
+        let mut out: Vec<UserRoom> = memberships
+            .iter()
+            .filter(|m| m.user_sub == user_sub)
+            .filter_map(|m| {
+                rooms.iter().find(|r| r.id == m.room_id).map(|r| UserRoom {
+                    room: r.clone(),
+                    last_read_at: m.last_read_at,
+                })
+            })
+            .collect();
+        // Oldest-created room first (the lobby is created first), ties broken by id for stability.
+        out.sort_by(|a, b| {
+            a.room
+                .created_at
+                .cmp(&b.room.created_at)
+                .then_with(|| a.room.id.cmp(&b.room.id))
+        });
+        out.truncate(crate::config::ROOM_LIST_LIMIT as usize);
+        out
+    }
+
+    async fn ensure_membership(
+        &self,
+        room_id: &str,
+        user_sub: &str,
+        user_email: &str,
+        joined_at: i64,
+    ) -> Result<(), StoreError> {
+        let mut memberships = self.memberships.lock().expect("memberships lock poisoned");
+        if !memberships
+            .iter()
+            .any(|m| m.room_id == room_id && m.user_sub == user_sub)
+        {
+            memberships.push(MembershipRow {
+                room_id: room_id.to_string(),
+                user_sub: user_sub.to_string(),
+                user_email: user_email.to_string(),
+                joined_at,
+                last_read_at: 0,
+            });
+        }
+        Ok(())
+    }
+
+    async fn is_member(&self, room_id: &str, user_sub: &str) -> bool {
+        self.memberships
+            .lock()
+            .expect("memberships lock poisoned")
+            .iter()
+            .any(|m| m.room_id == room_id && m.user_sub == user_sub)
+    }
+
+    async fn update_last_read(
+        &self,
+        room_id: &str,
+        user_sub: &str,
+        last_read_at: i64,
+    ) -> Result<(), StoreError> {
+        let mut memberships = self.memberships.lock().expect("memberships lock poisoned");
+        if let Some(m) = memberships
+            .iter_mut()
+            .find(|m| m.room_id == room_id && m.user_sub == user_sub)
+        {
+            // Read cursors only move forward.
+            if last_read_at > m.last_read_at {
+                m.last_read_at = last_read_at;
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_messages(&self, room_id: &str, before: Option<i64>, limit: i64) -> Vec<Message> {
+        let messages = self.messages.lock().expect("messages lock poisoned");
+        let mut v: Vec<Message> = messages
+            .iter()
+            .filter(|m| m.room_id == room_id)
+            .filter(|m| before.is_none_or(|b| m.created_at < b))
+            .cloned()
+            .collect();
+        // Newest-first; ties broken by id so output is stable + keyset-safe.
+        v.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        v.truncate(limit.max(0) as usize);
+        v
+    }
+
+    async fn create_message(&self, message: &Message) -> Result<(), StoreError> {
+        self.messages
+            .lock()
+            .expect("messages lock poisoned")
+            .push(message.clone());
+        Ok(())
+    }
+}
+
+// --------------------------------------------------------------------------------------
+// PostgreSQL-backed store (portable: standard SQL, runtime queries, no macros).
+// --------------------------------------------------------------------------------------
+//
+// Selected at runtime by `MURMUR_STORE=postgres`. Each method drives sqlx natively and the
+// handlers `.await` it on the serving runtime — NO `block_in_place`, NO sync-over-async. Joins
+// and room creates are idempotent via `ON CONFLICT DO NOTHING`, so no in-process serializer is
+// needed.
+
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::Row;
+
+/// PostgreSQL-backed [`Store`]. Holds just a `PgPool`.
+pub struct PgStore {
+    pool: PgPool,
+}
+
+impl PgStore {
+    /// Open a pooled connection. Async; call from within a Tokio runtime.
+    pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(database_url)
+            .await?;
+        Ok(Self::from_pool(pool))
+    }
+
+    /// Construct from an existing pool.
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Idempotent, portable migration. Standard SQL only — safe to run on every startup. The
+    /// table/column names match the PINNED schema exactly (Atrium reads them read-only).
+    pub async fn migrate(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS rooms (\
+                 id TEXT PRIMARY KEY, \
+                 name TEXT NOT NULL, \
+                 kind TEXT NOT NULL DEFAULT 'room', \
+                 created_by TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS memberships (\
+                 room_id TEXT NOT NULL, \
+                 user_sub TEXT NOT NULL, \
+                 user_email TEXT NOT NULL DEFAULT '', \
+                 joined_at BIGINT NOT NULL, \
+                 last_read_at BIGINT NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (room_id, user_sub)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS messages (\
+                 id TEXT PRIMARY KEY, \
+                 room_id TEXT NOT NULL, \
+                 sender_sub TEXT NOT NULL, \
+                 sender_email TEXT NOT NULL DEFAULT '', \
+                 body TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Backs the per-room newest-first timeline scan + keyset pagination.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_room_created \
+             ON messages (room_id, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Backs the "rooms this user belongs to" lookup.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships (user_sub)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn room_from_row(row: &sqlx::postgres::PgRow) -> Result<Room, sqlx::Error> {
+        Ok(Room {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            kind: row.try_get("kind")?,
+            created_by: row.try_get("created_by")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn message_from_row(row: &sqlx::postgres::PgRow) -> Result<Message, sqlx::Error> {
+        Ok(Message {
+            id: row.try_get("id")?,
+            room_id: row.try_get("room_id")?,
+            sender_sub: row.try_get("sender_sub")?,
+            sender_email: row.try_get("sender_email")?,
+            body: row.try_get("body")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    async fn ensure_room_async(&self, room: &Room) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO rooms (id, name, kind, created_by, created_at) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&room.id)
+        .bind(&room.name)
+        .bind(&room.kind)
+        .bind(&room.created_by)
+        .bind(room.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_room_async(&self, id: &str) -> Result<Option<Room>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, name, kind, created_by, created_at FROM rooms WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some(Self::room_from_row(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_user_rooms_async(&self, user_sub: &str) -> Result<Vec<UserRoom>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT r.id, r.name, r.kind, r.created_by, r.created_at, m.last_read_at \
+             FROM rooms r JOIN memberships m ON m.room_id = r.id \
+             WHERE m.user_sub = $1 \
+             ORDER BY r.created_at ASC, r.id ASC LIMIT $2",
+        )
+        .bind(user_sub)
+        .bind(crate::config::ROOM_LIST_LIMIT)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(UserRoom {
+                    room: Self::room_from_row(r)?,
+                    last_read_at: r.try_get("last_read_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn ensure_membership_async(
+        &self,
+        room_id: &str,
+        user_sub: &str,
+        user_email: &str,
+        joined_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO memberships (room_id, user_sub, user_email, joined_at, last_read_at) \
+             VALUES ($1, $2, $3, $4, 0) ON CONFLICT (room_id, user_sub) DO NOTHING",
+        )
+        .bind(room_id)
+        .bind(user_sub)
+        .bind(user_email)
+        .bind(joined_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn is_member_async(&self, room_id: &str, user_sub: &str) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT 1 AS one FROM memberships WHERE room_id = $1 AND user_sub = $2",
+        )
+        .bind(room_id)
+        .bind(user_sub)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    async fn update_last_read_async(
+        &self,
+        room_id: &str,
+        user_sub: &str,
+        last_read_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        // Read cursors only move forward (GREATEST keeps an out-of-order update harmless).
+        sqlx::query(
+            "UPDATE memberships SET last_read_at = $1 \
+             WHERE room_id = $2 AND user_sub = $3 AND $1 > last_read_at",
+        )
+        .bind(last_read_at)
+        .bind(room_id)
+        .bind(user_sub)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_messages_async(
+        &self,
+        room_id: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        // `before` is folded into one statement: a sentinel of i64::MAX means "no cursor", so the
+        // predicate `created_at < $2` always passes for the first page. Keeps the SQL portable
+        // (no dynamic string building).
+        let cursor = before.unwrap_or(i64::MAX);
+        let rows = sqlx::query(
+            "SELECT id, room_id, sender_sub, sender_email, body, created_at \
+             FROM messages WHERE room_id = $1 AND created_at < $2 \
+             ORDER BY created_at DESC, id DESC LIMIT $3",
+        )
+        .bind(room_id)
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::message_from_row).collect()
+    }
+
+    async fn create_message_async(&self, m: &Message) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_sub, sender_email, body, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&m.id)
+        .bind(&m.room_id)
+        .bind(&m.sender_sub)
+        .bind(&m.sender_email)
+        .bind(&m.body)
+        .bind(m.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Store for PgStore {
+    async fn ensure_room(&self, room: &Room) -> Result<(), StoreError> {
+        self.ensure_room_async(room)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_room(&self, id: &str) -> Option<Room> {
+        self.get_room_async(id).await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg get_room failed");
+            None
+        })
+    }
+
+    async fn list_user_rooms(&self, user_sub: &str) -> Vec<UserRoom> {
+        self.list_user_rooms_async(user_sub)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_user_rooms failed");
+                Vec::new()
+            })
+    }
+
+    async fn ensure_membership(
+        &self,
+        room_id: &str,
+        user_sub: &str,
+        user_email: &str,
+        joined_at: i64,
+    ) -> Result<(), StoreError> {
+        self.ensure_membership_async(room_id, user_sub, user_email, joined_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn is_member(&self, room_id: &str, user_sub: &str) -> bool {
+        self.is_member_async(room_id, user_sub)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg is_member failed");
+                false
+            })
+    }
+
+    async fn update_last_read(
+        &self,
+        room_id: &str,
+        user_sub: &str,
+        last_read_at: i64,
+    ) -> Result<(), StoreError> {
+        self.update_last_read_async(room_id, user_sub, last_read_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_messages(&self, room_id: &str, before: Option<i64>, limit: i64) -> Vec<Message> {
+        self.list_messages_async(room_id, before, limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_messages failed");
+                Vec::new()
+            })
+    }
+
+    async fn create_message(&self, message: &Message) -> Result<(), StoreError> {
+        self.create_message_async(message)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+}

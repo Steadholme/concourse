@@ -27,6 +27,21 @@ pub struct Room {
     pub kind: String,
     pub created_by: String,
     pub created_at: i64,
+    /// Admin soft-archive flag. An archived room drops out of users' room lists (it is inert),
+    /// but its row/history is retained. Distinct from a hard `delete_room`.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// A room member as surfaced to the admin membership panel (one `memberships` row).
+#[derive(Clone, Debug, Serialize)]
+pub struct Member {
+    pub user_sub: String,
+    pub user_email: String,
+    /// Admin ban flag: a banned member keeps their row but is treated as a non-member (cannot
+    /// read/post), and re-joining does not clear it.
+    pub banned: bool,
+    pub joined_at: i64,
 }
 
 /// A room the requesting user is a member of, with that membership's read cursor.
@@ -102,6 +117,24 @@ pub trait Store: Send + Sync {
     /// Soft-delete a message: mark it deleted and clear the stored body. No-op on a missing
     /// message. Idempotent.
     async fn delete_message(&self, id: &str) -> Result<(), StoreError>;
+
+    // --- admin panel -------------------------------------------------------
+    /// ALL rooms in the system, newest-created first (admin room list; includes archived).
+    async fn list_all_rooms(&self) -> Vec<Room>;
+    /// Set a room's archived flag (idempotent). Archived rooms drop out of users' room lists.
+    async fn set_room_archived(&self, room_id: &str, archived: bool) -> Result<(), StoreError>;
+    /// Hard-delete a room and ALL of its memberships + messages (admin, irreversible). Idempotent.
+    async fn delete_room(&self, room_id: &str) -> Result<(), StoreError>;
+    /// Every membership of a room (admin membership control), oldest-joined first.
+    async fn list_room_members(&self, room_id: &str) -> Vec<Member>;
+    /// Remove a membership outright (admin kick). No-op when absent. Idempotent.
+    async fn remove_member(&self, room_id: &str, user_sub: &str) -> Result<(), StoreError>;
+    /// Ban a member: keep the row but set `banned`, so they can no longer read/post and a
+    /// re-join cannot clear it. No-op when absent. Idempotent.
+    async fn ban_member(&self, room_id: &str, user_sub: &str) -> Result<(), StoreError>;
+    /// Redact ANY message (admin overrides ownership): soft-delete it and replace the body with
+    /// the fixed [`crate::config::REDACTED_BODY`] tombstone. No-op on a missing message. Idempotent.
+    async fn redact_message(&self, id: &str) -> Result<(), StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -120,11 +153,11 @@ pub struct InMemoryStore {
 struct MembershipRow {
     room_id: String,
     user_sub: String,
-    #[allow(dead_code)]
     user_email: String,
-    #[allow(dead_code)]
     joined_at: i64,
     last_read_at: i64,
+    /// Admin ban flag (see [`Member::banned`]).
+    banned: bool,
 }
 
 impl InMemoryStore {
@@ -159,12 +192,17 @@ impl Store for InMemoryStore {
         let rooms = self.rooms.lock().expect("rooms lock poisoned");
         let mut out: Vec<UserRoom> = memberships
             .iter()
-            .filter(|m| m.user_sub == user_sub)
+            // A banned membership is inert — the room disappears from that user's list.
+            .filter(|m| m.user_sub == user_sub && !m.banned)
             .filter_map(|m| {
-                rooms.iter().find(|r| r.id == m.room_id).map(|r| UserRoom {
-                    room: r.clone(),
-                    last_read_at: m.last_read_at,
-                })
+                // An archived room drops out of the active room list.
+                rooms
+                    .iter()
+                    .find(|r| r.id == m.room_id && !r.archived)
+                    .map(|r| UserRoom {
+                        room: r.clone(),
+                        last_read_at: m.last_read_at,
+                    })
             })
             .collect();
         // Oldest-created room first (the lobby is created first), ties broken by id for stability.
@@ -196,17 +234,19 @@ impl Store for InMemoryStore {
                 user_email: user_email.to_string(),
                 joined_at,
                 last_read_at: 0,
+                banned: false,
             });
         }
         Ok(())
     }
 
     async fn is_member(&self, room_id: &str, user_sub: &str) -> bool {
+        // A banned membership does NOT authorize: the user is treated as a non-member.
         self.memberships
             .lock()
             .expect("memberships lock poisoned")
             .iter()
-            .any(|m| m.room_id == room_id && m.user_sub == user_sub)
+            .any(|m| m.room_id == room_id && m.user_sub == user_sub && !m.banned)
     }
 
     async fn update_last_read(
@@ -280,6 +320,93 @@ impl Store for InMemoryStore {
         if let Some(m) = messages.iter_mut().find(|m| m.id == id) {
             m.deleted = true;
             m.body = String::new();
+        }
+        Ok(())
+    }
+
+    async fn list_all_rooms(&self) -> Vec<Room> {
+        let mut out: Vec<Room> = self
+            .rooms
+            .lock()
+            .expect("rooms lock poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        // Newest-created first, ties broken by id for a stable admin ordering.
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        out
+    }
+
+    async fn set_room_archived(&self, room_id: &str, archived: bool) -> Result<(), StoreError> {
+        let mut rooms = self.rooms.lock().expect("rooms lock poisoned");
+        if let Some(r) = rooms.iter_mut().find(|r| r.id == room_id) {
+            r.archived = archived;
+        }
+        Ok(())
+    }
+
+    async fn delete_room(&self, room_id: &str) -> Result<(), StoreError> {
+        self.rooms
+            .lock()
+            .expect("rooms lock poisoned")
+            .retain(|r| r.id != room_id);
+        self.memberships
+            .lock()
+            .expect("memberships lock poisoned")
+            .retain(|m| m.room_id != room_id);
+        self.messages
+            .lock()
+            .expect("messages lock poisoned")
+            .retain(|m| m.room_id != room_id);
+        Ok(())
+    }
+
+    async fn list_room_members(&self, room_id: &str) -> Vec<Member> {
+        let mut out: Vec<Member> = self
+            .memberships
+            .lock()
+            .expect("memberships lock poisoned")
+            .iter()
+            .filter(|m| m.room_id == room_id)
+            .map(|m| Member {
+                user_sub: m.user_sub.clone(),
+                user_email: m.user_email.clone(),
+                banned: m.banned,
+                joined_at: m.joined_at,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.joined_at
+                .cmp(&b.joined_at)
+                .then_with(|| a.user_sub.cmp(&b.user_sub))
+        });
+        out
+    }
+
+    async fn remove_member(&self, room_id: &str, user_sub: &str) -> Result<(), StoreError> {
+        self.memberships
+            .lock()
+            .expect("memberships lock poisoned")
+            .retain(|m| !(m.room_id == room_id && m.user_sub == user_sub));
+        Ok(())
+    }
+
+    async fn ban_member(&self, room_id: &str, user_sub: &str) -> Result<(), StoreError> {
+        let mut memberships = self.memberships.lock().expect("memberships lock poisoned");
+        if let Some(m) = memberships
+            .iter_mut()
+            .find(|m| m.room_id == room_id && m.user_sub == user_sub)
+        {
+            m.banned = true;
+        }
+        Ok(())
+    }
+
+    async fn redact_message(&self, id: &str) -> Result<(), StoreError> {
+        let mut messages = self.messages.lock().expect("messages lock poisoned");
+        if let Some(m) = messages.iter_mut().find(|m| m.id == id) {
+            m.deleted = true;
+            m.body = crate::config::REDACTED_BODY.to_string();
         }
         Ok(())
     }
@@ -371,6 +498,19 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
 
+        // Admin panel columns. Added idempotently so an existing schema upgrades in place
+        // (portable ALTER — defaults backfill old rows, no data migration).
+        sqlx::query(
+            "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE memberships ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Backs the per-room newest-first timeline scan + keyset pagination.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_messages_room_created \
@@ -394,6 +534,16 @@ impl PgStore {
             kind: row.try_get("kind")?,
             created_by: row.try_get("created_by")?,
             created_at: row.try_get("created_at")?,
+            archived: row.try_get("archived")?,
+        })
+    }
+
+    fn member_from_row(row: &sqlx::postgres::PgRow) -> Result<Member, sqlx::Error> {
+        Ok(Member {
+            user_sub: row.try_get("user_sub")?,
+            user_email: row.try_get("user_email")?,
+            banned: row.try_get("banned")?,
+            joined_at: row.try_get("joined_at")?,
         })
     }
 
@@ -412,14 +562,15 @@ impl PgStore {
 
     async fn ensure_room_async(&self, room: &Room) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO rooms (id, name, kind, created_by, created_at) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO rooms (id, name, kind, created_by, created_at, archived) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
         )
         .bind(&room.id)
         .bind(&room.name)
         .bind(&room.kind)
         .bind(&room.created_by)
         .bind(room.created_at)
+        .bind(room.archived)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -427,7 +578,7 @@ impl PgStore {
 
     async fn get_room_async(&self, id: &str) -> Result<Option<Room>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, name, kind, created_by, created_at FROM rooms WHERE id = $1",
+            "SELECT id, name, kind, created_by, created_at, archived FROM rooms WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -440,9 +591,9 @@ impl PgStore {
 
     async fn list_user_rooms_async(&self, user_sub: &str) -> Result<Vec<UserRoom>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT r.id, r.name, r.kind, r.created_by, r.created_at, m.last_read_at \
+            "SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.archived, m.last_read_at \
              FROM rooms r JOIN memberships m ON m.room_id = r.id \
-             WHERE m.user_sub = $1 \
+             WHERE m.user_sub = $1 AND m.banned = FALSE AND r.archived = FALSE \
              ORDER BY r.created_at ASC, r.id ASC LIMIT $2",
         )
         .bind(user_sub)
@@ -481,7 +632,8 @@ impl PgStore {
 
     async fn is_member_async(&self, room_id: &str, user_sub: &str) -> Result<bool, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT 1 AS one FROM memberships WHERE room_id = $1 AND user_sub = $2",
+            "SELECT 1 AS one FROM memberships \
+             WHERE room_id = $1 AND user_sub = $2 AND banned = FALSE",
         )
         .bind(room_id)
         .bind(user_sub)
@@ -591,6 +743,89 @@ impl PgStore {
             .await?;
         Ok(())
     }
+
+    async fn list_all_rooms_async(&self) -> Result<Vec<Room>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, name, kind, created_by, created_at, archived FROM rooms \
+             ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::room_from_row).collect()
+    }
+
+    async fn set_room_archived_async(
+        &self,
+        room_id: &str,
+        archived: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE rooms SET archived = $1 WHERE id = $2")
+            .bind(archived)
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_room_async(&self, room_id: &str) -> Result<(), sqlx::Error> {
+        // Hard delete: messages + memberships first, then the room row. Portable, no FK cascade.
+        sqlx::query("DELETE FROM messages WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM memberships WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM rooms WHERE id = $1")
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_room_members_async(&self, room_id: &str) -> Result<Vec<Member>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT user_sub, user_email, banned, joined_at FROM memberships \
+             WHERE room_id = $1 ORDER BY joined_at ASC, user_sub ASC",
+        )
+        .bind(room_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::member_from_row).collect()
+    }
+
+    async fn remove_member_async(
+        &self,
+        room_id: &str,
+        user_sub: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM memberships WHERE room_id = $1 AND user_sub = $2")
+            .bind(room_id)
+            .bind(user_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn ban_member_async(&self, room_id: &str, user_sub: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE memberships SET banned = TRUE WHERE room_id = $1 AND user_sub = $2")
+            .bind(room_id)
+            .bind(user_sub)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn redact_message_async(&self, id: &str) -> Result<(), sqlx::Error> {
+        // Redact ANY message: soft-delete + replace the body with the moderator tombstone.
+        sqlx::query("UPDATE messages SET deleted = TRUE, body = $1 WHERE id = $2")
+            .bind(crate::config::REDACTED_BODY)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -679,6 +914,52 @@ impl Store for PgStore {
 
     async fn delete_message(&self, id: &str) -> Result<(), StoreError> {
         self.delete_message_async(id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_all_rooms(&self) -> Vec<Room> {
+        self.list_all_rooms_async().await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg list_all_rooms failed");
+            Vec::new()
+        })
+    }
+
+    async fn set_room_archived(&self, room_id: &str, archived: bool) -> Result<(), StoreError> {
+        self.set_room_archived_async(room_id, archived)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_room(&self, room_id: &str) -> Result<(), StoreError> {
+        self.delete_room_async(room_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_room_members(&self, room_id: &str) -> Vec<Member> {
+        self.list_room_members_async(room_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_room_members failed");
+                Vec::new()
+            })
+    }
+
+    async fn remove_member(&self, room_id: &str, user_sub: &str) -> Result<(), StoreError> {
+        self.remove_member_async(room_id, user_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn ban_member(&self, room_id: &str, user_sub: &str) -> Result<(), StoreError> {
+        self.ban_member_async(room_id, user_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn redact_message(&self, id: &str) -> Result<(), StoreError> {
+        self.redact_message_async(id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }

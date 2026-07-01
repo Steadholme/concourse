@@ -59,6 +59,47 @@ pub fn require_user(headers: &HeaderMap) -> Result<(String, String), AppError> {
     Ok((sub, email))
 }
 
+/// Group names that authorize the `/admin` panel. Membership in ANY of these unlocks it.
+pub const ADMIN_GROUPS: &[&str] = &["admins", "infra-admins"];
+
+/// The authenticated user's groups, parsed from the comma-separated `X-Auth-Groups` header
+/// (injected AND HMAC-verified by the gateway, so it is trustworthy). Empty when absent/blank.
+pub fn author_groups(headers: &HeaderMap) -> Vec<String> {
+    header_value(headers, HEADER_GROUPS)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the authenticated user belongs to `group` (exact match against `X-Auth-Groups`).
+pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
+    author_groups(headers).iter().any(|g| g == group)
+}
+
+/// Whether the authenticated user is in ANY [`ADMIN_GROUPS`] entry.
+pub fn is_admin(headers: &HeaderMap) -> bool {
+    let groups = author_groups(headers);
+    ADMIN_GROUPS.iter().any(|a| groups.iter().any(|g| g == a))
+}
+
+/// Require admin group membership for an `/admin` action. `Forbidden` (403) when the
+/// authenticated user carries no admin group — an ordinary signed-in user gets 403 and never
+/// sees the panel. `admin` overrides ownership: it does NOT consult `created_by`.
+pub fn require_admin(headers: &HeaderMap) -> Result<(), AppError> {
+    if is_admin(headers) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "admin panel requires an admin group".to_string(),
+        ))
+    }
+}
+
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -190,6 +231,21 @@ pub fn ensure_csrf(headers: &HeaderMap) -> (String, Option<String>) {
 /// Double-submit check: the `X-CSRF-Token` header must equal the `__Host-csrf` cookie.
 pub fn verify_csrf(headers: &HeaderMap) -> Result<(), AppError> {
     let submitted = header_value(headers, HEADER_CSRF).unwrap_or_default();
+    let ok = match get_cookie(headers, CSRF_COOKIE) {
+        Some(cookie) if !cookie.is_empty() => ct_eq(cookie.as_bytes(), submitted.as_bytes()),
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized("CSRF token mismatch".to_string()))
+    }
+}
+
+/// Double-submit check for server-rendered HTML forms: the `submitted` hidden `csrf` field must
+/// equal the `__Host-csrf` cookie. Mirrors [`verify_csrf`] but takes the token from the form body
+/// (the admin panel posts real `<form>`s, not the dashboard's `fetch` + `X-CSRF-Token` header).
+pub fn verify_csrf_field(headers: &HeaderMap, submitted: &str) -> Result<(), AppError> {
     let ok = match get_cookie(headers, CSRF_COOKIE) {
         Some(cookie) if !cookie.is_empty() => ct_eq(cookie.as_bytes(), submitted.as_bytes()),
         _ => false,

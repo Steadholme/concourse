@@ -94,6 +94,7 @@ pub async fn create(
         kind,
         created_by: sub.clone(),
         created_at: now,
+        archived: false,
     };
     state.store.ensure_room(&room).await?;
     state

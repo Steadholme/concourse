@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Admin · Murmur · HOLDFAST</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-chat">
+{{TOPBAR}}
+<main class="admin">
+  <section class="card admin__card">
+    <header class="admin__head">
+      <h1 class="admin__title">Rooms</h1>
+      <span class="admin__sub">Moderator control — admin overrides ownership.</span>
+    </header>
+    <table>
+      <thead>
+        <tr><th>Room</th><th>Kind</th><th>Created by</th><th>Status</th><th class="admin__col-actions">Actions</th></tr>
+      </thead>
+      <tbody>
+        {{ROOMS}}
+      </tbody>
+    </table>
+  </section>
+</main>
+</body>
+</html>

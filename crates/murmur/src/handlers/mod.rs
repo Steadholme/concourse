@@ -7,6 +7,7 @@
 //! into the rendered page, matching the HOLDFAST enterprise brand (the same look as the Keystone
 //! / Inkwell UI): brand gradient, indigo accent, dark command-center chrome.
 
+pub mod admin;
 pub mod dashboard;
 pub mod health;
 pub mod rooms;

@@ -100,7 +100,14 @@ fn render_messages(messages: &[Message]) -> String {
 /// (its stored body is already cleared); an edited message carries an `(edited)` marker.
 pub fn render_message(m: &Message) -> String {
     let body = if m.deleted {
-        r#"<span class="msg__deleted">[deleted]</span>"#.to_string()
+        // Author soft-delete clears the body (=> `[deleted]`); an admin redaction stores the
+        // fixed moderator tombstone. Either way the stored text is a constant, escaped for safety.
+        let label = if m.body.is_empty() {
+            "[deleted]".to_string()
+        } else {
+            esc(&m.body)
+        };
+        format!(r#"<span class="msg__deleted">{label}</span>"#)
     } else {
         render_body(&m.body)
     };

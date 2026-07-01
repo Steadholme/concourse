@@ -20,6 +20,9 @@ pub const MAX_BODY_CHARS: usize = 8 * 1024;
 /// Maximum room name length, in characters.
 pub const MAX_ROOM_NAME_CHARS: usize = 120;
 
+/// Tombstone body a message is redacted TO by an admin/moderator (replaces the original text).
+pub const REDACTED_BODY: &str = "[removed by moderator]";
+
 /// The global lobby room every user is auto-joined to on first visit, so the UI is never empty.
 pub const LOBBY_ID: &str = "lobby";
 /// Display name of the lobby room.

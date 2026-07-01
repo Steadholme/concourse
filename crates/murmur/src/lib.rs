@@ -22,6 +22,13 @@
 //! - `POST /api/rooms/{id}/messages/{msg_id}/delete`  author soft-deletes -> `[deleted]` + broadcast (CSRF)
 //! - `POST /api/rooms/{id}/read`      advance `last_read_at`
 //! - `GET  /ws`                       WebSocket: live messages/presence for the user's rooms
+//! - `GET  /admin`                    moderator panel: all rooms (admins/infra-admins only)
+//! - `GET  /admin/rooms/{id}`         room detail: members + messages with per-row controls
+//! - `POST /admin/rooms/{id}/archive` archive a room (CSRF)
+//! - `POST /admin/rooms/{id}/delete`  hard-delete a room + its members/messages (CSRF)
+//! - `POST /admin/rooms/{id}/members/{user_sub}/remove`  kick a member (CSRF)
+//! - `POST /admin/rooms/{id}/members/{user_sub}/ban`     ban a member (CSRF)
+//! - `POST /admin/messages/{msg_id}/redact`              redact ANY message (CSRF)
 
 pub mod audit;
 pub mod auth;
@@ -77,6 +84,26 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/rooms/{id}/read", post(handlers::rooms::read))
         .route("/ws", get(handlers::ws::ws_handler))
+        // --- admin subtree (gated by `require_admin`: admins / infra-admins only) ---
+        .route("/admin", get(handlers::admin::index))
+        .route("/admin/rooms/{id}", get(handlers::admin::room_detail))
+        .route(
+            "/admin/rooms/{id}/archive",
+            post(handlers::admin::archive_room),
+        )
+        .route("/admin/rooms/{id}/delete", post(handlers::admin::delete_room))
+        .route(
+            "/admin/rooms/{id}/members/{user_sub}/remove",
+            post(handlers::admin::remove_member),
+        )
+        .route(
+            "/admin/rooms/{id}/members/{user_sub}/ban",
+            post(handlers::admin::ban_member),
+        )
+        .route(
+            "/admin/messages/{msg_id}/redact",
+            post(handlers::admin::redact_message),
+        )
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (healthz / dev).
@@ -167,6 +194,7 @@ pub async fn ensure_lobby(state: &AppState, sub: &str, email: &str) {
         kind: "room".to_string(),
         created_by: "system".to_string(),
         created_at: 0, // created_at=0 keeps the lobby first in the oldest-first room ordering.
+        archived: false,
     };
     if let Err(e) = state.store.ensure_room(&lobby).await {
         tracing::warn!(error = %e, "ensure lobby room failed");

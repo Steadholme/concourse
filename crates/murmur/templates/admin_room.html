@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Admin · {{ROOM_TITLE}} · Murmur</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-chat">
+{{TOPBAR}}
+<main class="admin">
+  <section class="card admin__card">
+    <header class="admin__head">
+      <a class="btn-link" href="/admin">&larr; All rooms</a>
+      <h1 class="admin__title">{{ROOM_TITLE}}</h1>
+      <span class="admin__sub mono">{{ROOM_ID}}</span>
+    </header>
+
+    <h2 class="admin__section">Members</h2>
+    <table>
+      <thead>
+        <tr><th>Email</th><th>Subject</th><th>Status</th><th class="admin__col-actions">Actions</th></tr>
+      </thead>
+      <tbody>
+        {{MEMBERS}}
+      </tbody>
+    </table>
+
+    <h2 class="admin__section">Messages</h2>
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Author</th><th>Body</th><th class="admin__col-actions">Actions</th></tr>
+      </thead>
+      <tbody>
+        {{MESSAGES}}
+      </tbody>
+    </table>
+  </section>
+</main>
+</body>
+</html>

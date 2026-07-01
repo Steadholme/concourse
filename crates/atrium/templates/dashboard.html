@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
+  <meta name="csrf-token" content="{{CSRF}}">
   <title>Atrium · HOLDFAST</title>
   <style>{{CSS}}</style>
 </head>
@@ -16,6 +17,8 @@
       <p class="shell__sub">Everything new across the keep — chat, notifications, and your feeds in one pane.</p>
     </div>
   </div>
+
+  {{SEARCH}}
 
   <div id="summary-slot">{{SUMMARY}}</div>
 
@@ -39,6 +42,10 @@
 // A transient network error is swallowed — the last good render simply stays on screen.
 (function () {
   var INTERVAL_MS = 20000;
+  function csrf() {
+    var m = document.querySelector('meta[name="csrf-token"]');
+    return m ? m.getAttribute('content') : '';
+  }
   function apply(id, html) {
     if (typeof html !== 'string') return;
     var el = document.getElementById(id);
@@ -46,7 +53,8 @@
   }
   async function refresh() {
     try {
-      var res = await fetch('/api/inbox', {
+      // Carry the current ?q= / ?source= so a live refresh preserves the active filter.
+      var res = await fetch('/api/inbox' + window.location.search, {
         headers: { 'Accept': 'application/json' },
         credentials: 'same-origin',
         cache: 'no-store'
@@ -59,6 +67,44 @@
       /* transient error — keep the current view */
     }
   }
+  // In-place row actions (mark-read / dismiss). Delegated so it keeps working after the columns
+  // fragment is swapped by a poll. On success the row is removed immediately and a refresh
+  // reconciles the counts; the double-submit CSRF token rides the X-CSRF-Token header.
+  async function onActionClick(ev) {
+    var btn = ev.target.closest('.row__act');
+    if (!btn) return;
+    var row = btn.closest('.row');
+    if (!row) return;
+    var action = btn.getAttribute('data-action'); // "read" | "dismiss"
+    var source = row.getAttribute('data-source');
+    var key = row.getAttribute('data-key');
+    if (!source || !key) return;
+    ev.preventDefault();
+    // Disable the row's buttons while the request is in flight.
+    row.querySelectorAll('.row__act').forEach(function (b) { b.disabled = true; });
+    try {
+      var res = await fetch('/api/inbox/' + action, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': csrf()
+        },
+        credentials: 'same-origin',
+        cache: 'no-store',
+        body: JSON.stringify({ source: source, key: key })
+      });
+      if (res.ok) {
+        row.parentNode && row.parentNode.removeChild(row);
+        refresh();
+      } else {
+        row.querySelectorAll('.row__act').forEach(function (b) { b.disabled = false; });
+      }
+    } catch (e) {
+      row.querySelectorAll('.row__act').forEach(function (b) { b.disabled = false; });
+    }
+  }
+  var cols = document.getElementById('columns-slot');
+  if (cols) cols.addEventListener('click', onActionClick);
   setInterval(refresh, INTERVAL_MS);
 })();
 </script>

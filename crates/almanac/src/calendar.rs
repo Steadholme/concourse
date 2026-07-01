@@ -15,6 +15,9 @@
 
 use time::{Date, Month, OffsetDateTime, Time};
 
+/// Milliseconds in a UTC day (all Almanac date math is DST-free, per the module docs).
+const DAY_MS: i64 = 86_400_000;
+
 /// One calendar day in the month grid. `Clone` so weeks can be `chunks(7).to_vec()`.
 #[derive(Clone, Debug)]
 pub struct DayCell {
@@ -151,6 +154,132 @@ pub fn build_month_at(
         weeks,
         prev,
         next,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Week / day time-grids. A `TimeGridView` is a strip of consecutive day columns
+// (7 for a week, 1 for a day), each carrying its owner-local `[start,end]` UTC-ms
+// range so the handler places events on an hour grid exactly like the month cells.
+// ---------------------------------------------------------------------------
+
+/// One day column in a week/day time-grid.
+#[derive(Clone, Debug)]
+pub struct GridDay {
+    /// Day-of-month, 1..=31.
+    pub day: u8,
+    /// Real UTC instant of the owner's LOCAL midnight (inclusive lower bound for overlap tests).
+    pub start_ms: i64,
+    /// Real UTC instant of the last millisecond of the owner's LOCAL day (inclusive upper bound).
+    pub end_ms: i64,
+    /// Whether this column is the owner's local "today".
+    pub is_today: bool,
+    /// `YYYY-MM-DD` (owner-local) for the day-view / "add on this day" links.
+    pub iso_date: String,
+    /// Sunday-first weekday label, e.g. `Mon`.
+    pub weekday: &'static str,
+    /// Abbreviated month, e.g. `Jun`.
+    pub month_abbr: &'static str,
+}
+
+/// A computed week- or day- time-grid: the day columns plus header + navigation targets.
+pub struct TimeGridView {
+    /// Human header, e.g. `Jun 29, 2026 – Jul 5, 2026` (week) or `Jun 29, 2026` (day).
+    pub title: String,
+    /// One column per rendered day: 7 for a week, 1 for a day.
+    pub days: Vec<GridDay>,
+    /// `YYYY-MM-DD` (owner-local) anchor of the previous / next period, for the ‹ › nav.
+    pub prev_date: String,
+    pub next_date: String,
+    /// `YYYY-MM-DD` (owner-local) of the first day shown — threaded through the view-switch links.
+    pub anchor_date: String,
+    /// The real-UTC `[win_start, win_end]` span this grid covers, for RRULE expansion.
+    pub win_start: i64,
+    pub win_end: i64,
+}
+
+/// Sunday-first weekday label for a UTC epoch (expects an already owner-local `ms`).
+fn weekday_label(ms: i64) -> &'static str {
+    match to_dt(ms) {
+        Some(dt) => WEEKDAY_HEADERS[dt.weekday().number_days_from_sunday() as usize],
+        None => WEEKDAY_HEADERS[0],
+    }
+}
+
+/// Build one [`GridDay`] from a LOCAL midnight epoch (`local_mid`) and the owner's local today.
+fn make_grid_day(local_mid: i64, off_min: i32, today_ymd: (i32, u8, u8)) -> GridDay {
+    let start_ms = shift(local_mid, -off_min);
+    let (y, mo, d) = match to_dt(local_mid) {
+        Some(dt) => (dt.year(), dt.month() as u8, dt.day()),
+        None => (1970, 1, 1),
+    };
+    GridDay {
+        day: d,
+        start_ms,
+        end_ms: start_ms + DAY_MS - 1,
+        is_today: today_ymd == (y, mo, d),
+        iso_date: format!("{y:04}-{mo:02}-{d:02}"),
+        weekday: weekday_label(local_mid),
+        month_abbr: MONTH_ABBR[(mo.clamp(1, 12) - 1) as usize],
+    }
+}
+
+/// The owner-local `(year, month, day)` of `today_ms` (for the "is today" flag).
+fn local_today_ymd(today_ms: i64, off_min: i32) -> (i32, u8, u8) {
+    match to_dt(shift(today_ms, off_min)) {
+        Some(dt) => (dt.year(), dt.month() as u8, dt.day()),
+        None => (0, 0, 0),
+    }
+}
+
+/// Build the 7-day week time-grid containing `anchor_ms`, in the owner's timezone. `monday_first`
+/// selects whether the week starts on Monday or Sunday; `today_ms` marks the live "today" column.
+pub fn build_week_at(anchor_ms: i64, today_ms: i64, off_min: i32, monday_first: bool) -> TimeGridView {
+    let local_mid = start_of_day(shift(anchor_ms, off_min));
+    let lead = match to_dt(local_mid) {
+        Some(dt) => {
+            if monday_first {
+                dt.weekday().number_days_from_monday()
+            } else {
+                dt.weekday().number_days_from_sunday()
+            }
+        }
+        None => 0,
+    } as i64;
+    let week_start = local_mid - lead * DAY_MS;
+    let today = local_today_ymd(today_ms, off_min);
+    let days: Vec<GridDay> = (0..7)
+        .map(|i| make_grid_day(week_start + i * DAY_MS, off_min, today))
+        .collect();
+
+    TimeGridView {
+        title: format!(
+            "{} – {}",
+            human_date(week_start),
+            human_date(week_start + 6 * DAY_MS)
+        ),
+        days,
+        prev_date: fmt_date_input(week_start - 7 * DAY_MS),
+        next_date: fmt_date_input(week_start + 7 * DAY_MS),
+        anchor_date: fmt_date_input(week_start),
+        win_start: shift(week_start, -off_min),
+        win_end: shift(week_start + 7 * DAY_MS - 1, -off_min),
+    }
+}
+
+/// Build the single-day time-grid for the day containing `anchor_ms`, in the owner's timezone.
+pub fn build_day_at(anchor_ms: i64, today_ms: i64, off_min: i32) -> TimeGridView {
+    let local_mid = start_of_day(shift(anchor_ms, off_min));
+    let today = local_today_ymd(today_ms, off_min);
+    let day = make_grid_day(local_mid, off_min, today);
+    TimeGridView {
+        title: human_date(local_mid),
+        days: vec![day],
+        prev_date: fmt_date_input(local_mid - DAY_MS),
+        next_date: fmt_date_input(local_mid + DAY_MS),
+        anchor_date: fmt_date_input(local_mid),
+        win_start: shift(local_mid, -off_min),
+        win_end: shift(local_mid + DAY_MS - 1, -off_min),
     }
 }
 
@@ -494,6 +623,59 @@ mod tests {
         assert!(dec31.is_today, "local date is Dec 31, not Jan 1");
         // The cell's start is the real UTC instant of local midnight (05:00 UTC).
         assert_eq!(human_time(dec31.start_ms), "05:00");
+    }
+
+    #[test]
+    fn week_grid_has_seven_days_from_the_right_start() {
+        // 2026-06-29 is a Monday; a Sunday-first week runs Jun 28 (Sun) .. Jul 4 (Sat).
+        let anchor = parse_date("2026-06-29").unwrap();
+        let sun = build_week_at(anchor, anchor, 0, false);
+        assert_eq!(sun.days.len(), 7);
+        assert_eq!(sun.days[0].weekday, "Sun");
+        assert_eq!(sun.days[0].day, 28);
+        assert_eq!(sun.days[6].day, 4);
+        assert_eq!(sun.days[6].month_abbr, "Jul");
+        // The anchor day (Mon 29) is flagged today when it equals `today_ms`.
+        assert!(sun.days.iter().any(|d| d.day == 29 && d.is_today));
+        // Prev/next jump a whole week.
+        assert_eq!(sun.prev_date, "2026-06-21");
+        assert_eq!(sun.next_date, "2026-07-05");
+        assert_eq!(sun.anchor_date, "2026-06-28");
+
+        // Monday-first: the same anchor week starts on Mon Jun 29.
+        let mon = build_week_at(anchor, anchor, 0, true);
+        assert_eq!(mon.days[0].weekday, "Mon");
+        assert_eq!(mon.days[0].day, 29);
+        assert_eq!(mon.days[6].day, 5);
+    }
+
+    #[test]
+    fn week_grid_day_bounds_are_local_midnights() {
+        // In UTC-05:00 the day column's start is the real UTC instant of local midnight (05:00 UTC).
+        let off = tz_offset_minutes("UTC-05:00");
+        let anchor = parse_date_at("2026-06-15", off).unwrap();
+        let week = build_week_at(anchor, anchor, off, true); // Mon-first: Jun 15 is a Monday
+        let first = &week.days[0];
+        assert_eq!(first.day, 15);
+        assert_eq!(human_time(first.start_ms), "05:00");
+        assert_eq!(first.end_ms - first.start_ms, 86_400_000 - 1);
+        // The expansion window spans the whole 7-day strip.
+        assert_eq!(week.win_start, first.start_ms);
+        assert_eq!(week.win_end, week.days[6].end_ms);
+    }
+
+    #[test]
+    fn day_grid_is_a_single_day_with_step_nav() {
+        let anchor = parse_date("2026-06-29").unwrap();
+        let day = build_day_at(anchor, anchor, 0);
+        assert_eq!(day.days.len(), 1);
+        assert_eq!(day.days[0].day, 29);
+        assert!(day.days[0].is_today);
+        assert_eq!(day.prev_date, "2026-06-28");
+        assert_eq!(day.next_date, "2026-06-30");
+        assert_eq!(day.title, "Jun 29, 2026");
+        assert_eq!(day.win_start, day.days[0].start_ms);
+        assert_eq!(day.win_end, day.days[0].end_ms);
     }
 
     #[test]

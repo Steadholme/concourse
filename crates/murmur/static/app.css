@@ -281,6 +281,45 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .msg__body a { color: var(--accent-2); text-decoration: underline; text-underline-offset: 2px; }
 .msg__edited { font-size: 11px; color: var(--ink-3); font-style: italic; }
 .msg__deleted { color: var(--ink-3); font-style: italic; }
+.msg__replies { font-size: 11px; color: var(--accent-2); font-weight: 600; }
+
+/* ---- Threaded reply (quoted parent) ------------------------------------- */
+.msg__quote {
+  display: flex; gap: 8px; align-items: baseline;
+  margin: 0 0 4px; padding: 4px 10px;
+  border-left: 3px solid var(--accent-border);
+  background: var(--accent-soft); border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: 12.5px; color: var(--ink-3);
+}
+.msg__quote-author { font-weight: 600; color: var(--accent-2); flex: 0 0 auto; }
+.msg__quote-body { color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- Reactions ---------------------------------------------------------- */
+.msg__reactions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.reaction {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border-2); background: var(--surface);
+  color: var(--ink-2); font-size: 12.5px; line-height: 1.4; cursor: pointer;
+}
+.reaction:hover { border-color: var(--accent-border); background: var(--bg-2); }
+.reaction.is-mine { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent-2); font-weight: 600; }
+.reaction__count { font-size: 11.5px; color: inherit; }
+/* Small "add reaction / reply" affordances revealed on message hover. */
+.msg__tools { display: inline-flex; gap: 8px; margin-left: auto; opacity: 0; transition: opacity .12s ease; }
+.msg:hover .msg__tools { opacity: 1; }
+.msg__tool { font-size: 11px; color: var(--ink-3); background: transparent; border: none; cursor: pointer; padding: 0; }
+.msg__tool:hover { color: var(--accent-2); }
+
+/* ---- Reply banner (composer reply target) ------------------------------- */
+.reply-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 20px; border-top: 1px solid var(--border);
+  background: var(--accent-soft); font-size: 12.5px;
+}
+.reply-banner__label { color: var(--accent-2); font-weight: 600; }
+.reply-banner__cancel { background: transparent; border: none; color: var(--ink-3); cursor: pointer; font-size: 12px; }
+.reply-banner__cancel:hover { color: var(--accent-2); }
 
 /* ---- Composer ----------------------------------------------------------- */
 .composer {

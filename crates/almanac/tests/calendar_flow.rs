@@ -418,6 +418,102 @@ async fn settings_timezone_shifts_rendering_and_persists() {
 }
 
 #[tokio::test]
+async fn week_and_day_views_render_events_on_the_time_grid() {
+    let state = build_dev_state();
+    let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "a@x.co")).await;
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+
+    // A timed event on Mon 2099-06-15 10:00–11:00, plus a daily recurring standup that week.
+    let save = post_form(
+        "/new",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf),
+            ("title", "Design review"),
+            ("starts_at", "2099-06-15T10:00"),
+            ("ends_at", "2099-06-15T11:00"),
+        ],
+    );
+    assert_eq!(call(&state, save).await.0, StatusCode::SEE_OTHER);
+    let stand = post_form(
+        "/new",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf),
+            ("title", "Standup"),
+            ("starts_at", "2099-06-15T09:00"),
+            ("ends_at", "2099-06-15T09:15"),
+            ("repeat", "daily"),
+            ("repeat_interval", "1"),
+            ("repeat_count", "5"),
+        ],
+    );
+    assert_eq!(call(&state, stand).await.0, StatusCode::SEE_OTHER);
+
+    // Week view anchored inside that week: the time-grid shows the one-off AND every daily
+    // occurrence, plus the hour gutter and the Month/Week/Day switch.
+    let (status, _h, week) =
+        call(&state, get_as("/?view=week&date=2099-06-17", "u_alice", "a@x.co")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(week.contains("tgrid__body"), "renders the time-grid");
+    assert!(week.contains("09:00"), "hour gutter present");
+    assert!(week.contains("tgrid__event"), "timed events are placed");
+    assert!(week.contains("Design review"));
+    // Mon–Fri daily standup => 5 occurrences visible in the week.
+    assert!(week.matches("Standup").count() >= 5, "recurring series expands in the week grid");
+    assert!(week.contains("href=\"/?view=day&amp;date=2099-06-15\""), "day headers link to the day view");
+    // Sunday-first week containing Jun 17 runs Jun 14 (Sun)..Jun 20 (Sat); nav steps a whole week.
+    assert!(week.contains("href=\"/?view=week&amp;date=2099-06-07\""), "prev week");
+    assert!(week.contains("href=\"/?view=week&amp;date=2099-06-21\""), "next week");
+
+    // Day view for Mon Jun 15: the one-off + that day's standup occurrence, stepping day-by-day.
+    let (status, _h, day) =
+        call(&state, get_as("/?view=day&date=2099-06-15", "u_alice", "a@x.co")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(day.contains("Jun 15, 2099"));
+    assert!(day.contains("Design review"));
+    assert!(day.contains("Standup"), "the day's recurring occurrence shows");
+    assert!(day.contains("href=\"/?view=day&amp;date=2099-06-14\""), "prev day");
+    assert!(day.contains("href=\"/?view=day&amp;date=2099-06-16\""), "next day");
+
+    // Sat Jun 20 is outside the 5-occurrence (Mon–Fri) run and holds no one-off => empty grid.
+    let (_s, _h, sat) =
+        call(&state, get_as("/?view=day&date=2099-06-20", "u_alice", "a@x.co")).await;
+    assert!(!sat.contains("Standup"), "day view is scoped to its own day");
+    assert!(!sat.contains("Design review"));
+}
+
+#[tokio::test]
+async fn week_view_escapes_event_titles() {
+    let state = build_dev_state();
+    let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "a@x.co")).await;
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+    let save = post_form(
+        "/new",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf),
+            ("title", "<script>alert(2)</script>"),
+            ("starts_at", "2099-07-06T10:00"),
+            ("ends_at", "2099-07-06T11:00"),
+        ],
+    );
+    assert_eq!(call(&state, save).await.0, StatusCode::SEE_OTHER);
+    let (_s, _h, week) =
+        call(&state, get_as("/?view=week&date=2099-07-06", "u_alice", "a@x.co")).await;
+    assert!(!week.contains("<script>alert(2)</script>"), "title must be escaped in the grid");
+    assert!(week.contains("&lt;script&gt;"));
+}
+
+#[tokio::test]
 async fn unknown_route_renders_404() {
     let state = build_dev_state();
     let (status, _h, body) = call(&state, get("/no/such/path")).await;

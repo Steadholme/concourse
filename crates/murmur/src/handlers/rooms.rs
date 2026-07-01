@@ -14,9 +14,9 @@ use serde_json::json;
 
 use crate::audit::AuditEvent;
 use crate::auth;
-use crate::config::{MAX_BODY_CHARS, MAX_ROOM_NAME_CHARS, MESSAGE_PAGE_LIMIT};
+use crate::config::{MAX_BODY_CHARS, MAX_EMOJI_CHARS, MAX_ROOM_NAME_CHARS, MESSAGE_PAGE_LIMIT};
 use crate::error::AppError;
-use crate::handlers::message_frame;
+use crate::handlers::{message_frame, reaction_frame};
 use crate::store::{Message, Room};
 use crate::{ensure_lobby, now_nanos, now_secs, AppState};
 
@@ -34,6 +34,16 @@ pub struct CreateRoomReq {
 pub struct SendReq {
     #[serde(default)]
     pub body: String,
+    /// Optional threaded-reply parent (a message id in the SAME room). Omitted/empty => top-level.
+    #[serde(default)]
+    pub reply_to_id: Option<String>,
+}
+
+/// Body for `POST /api/rooms/{id}/messages/{msg_id}/react`.
+#[derive(Debug, Deserialize)]
+pub struct ReactReq {
+    #[serde(default)]
+    pub emoji: String,
 }
 
 /// Body for `POST /api/rooms/{id}/messages/{msg_id}/edit`.
@@ -172,6 +182,21 @@ pub async fn send(
         return Err(AppError::InvalidRequest("message body too long".to_string()));
     }
 
+    // A threaded reply must point at an EXISTING message IN THIS ROOM (a reply can never cross
+    // rooms or dangle). An empty/blank id is treated as "no reply".
+    let reply_to_id = match req.reply_to_id.as_deref().map(str::trim) {
+        Some(pid) if !pid.is_empty() => {
+            let parent = state
+                .store
+                .get_message(pid)
+                .await
+                .filter(|m| m.room_id == id)
+                .ok_or_else(|| AppError::InvalidRequest("reply target not found".to_string()))?;
+            Some(parent.id)
+        }
+        _ => None,
+    };
+
     let message = Message {
         id: format!("msg_{}", now_nanos()),
         room_id: id.clone(),
@@ -181,6 +206,7 @@ pub async fn send(
         created_at: now_secs(),
         edited_at: 0,
         deleted: false,
+        reply_to_id,
     };
     state.store.create_message(&message).await?;
 
@@ -281,6 +307,87 @@ pub async fn delete_message(
     ));
 
     Ok(Json(json!({ "message": updated })).into_response())
+}
+
+/// `POST /api/rooms/{id}/messages/{msg_id}/react` — toggle the caller's `{emoji}` reaction on a
+/// message. CSRF-checked + membership-gated; the message must live in this room. Idempotent per
+/// `(message, user, emoji)`: a second identical call removes it. Publishes the updated tallies over
+/// the hub and audits. Returns the message's full reaction counts + the caller's own reactions.
+pub async fn react(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, msg_id)): Path<(String, String)>,
+    Json(req): Json<ReactReq>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_user(&headers)?;
+    auth::verify_csrf(&headers)?;
+    require_membership(&state, &id, &sub).await?;
+
+    // The target must exist AND belong to this room (defense in depth: no cross-room reactions).
+    state
+        .store
+        .get_message(&msg_id)
+        .await
+        .filter(|m| m.room_id == id)
+        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
+
+    let emoji = req.emoji.trim();
+    if emoji.is_empty() {
+        return Err(AppError::InvalidRequest("emoji is required".to_string()));
+    }
+    if emoji.chars().count() > MAX_EMOJI_CHARS {
+        return Err(AppError::InvalidRequest("emoji too long".to_string()));
+    }
+
+    let added = state.store.toggle_reaction(&msg_id, &sub, emoji).await?;
+    let reactions = state.store.list_reactions(&msg_id).await;
+    let mine = state.store.list_user_reactions(&msg_id, &sub).await;
+
+    // Fan the new tallies out to everyone watching the room so live chips update in place.
+    state.hub.publish(&id, reaction_frame(&id, &msg_id, &reactions));
+
+    // Best-effort audit — the emoji length + toggle direction only, never who-reacted-with-what text.
+    state.audit.emit(AuditEvent::info(
+        "chat.message.react",
+        &actor(&email, &sub),
+        &msg_id,
+        &format!("added={} emoji_len={}", added, emoji.chars().count()),
+    ));
+
+    Ok(Json(json!({
+        "message_id": msg_id,
+        "added": added,
+        "reactions": reactions,
+        "mine": mine,
+    }))
+    .into_response())
+}
+
+/// `GET /api/rooms/{id}/messages/{msg_id}/reactions` — the message's per-emoji reaction tallies
+/// plus the caller's own reactions (used to render + highlight chips). Membership-gated.
+pub async fn reactions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, msg_id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let (sub, _email) = auth::require_user(&headers)?;
+    require_membership(&state, &id, &sub).await?;
+
+    state
+        .store
+        .get_message(&msg_id)
+        .await
+        .filter(|m| m.room_id == id)
+        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
+
+    let reactions = state.store.list_reactions(&msg_id).await;
+    let mine = state.store.list_user_reactions(&msg_id, &sub).await;
+    Ok(Json(json!({
+        "message_id": msg_id,
+        "reactions": reactions,
+        "mine": mine,
+    }))
+    .into_response())
 }
 
 /// `POST /api/rooms/{id}/read` — advance the caller's read cursor (no CSRF; non-destructive).

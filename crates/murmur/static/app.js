@@ -11,6 +11,7 @@
 
   var cfg = window.MURMUR || {};
   var selected = cfg.selected || "lobby";
+  var replyTarget = null; // id of the message the composer is currently replying to (or null)
 
   var $ = function (sel) { return document.querySelector(sel); };
   var timeline = $("#timeline");
@@ -41,12 +42,20 @@
     var row = document.createElement("div");
     row.className = "msg";
     row.setAttribute("data-id", m.id);
+    var authorName = m.sender_email || m.sender_sub || "—";
+    row.setAttribute("data-author", authorName);
+
+    // Threaded reply: quote the parent (author + snippet) pulled from the on-screen parent row.
+    if (m.reply_to_id) {
+      var quote = buildQuote(m.reply_to_id);
+      if (quote) row.appendChild(quote);
+    }
 
     var head = document.createElement("div");
     head.className = "msg__head";
     var author = document.createElement("span");
     author.className = "msg__author";
-    author.textContent = m.sender_email || m.sender_sub || "—";
+    author.textContent = authorName;
     var time = document.createElement("span");
     time.className = "msg__time";
     time.textContent = fmtTime(m.created_at);
@@ -58,6 +67,7 @@
       edited.textContent = "(edited)";
       head.appendChild(edited);
     }
+    head.appendChild(buildTools());
 
     var body = document.createElement("div");
     body.className = "msg__body";
@@ -73,6 +83,100 @@
     row.appendChild(head);
     row.appendChild(body);
     return row;
+  }
+
+  // The per-message "React" / "Reply" affordances (revealed on hover; wired by delegation).
+  function buildTools() {
+    var tools = document.createElement("span");
+    tools.className = "msg__tools";
+    tools.appendChild(makeTool("react", "React"));
+    tools.appendChild(makeTool("reply", "Reply"));
+    return tools;
+  }
+  function makeTool(act, label) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "msg__tool";
+    b.setAttribute("data-act", act);
+    b.textContent = label;
+    return b;
+  }
+
+  // Build the quoted-parent block for a reply from the parent row already in the timeline.
+  function buildQuote(parentId) {
+    var parent = timeline
+      ? timeline.querySelector('[data-id="' + cssEscape(parentId) + '"]')
+      : null;
+    if (!parent) return null;
+    var pAuthor = parent.getAttribute("data-author") || "—";
+    var pBodyEl = parent.querySelector(".msg__body");
+    var pBody = pBodyEl ? pBodyEl.textContent.trim() : "";
+    if (pBody.length > 120) pBody = pBody.slice(0, 120) + "…";
+    var quote = document.createElement("div");
+    quote.className = "msg__quote";
+    quote.setAttribute("data-parent-id", parentId);
+    var qa = document.createElement("span");
+    qa.className = "msg__quote-author";
+    qa.textContent = pAuthor;
+    var qb = document.createElement("span");
+    qb.className = "msg__quote-body";
+    qb.textContent = pBody.replace(/[\r\n]+/g, " ");
+    quote.appendChild(qa);
+    quote.appendChild(qb);
+    return quote;
+  }
+
+  // Build/replace a message's reaction chip row from a reactions array ([{emoji,count}]).
+  function buildReactions(reactions) {
+    var wrap = document.createElement("div");
+    wrap.className = "msg__reactions";
+    for (var i = 0; i < (reactions || []).length; i++) {
+      var r = reactions[i];
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "reaction";
+      chip.setAttribute("data-emoji", r.emoji);
+      var em = document.createElement("span");
+      em.className = "reaction__emoji";
+      em.textContent = r.emoji;
+      var ct = document.createElement("span");
+      ct.className = "reaction__count";
+      ct.textContent = String(r.count);
+      chip.appendChild(em);
+      chip.appendChild(ct);
+      wrap.appendChild(chip);
+    }
+    return wrap;
+  }
+
+  // Replace (or drop) a message row's reaction chips in place.
+  function applyReactions(msgId, reactions) {
+    if (!timeline) return;
+    var row = timeline.querySelector('[data-id="' + cssEscape(msgId) + '"]');
+    if (!row) return;
+    var existing = row.querySelector(".msg__reactions");
+    if (!reactions || reactions.length === 0) {
+      if (existing) existing.remove();
+      return;
+    }
+    var next = buildReactions(reactions);
+    if (existing) existing.parentNode.replaceChild(next, existing);
+    else row.appendChild(next);
+  }
+
+  // Toggle a reaction on a message via the API (chips update live from the returned frame).
+  function toggleReaction(msgId, emoji) {
+    if (!emoji) return;
+    fetch("/api/rooms/" + encodeURIComponent(selected) + "/messages/" +
+      encodeURIComponent(msgId) + "/react", {
+      method: "POST",
+      headers: apiHeaders(true),
+      credentials: "same-origin",
+      body: JSON.stringify({ emoji: emoji })
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) { if (data) applyReactions(msgId, data.reactions); })
+      .catch(function () {});
   }
 
   // Append text to `el`, turning bare http/https URLs into <a> elements. Uses text nodes so the
@@ -177,17 +281,72 @@
   function sendMessage() {
     var body = input ? input.value.trim() : "";
     if (!body) return;
+    var payload = { body: body };
+    if (replyTarget) payload.reply_to_id = replyTarget;
     fetch("/api/rooms/" + encodeURIComponent(selected) + "/messages", {
       method: "POST",
       headers: apiHeaders(true),
       credentials: "same-origin",
-      body: JSON.stringify({ body: body })
+      body: JSON.stringify(payload)
     })
       .then(function (r) {
         if (r.ok && input) { input.value = ""; input.style.height = "auto"; }
+        clearReply();
         // The message arrives back over /ws and is appended there (no optimistic dup).
       })
       .catch(function () {});
+  }
+
+  // --- reactions + threaded-reply affordances (event delegation) -----------
+
+  if (timeline) {
+    timeline.addEventListener("click", function (e) {
+      var chip = e.target.closest ? e.target.closest(".reaction") : null;
+      if (chip) {
+        var row = chip.closest(".msg");
+        if (row) toggleReaction(row.getAttribute("data-id"), chip.getAttribute("data-emoji"));
+        return;
+      }
+      var tool = e.target.closest ? e.target.closest(".msg__tool") : null;
+      if (!tool) return;
+      var msg = tool.closest(".msg");
+      if (!msg) return;
+      var id = msg.getAttribute("data-id");
+      if (tool.getAttribute("data-act") === "react") {
+        var emoji = window.prompt("React with (emoji)", "👍");
+        if (emoji) toggleReaction(id, emoji.trim());
+      } else if (tool.getAttribute("data-act") === "reply") {
+        setReply(id, msg.getAttribute("data-author") || "");
+      }
+    });
+  }
+
+  // Point the composer at a parent message and show a dismissible reply banner above it.
+  function setReply(id, author) {
+    replyTarget = id;
+    var existing = document.getElementById("reply-banner");
+    if (existing) existing.remove();
+    var banner = document.createElement("div");
+    banner.id = "reply-banner";
+    banner.className = "reply-banner";
+    var label = document.createElement("span");
+    label.className = "reply-banner__label";
+    label.textContent = "Replying to " + (author || "message");
+    var cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "reply-banner__cancel";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", clearReply);
+    banner.appendChild(label);
+    banner.appendChild(cancel);
+    if (composer && composer.parentNode) composer.parentNode.insertBefore(banner, composer);
+    if (input) input.focus();
+  }
+
+  function clearReply() {
+    replyTarget = null;
+    var banner = document.getElementById("reply-banner");
+    if (banner) banner.remove();
   }
 
   // --- room list clicks + new room -----------------------------------------
@@ -342,6 +501,7 @@
       try { frame = JSON.parse(ev.data); } catch (e) { return; }
       if (frame.type === "message") onLiveMessage(frame);
       else if (frame.type === "presence") onPresence(frame);
+      else if (frame.type === "reaction") onReaction(frame);
     };
     ws.onclose = function () { if (presence) presence.textContent = ""; scheduleReconnect(); };
     ws.onerror = function () { if (ws) ws.close(); };
@@ -374,6 +534,11 @@
     timeline.appendChild(buildMessage(frame));
     if (nearBottom) scrollToBottom();
     markRead(selected);
+  }
+
+  function onReaction(frame) {
+    if (frame.room_id !== selected) return;
+    applyReactions(frame.message_id, frame.reactions);
   }
 
   function onPresence(frame) {

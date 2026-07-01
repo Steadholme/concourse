@@ -91,6 +91,17 @@ fn webhooks_page(subject: &str, email: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// GET the delivery-preferences page as `subject`.
+fn prefs_page(subject: &str, email: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri("/settings/prefs")
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", email)
+        .body(Body::empty())
+        .unwrap()
+}
+
 /// POST a form to `uri` as `subject` with the double-submit CSRF cookie+field set to `csrf`.
 fn form_post(uri: &str, subject: &str, csrf: &str, body: String) -> Request<Body> {
     Request::builder()
@@ -215,6 +226,95 @@ async fn mark_read_requires_csrf_then_succeeds() {
     // Now the inbox shows zero unread.
     let page = send(&st, inbox(SUBJECT, EMAIL)).await;
     assert!(page.body.contains(r#"<span class="count" data-zero="0">0</span>"#));
+}
+
+#[tokio::test]
+async fn prefs_page_requires_sso_identity() {
+    let st = state();
+    let resp = send(
+        &st,
+        Request::builder().uri("/settings/prefs").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn prefs_save_requires_csrf() {
+    let st = state();
+    let page = send(&st, prefs_page(SUBJECT, EMAIL)).await;
+    let cookie = page.csrf_cookie().expect("csrf cookie set on first render");
+
+    // Wrong CSRF field -> 401 (cookie present, mismatched field).
+    let req = form_post("/settings/prefs", SUBJECT, &cookie, "csrf_token=wrong&mute_all=on".to_string());
+    assert_eq!(send(&st, req).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn prefs_save_roundtrip_and_prefill() {
+    let st = state();
+    let page = send(&st, prefs_page(SUBJECT, EMAIL)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    // Fresh owner: nothing checked, quiet-hours blank.
+    assert!(!page.body.contains("checkbox\" name=\"mute_all\" value=\"on\" checked"));
+    let cookie = page.csrf_cookie().unwrap();
+
+    // Save: mute-all on, quiet 22:00–07:00, mute the beacon source + warning severity.
+    let req = form_post(
+        "/settings/prefs",
+        SUBJECT,
+        &cookie,
+        format!("csrf_token={cookie}&mute_all=on&quiet_start=22:00&quiet_end=07:00&muted_sources=Beacon,+loom&muted_severities=warning"),
+    );
+    assert_eq!(send(&st, req).await.status, StatusCode::SEE_OTHER);
+
+    // Re-render pre-fills the saved values (normalized + escaped).
+    let page = send(&st, prefs_page(SUBJECT, EMAIL)).await;
+    assert!(page.body.contains(r#"name="mute_all" value="on" checked"#));
+    assert!(page.body.contains(r#"name="quiet_start" value="22:00""#));
+    assert!(page.body.contains(r#"name="quiet_end" value="07:00""#));
+    assert!(page.body.contains(r#"value="beacon, loom""#), "sources normalized to lower-case, comma-joined");
+    assert!(page.body.contains(r#"value="warning""#));
+
+    // Another user's prefs are independent (owner scoping).
+    let other = send(&st, prefs_page("u_mallory", "m@w33d.xyz")).await;
+    assert!(!other.body.contains(r#"name="mute_all" value="on" checked"#));
+}
+
+#[tokio::test]
+async fn prefs_reject_bad_quiet_hours() {
+    let st = state();
+    let page = send(&st, prefs_page(SUBJECT, EMAIL)).await;
+    let cookie = page.csrf_cookie().unwrap();
+    let req = form_post(
+        "/settings/prefs",
+        SUBJECT,
+        &cookie,
+        format!("csrf_token={cookie}&quiet_start=25:00"),
+    );
+    assert_eq!(send(&st, req).await.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn muted_source_still_lands_in_inbox() {
+    let st = state();
+    // Mute the "beacon" source for this owner.
+    let page = send(&st, prefs_page(SUBJECT, EMAIL)).await;
+    let cookie = page.csrf_cookie().unwrap();
+    let req = form_post(
+        "/settings/prefs",
+        SUBJECT,
+        &cookie,
+        format!("csrf_token={cookie}&muted_sources=beacon"),
+    );
+    assert_eq!(send(&st, req).await.status, StatusCode::SEE_OTHER);
+
+    // Ingest a beacon notification: real-time delivery is suppressed, but it MUST still be stored.
+    let body = format!(r#"{{"user_sub":"{SUBJECT}","source":"beacon","severity":"warning","title":"Probe down"}}"#);
+    assert_eq!(send(&st, ingest(Some(INGEST_TOKEN), &body)).await.status, StatusCode::OK);
+
+    let inbox = send(&st, inbox(SUBJECT, EMAIL)).await;
+    assert!(inbox.body.contains("Probe down"), "muted notifications still appear in the inbox");
 }
 
 #[tokio::test]

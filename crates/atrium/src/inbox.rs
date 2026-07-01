@@ -9,7 +9,7 @@
 //! [`InboxCache`] memoizes each viewer's inbox for [`CACHE_TTL`] (~10 s), so back-to-back loads by
 //! the same person share one concurrent refresh and don't re-hammer the three source databases.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,86 @@ impl Inbox {
         }
         v
     }
+}
+
+/// A unified search + source view over an aggregated [`Inbox`]. `q` is a case-insensitive
+/// substring matched across a row's title / snippet / origin; `source` restricts the view to a
+/// single column (all others render empty). Both default to "no restriction".
+#[derive(Clone, Debug, Default)]
+pub struct ViewFilter {
+    /// Case-insensitive free-text query (empty = match everything).
+    pub q: String,
+    /// Restrict to one column (`None` = all three).
+    pub source: Option<SectionKind>,
+}
+
+impl ViewFilter {
+    /// Build from the raw query-string values (`?q=` / `?source=`). `all`/unknown source = no
+    /// restriction; the query is trimmed.
+    pub fn new(q: Option<String>, source: Option<String>) -> Self {
+        ViewFilter {
+            q: q.unwrap_or_default().trim().to_string(),
+            source: source.as_deref().and_then(SectionKind::from_slug),
+        }
+    }
+
+    /// True when neither a query nor a source restriction is set (the default full view).
+    pub fn is_empty(&self) -> bool {
+        self.q.is_empty() && self.source.is_none()
+    }
+}
+
+/// Produce the viewer-facing [`Inbox`]: hide rows the viewer has acted on (`hidden`, keyed by
+/// source slug) and apply the search + source [`ViewFilter`]. Totals are recomputed from the rows
+/// that survive (a per-room chat count, or one per notification/feed row), so the summary always
+/// matches what is shown. Unavailable columns pass through untouched.
+pub fn view(
+    inbox: &Inbox,
+    hidden: &HashMap<String, HashSet<String>>,
+    filter: &ViewFilter,
+) -> Inbox {
+    Inbox {
+        chat: view_section(&inbox.chat, SectionKind::Chat, hidden, filter),
+        notifications: view_section(&inbox.notifications, SectionKind::Notifications, hidden, filter),
+        feed: view_section(&inbox.feed, SectionKind::Feed, hidden, filter),
+    }
+}
+
+fn view_section(
+    state: &SectionState,
+    kind: SectionKind,
+    hidden: &HashMap<String, HashSet<String>>,
+    filter: &ViewFilter,
+) -> SectionState {
+    let SectionState::Ready(section) = state else {
+        return state.clone(); // an unavailable column stays unavailable
+    };
+    // A source restriction blanks every other column (kept available, just empty).
+    if let Some(only) = filter.source {
+        if only != kind {
+            return SectionState::Ready(Section::empty());
+        }
+    }
+    let hidden_keys = hidden.get(kind.slug());
+    let needle = filter.q.to_lowercase();
+    let mut rows = Vec::new();
+    let mut total: i64 = 0;
+    for r in &section.rows {
+        if let Some(keys) = hidden_keys {
+            if !r.key.is_empty() && keys.contains(&r.key) {
+                continue; // acted-on: hidden from the unread view
+            }
+        }
+        if !needle.is_empty() {
+            let hay = format!("{} {} {}", r.title, r.snippet, r.source).to_lowercase();
+            if !hay.contains(&needle) {
+                continue;
+            }
+        }
+        total += r.count.unwrap_or(1);
+        rows.push(r.clone());
+    }
+    SectionState::Ready(Section { total, rows })
 }
 
 /// The aggregating engine: the (optional) source per column. An absent source = that column is
@@ -214,6 +294,84 @@ mod tests {
         assert_eq!(inbox.unavailable_kinds(), vec![SectionKind::Chat]);
         // The reachable column still reports.
         assert_eq!(inbox.total_unread(), 4);
+    }
+
+    fn keyed_row(key: &str, title: &str, snippet: &str, count: Option<i64>) -> InboxRow {
+        InboxRow {
+            key: key.to_string(),
+            title: title.to_string(),
+            snippet: snippet.to_string(),
+            count,
+            ..Default::default()
+        }
+    }
+
+    fn sample_inbox() -> Inbox {
+        Inbox {
+            chat: SectionState::Ready(Section {
+                total: 5,
+                rows: vec![
+                    keyed_row("r1", "#general", "hi", Some(2)),
+                    keyed_row("r2", "#random", "lunch?", Some(3)),
+                ],
+            }),
+            notifications: SectionState::Ready(Section {
+                total: 1,
+                rows: vec![keyed_row("n1", "Deploy done", "current is live", None)],
+            }),
+            feed: SectionState::Unavailable,
+        }
+    }
+
+    #[test]
+    fn view_hides_acted_on_rows_and_recomputes_totals() {
+        let inbox = sample_inbox();
+        let mut hidden: HashMap<String, HashSet<String>> = HashMap::new();
+        hidden.entry("chat".into()).or_default().insert("r1".into());
+        let out = view(&inbox, &hidden, &ViewFilter::default());
+        let SectionState::Ready(chat) = &out.chat else { panic!() };
+        assert_eq!(chat.rows.len(), 1, "dismissed room removed");
+        assert_eq!(chat.rows[0].title, "#random");
+        assert_eq!(chat.total, 3, "total drops by the hidden room's unread count");
+        // Unavailable column passes through untouched.
+        assert!(!out.feed.is_available());
+    }
+
+    #[test]
+    fn view_search_matches_title_snippet_and_origin() {
+        let inbox = sample_inbox();
+        let empty = HashMap::new();
+        let f = ViewFilter::new(Some("lunch".into()), None);
+        let out = view(&inbox, &empty, &f);
+        let SectionState::Ready(chat) = &out.chat else { panic!() };
+        assert_eq!(chat.rows.len(), 1);
+        assert_eq!(chat.rows[0].title, "#random");
+        // The notification doesn't match "lunch" -> emptied.
+        let SectionState::Ready(notifs) = &out.notifications else { panic!() };
+        assert!(notifs.rows.is_empty());
+        assert_eq!(notifs.total, 0);
+    }
+
+    #[test]
+    fn view_source_filter_blanks_other_columns() {
+        let inbox = sample_inbox();
+        let empty = HashMap::new();
+        let f = ViewFilter::new(None, Some("notifications".into()));
+        let out = view(&inbox, &empty, &f);
+        // Only notifications keeps rows; chat is emptied (still available).
+        let SectionState::Ready(chat) = &out.chat else { panic!() };
+        assert!(chat.rows.is_empty());
+        let SectionState::Ready(notifs) = &out.notifications else { panic!() };
+        assert_eq!(notifs.rows.len(), 1);
+    }
+
+    #[test]
+    fn empty_filter_preserves_the_original_view() {
+        let inbox = sample_inbox();
+        let empty = HashMap::new();
+        assert!(ViewFilter::default().is_empty());
+        let out = view(&inbox, &empty, &ViewFilter::default());
+        assert_eq!(out.total_unread(), inbox.total_unread());
     }
 
     #[tokio::test]

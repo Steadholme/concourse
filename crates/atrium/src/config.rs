@@ -30,6 +30,9 @@ pub struct Config {
     pub klaxon_dsn: Option<String>,
     /// Current (RSS reader) database DSN; `None` = the Feed section degrades to empty.
     pub current_dsn: Option<String>,
+    /// Atrium's OWN overlay database DSN (`ATRIUM_DATABASE_URL`), backing the mark-read / dismiss
+    /// action table. `None` = the actions overlay is in-process only (dev/single-node).
+    pub atrium_dsn: Option<String>,
 }
 
 impl Config {
@@ -40,6 +43,7 @@ impl Config {
             murmur_dsn: None,
             klaxon_dsn: None,
             current_dsn: None,
+            atrium_dsn: None,
         }
     }
 
@@ -50,6 +54,7 @@ impl Config {
             murmur_dsn: env_nonempty("MURMUR_DATABASE_URL"),
             klaxon_dsn: env_nonempty("KLAXON_DATABASE_URL"),
             current_dsn: env_nonempty("CURRENT_DATABASE_URL"),
+            atrium_dsn: env_nonempty("ATRIUM_DATABASE_URL"),
         }
     }
 }

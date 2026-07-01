@@ -13,9 +13,13 @@ use axum::response::{Html, IntoResponse, Response};
 use crate::auth;
 use crate::config::{LOBBY_ID, MESSAGE_PAGE_LIMIT};
 use crate::handlers::{esc, fmt_time, topbar, APP_CSS, APP_JS};
-use crate::store::{Message, UserRoom};
+use crate::store::{Message, ReactionCount, UserRoom};
 use crate::text::render_body;
 use crate::{ensure_lobby, AppState};
+
+/// Longest quoted-parent snippet shown above a threaded reply, in characters (the full parent is
+/// one click away in the timeline).
+const QUOTE_SNIPPET_CHARS: usize = 120;
 
 const DASHBOARD_HTML: &str = include_str!("../../templates/dashboard.html");
 
@@ -44,6 +48,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
         .store
         .list_messages(&selected, None, MESSAGE_PAGE_LIMIT)
         .await;
+    let timeline = render_timeline(&state, &sub, &messages).await;
 
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
@@ -52,7 +57,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
         .replace("{{TOPBAR}}", &topbar("Chat", &email))
         .replace("{{ROOMS}}", &render_room_list(&rooms, &selected))
         .replace("{{ROOM_TITLE}}", &esc(&selected_name))
-        .replace("{{MESSAGES}}", &render_messages(&messages))
+        .replace("{{MESSAGES}}", &timeline)
         .replace("{{CSRF}}", &esc(&csrf))
         .replace("{{ME}}", &esc(&email))
         .replace("{{SELECTED}}", &esc(&selected))
@@ -84,24 +89,38 @@ fn render_room_list(rooms: &[UserRoom], selected: &str) -> String {
 }
 
 /// Render the timeline (oldest-first). The store returns newest-first, so we reverse for reading.
-fn render_messages(messages: &[Message]) -> String {
+/// Each row is enriched with its threaded-reply context (quoted parent + reply count) and its
+/// reaction tallies (with the caller's own reactions highlighted) — all fetched from the store.
+async fn render_timeline(state: &AppState, sub: &str, messages: &[Message]) -> String {
     if messages.is_empty() {
         return r#"<div class="timeline__empty">No messages yet — say hello.</div>"#.to_string();
     }
     let mut out = String::new();
     for m in messages.iter().rev() {
-        out.push_str(&render_message(m));
+        // Threaded-reply parent (best-effort: a purged parent simply renders no quote).
+        let parent = match &m.reply_to_id {
+            Some(pid) => state.store.get_message(pid).await,
+            None => None,
+        };
+        let reply_count = state.store.count_replies(&m.id).await;
+        let reactions = state.store.list_reactions(&m.id).await;
+        let mine = state.store.list_user_reactions(&m.id, sub).await;
+        out.push_str(&render_message_row(
+            m,
+            parent.as_ref(),
+            reply_count,
+            &reactions,
+            &mine,
+        ));
     }
     out
 }
 
-/// One message row. `sender_email` / time are escaped; the body goes through the
-/// escape-then-autolink renderer. A soft-deleted message renders a fixed `[deleted]` tombstone
-/// (its stored body is already cleared); an edited message carries an `(edited)` marker.
-pub fn render_message(m: &Message) -> String {
-    let body = if m.deleted {
-        // Author soft-delete clears the body (=> `[deleted]`); an admin redaction stores the
-        // fixed moderator tombstone. Either way the stored text is a constant, escaped for safety.
+/// Render a message body to safe HTML: a soft-deleted / redacted row shows a fixed tombstone
+/// (`[deleted]` or the stored moderator text, escaped); a live body goes through the
+/// escape-then-autolink renderer.
+fn message_body_html(m: &Message) -> String {
+    if m.deleted {
         let label = if m.body.is_empty() {
             "[deleted]".to_string()
         } else {
@@ -110,12 +129,21 @@ pub fn render_message(m: &Message) -> String {
         format!(r#"<span class="msg__deleted">{label}</span>"#)
     } else {
         render_body(&m.body)
-    };
-    let edited = if m.edited_at > 0 && !m.deleted {
+    }
+}
+
+/// The `(edited)` marker for a live, edited message (empty otherwise).
+fn message_edited_html(m: &Message) -> &'static str {
+    if m.edited_at > 0 && !m.deleted {
         r#"<span class="msg__edited">(edited)</span>"#
     } else {
         ""
-    };
+    }
+}
+
+/// One bare message row (no reply/reaction chrome). `sender_email` / time are escaped; the body is
+/// sanitized. Retained for callers that render a plain message.
+pub fn render_message(m: &Message) -> String {
     format!(
         r#"<div class="msg" data-id="{id}">
   <div class="msg__head"><span class="msg__author">{author}</span><span class="msg__time">{time}</span>{edited}</div>
@@ -124,9 +152,101 @@ pub fn render_message(m: &Message) -> String {
         id = esc(&m.id),
         author = esc(&m.sender_email),
         time = esc(&fmt_time(m.created_at)),
-        edited = edited,
-        body = body,
+        edited = message_edited_html(m),
+        body = message_body_html(m),
     )
+}
+
+/// One enriched timeline row: an optional quoted parent (threaded reply), the message head/body, a
+/// reply-count marker, and the reaction chip row. Every interpolated field is escaped/sanitized.
+fn render_message_row(
+    m: &Message,
+    parent: Option<&Message>,
+    reply_count: i64,
+    reactions: &[ReactionCount],
+    mine: &[String],
+) -> String {
+    format!(
+        r#"<div class="msg" data-id="{id}" data-author="{author}">
+  {quote}<div class="msg__head"><span class="msg__author">{author}</span><span class="msg__time">{time}</span>{edited}{replies}<span class="msg__tools"><button type="button" class="msg__tool" data-act="react">React</button><button type="button" class="msg__tool" data-act="reply">Reply</button></span></div>
+  <div class="msg__body">{body}</div>
+  {reactions}
+</div>"#,
+        id = esc(&m.id),
+        author = esc(&m.sender_email),
+        time = esc(&fmt_time(m.created_at)),
+        edited = message_edited_html(m),
+        replies = reply_count_html(reply_count),
+        quote = quote_html(parent),
+        body = message_body_html(m),
+        reactions = reactions_html(reactions, mine),
+    )
+}
+
+/// The quoted-parent block shown above a threaded reply. Empty for a top-level post (or when the
+/// parent was purged). The parent author + a short snippet are escaped as plain text.
+fn quote_html(parent: Option<&Message>) -> String {
+    let Some(p) = parent else {
+        return String::new();
+    };
+    let snippet = if p.deleted {
+        if p.body.is_empty() {
+            "[deleted]".to_string()
+        } else {
+            p.body.clone()
+        }
+    } else {
+        p.body.clone()
+    };
+    // A one-line, length-capped plain-text snippet (escaped) — no markup, no autolinking.
+    let mut oneline: String = snippet.chars().take(QUOTE_SNIPPET_CHARS).collect();
+    if snippet.chars().count() > QUOTE_SNIPPET_CHARS {
+        oneline.push('…');
+    }
+    let oneline = oneline.replace(['\n', '\r'], " ");
+    format!(
+        r#"<div class="msg__quote" data-parent-id="{id}"><span class="msg__quote-author">{author}</span><span class="msg__quote-body">{body}</span></div>
+  "#,
+        id = esc(&p.id),
+        author = esc(&p.sender_email),
+        body = esc(&oneline),
+    )
+}
+
+/// The reply-count marker on a parent message (empty when it has no replies).
+fn reply_count_html(reply_count: i64) -> String {
+    if reply_count <= 0 {
+        return String::new();
+    }
+    let label = if reply_count == 1 { "reply" } else { "replies" };
+    format!(
+        r#"<span class="msg__replies">{count} {label}</span>"#,
+        count = reply_count,
+        label = label,
+    )
+}
+
+/// The reaction chip row for a message. Each chip carries its emoji + distinct-user count; a chip
+/// the caller reacted with gets `is-mine`. Empty when the message has no reactions.
+fn reactions_html(reactions: &[ReactionCount], mine: &[String]) -> String {
+    if reactions.is_empty() {
+        return String::new();
+    }
+    let mut chips = String::new();
+    for r in reactions {
+        let is_mine = if mine.iter().any(|e| e == &r.emoji) {
+            " is-mine"
+        } else {
+            ""
+        };
+        chips.push_str(&format!(
+            r#"<button type="button" class="reaction{mine}" data-emoji="{emoji}"><span class="reaction__emoji">{emoji}</span><span class="reaction__count">{count}</span></button>"#,
+            mine = is_mine,
+            emoji = esc(&r.emoji),
+            count = r.count,
+        ));
+    }
+    format!(r#"<div class="msg__reactions">{chips}</div>"#, chips = chips)
 }
 
 /// A minimal HTML "session required" page (defense in depth — the gateway normally guarantees an

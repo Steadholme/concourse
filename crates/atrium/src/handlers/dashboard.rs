@@ -10,15 +10,16 @@
 //! "all caught up" column; an unreachable one renders an "unavailable" placeholder — the page
 //! NEVER errors or hangs. All federated text is HTML-escaped (untrusted cross-service content).
 
-use axum::extract::State;
-use axum::http::HeaderMap;
-use axum::response::Html;
+use axum::extract::{Query, State};
+use axum::http::{header, HeaderMap};
+use axum::response::{Html, IntoResponse, Response};
 
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::config::SECTION_LIMIT;
-use crate::handlers::{esc, rel_time, topbar, truncate, APP_CSS};
-use crate::inbox::{Inbox, SectionState};
+use crate::csrf;
+use crate::handlers::{esc, rel_time, topbar, truncate, InboxQuery, APP_CSS};
+use crate::inbox::{self, Inbox, SectionState, ViewFilter};
 use crate::source::{InboxRow, SectionKind};
 use crate::AppState;
 
@@ -32,38 +33,63 @@ const RSS_URL: &str = "https://rss.w33d.xyz";
 /// `GET /` — the unified inbox. Renders for any request the gateway forwards; the viewer identity
 /// (and the per-viewer federation scope) comes from the injected `X-Auth-Subject` / `X-Auth-Email`.
 /// An unauthenticated probe (no subject) still renders an empty, calm inbox rather than erroring.
-pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
+pub async fn dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InboxQuery>,
+) -> Response {
     let email = auth::display_email(&headers);
     let subject = auth::subject(&headers);
+    let filter = ViewFilter::new(query.q, query.source);
+
+    // Double-submit CSRF: reuse the token already on the request's cookie, or mint a fresh one.
+    // The same token is planted in a cookie (below) AND echoed into the page so an action POST can
+    // present it back in the X-CSRF-Token header.
+    let token = csrf::cookie_token(&headers).unwrap_or_else(csrf::issue_token);
 
     // No gateway identity -> nothing to scope a federation by; render the empty inbox shell.
     let Some(sub) = subject else {
-        return Html(render(&empty_inbox(), &email, crate::now_secs()));
+        let empty = empty_inbox();
+        let view = inbox::view(&empty, &Default::default(), &filter);
+        return page(render(&view, &email, &filter, &token, crate::now_secs()), &token);
     };
 
-    let (inbox, fresh) = state.cache.get(&state.engine, &sub, SECTION_LIMIT).await;
+    let (raw, fresh) = state.cache.get(&state.engine, &sub, SECTION_LIMIT).await;
 
     // Audit only on a REAL refresh (not cached views), so Watchtower isn't flooded: one info
     // event per inbox load, plus a warning per unreachable federated source (an ops signal — the
-    // private chat/notification/feed contents NEVER ride the event).
+    // private chat/notification/feed contents NEVER ride the event). The total is the true unread,
+    // measured before any search/overlay filtering of the on-screen view.
     if fresh {
         state.audit.emit(AuditEvent::info(
             "inbox.view",
             &email,
             "/",
-            &format!("total_unread={}", inbox.total_unread()),
+            &format!("total_unread={}", raw.total_unread()),
         ));
-        for kind in inbox.unavailable_kinds() {
+        for kind in raw.unavailable_kinds() {
             state.audit.emit(AuditEvent::warning(
                 "inbox.source_unavailable",
                 &email,
-                section_slug(kind),
+                kind.slug(),
                 source_name(kind),
             ));
         }
     }
 
-    Html(render(&inbox, &email, crate::now_secs()))
+    // Hide acted-on rows (fail-open on a down overlay DB) and apply the search + source filter.
+    let hidden = state.store.hidden(&sub).await.unwrap_or_default();
+    let view = inbox::view(&raw, &hidden, &filter);
+    page(render(&view, &email, &filter, &token, crate::now_secs()), &token)
+}
+
+/// Wrap the rendered HTML in a response that (re-)plants the CSRF cookie on every page load.
+fn page(html: String, token: &str) -> Response {
+    (
+        [(header::SET_COOKIE, csrf::set_cookie(token))],
+        Html(html),
+    )
+        .into_response()
 }
 
 /// The empty inbox shown to an unauthenticated probe (all columns empty + available). Shared with
@@ -77,12 +103,46 @@ pub(crate) fn empty_inbox() -> Inbox {
     }
 }
 
-fn render(inbox: &Inbox, email: &str, now: i64) -> String {
+fn render(inbox: &Inbox, email: &str, filter: &ViewFilter, token: &str, now: i64) -> String {
     DASHBOARD_HTML
         .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSRF}}", &esc(token))
         .replace("{{TOPBAR}}", &topbar("Inbox", email))
+        .replace("{{SEARCH}}", &render_search(filter))
         .replace("{{SUMMARY}}", &render_summary(inbox))
         .replace("{{COLUMNS}}", &render_columns(inbox, now))
+}
+
+/// The unified search + source-filter bar. A plain GET form (works with JS off); the live poll
+/// carries the same `?q=` / `?source=` so a refresh preserves the filter. Current values are echoed
+/// back HTML-escaped so the query is never reflected unescaped.
+pub(crate) fn render_search(filter: &ViewFilter) -> String {
+    let opt = |slug: &str, label: &str| {
+        let selected = filter.source.map(|k| k.slug()) == Some(slug);
+        format!(
+            r#"<option value="{slug}"{sel}>{label}</option>"#,
+            slug = esc(slug),
+            sel = if selected { " selected" } else { "" },
+            label = esc(label),
+        )
+    };
+    let all_selected = if filter.source.is_none() { " selected" } else { "" };
+    format!(
+        r#"<form class="searchbar" method="get" role="search">
+  <input class="searchbar__q" type="search" name="q" value="{q}" placeholder="Search chat, notifications & feeds…" aria-label="Search inbox">
+  <select class="searchbar__source" name="source" aria-label="Filter by source">
+    <option value="all"{all}>All sources</option>
+    {chat}{notifs}{feed}
+  </select>
+  <button class="btn btn-secondary btn-sm" type="submit">Search</button>
+  <a class="searchbar__clear" href="/">Clear</a>
+</form>"#,
+        q = esc(&filter.q),
+        all = all_selected,
+        chat = opt("chat", "Chat"),
+        notifs = opt("notifications", "Notifications"),
+        feed = opt("feed", "Feeds"),
+    )
 }
 
 /// The three activity columns concatenated (Chat, Notifications, Feed). Shared by the full page
@@ -96,6 +156,7 @@ pub(crate) fn render_columns(inbox: &Inbox, now: i64) -> String {
             "Unread messages",
             CHAT_URL,
             "Open chat",
+            SectionKind::Chat,
             &inbox.chat,
             row_chat,
             "You're all caught up on chat.",
@@ -106,6 +167,7 @@ pub(crate) fn render_columns(inbox: &Inbox, now: i64) -> String {
             "Unread alerts",
             NOTIFY_URL,
             "Open notifications",
+            SectionKind::Notifications,
             &inbox.notifications,
             row_notification,
             "No unread notifications.",
@@ -116,6 +178,7 @@ pub(crate) fn render_columns(inbox: &Inbox, now: i64) -> String {
             "Fresh items",
             RSS_URL,
             "Open reader",
+            SectionKind::Feed,
             &inbox.feed,
             row_feed,
             "No fresh feed items.",
@@ -172,8 +235,9 @@ fn render_column(
     subtitle: &str,
     open_url: &str,
     open_label: &str,
+    kind: SectionKind,
     state: &SectionState,
-    row_fn: fn(&InboxRow, i64) -> String,
+    row_fn: fn(&InboxRow, &str, i64) -> String,
     empty_msg: &str,
     now: i64,
 ) -> String {
@@ -196,7 +260,7 @@ fn render_column(
         SectionState::Ready(section) => {
             let mut rows = String::new();
             for r in &section.rows {
-                rows.push_str(&row_fn(r, now));
+                rows.push_str(&row_fn(r, kind.slug(), now));
             }
             (count_badge(section.total), rows)
         }
@@ -234,12 +298,14 @@ fn count_badge(total: i64) -> String {
 // --- Per-column row renderers ----------------------------------------------------------
 
 /// A chat room row: room name + per-room unread badge, latest-message preview, relative time.
-fn row_chat(r: &InboxRow, now: i64) -> String {
+fn row_chat(r: &InboxRow, source_slug: &str, now: i64) -> String {
     let unread = match r.count {
         Some(n) if n > 0 => format!(r#"<span class="row__badge">{n}</span>"#),
         _ => String::new(),
     };
     row_shell(
+        source_slug,
+        &r.key,
         &r.link,
         &esc(&r.title),
         &unread,
@@ -251,8 +317,10 @@ fn row_chat(r: &InboxRow, now: i64) -> String {
 }
 
 /// A notification row: title, body preview, relative time.
-fn row_notification(r: &InboxRow, now: i64) -> String {
+fn row_notification(r: &InboxRow, source_slug: &str, now: i64) -> String {
     row_shell(
+        source_slug,
+        &r.key,
         &r.link,
         &esc(&r.title),
         "",
@@ -264,13 +332,15 @@ fn row_notification(r: &InboxRow, now: i64) -> String {
 }
 
 /// A feed item row: item title, summary preview, feed-title origin tag, relative time.
-fn row_feed(r: &InboxRow, now: i64) -> String {
+fn row_feed(r: &InboxRow, source_slug: &str, now: i64) -> String {
     let title = if r.title.trim().is_empty() {
         "(untitled)".to_string()
     } else {
         esc(&r.title)
     };
     row_shell(
+        source_slug,
+        &r.key,
         &r.link,
         &title,
         "",
@@ -281,10 +351,29 @@ fn row_feed(r: &InboxRow, now: i64) -> String {
     )
 }
 
+/// The mark-read / dismiss controls for a row. Rendered only when the row carries a stable `key`
+/// (the token the action addresses it by); a keyless row is display-only. The buttons carry the
+/// `data-action` the delegated click handler reads; the owning `.row` carries `data-source` /
+/// `data-key`.
+fn row_actions(key: &str) -> String {
+    if key.trim().is_empty() {
+        return String::new();
+    }
+    r#"<div class="row__actions">
+    <button type="button" class="row__act" data-action="read">Mark read</button>
+    <button type="button" class="row__act row__act--dismiss" data-action="dismiss">Dismiss</button>
+  </div>"#
+        .to_string()
+}
+
 /// Shared row markup. `link` is treated as a same-origin-or-external URL and only escaped (the
-/// federated services emit their own absolute links); `badge` is pre-rendered safe HTML.
+/// federated services emit their own absolute links); `badge` is pre-rendered safe HTML. The row is
+/// a container div (so the deep-link anchor and the action buttons are siblings, never nested) that
+/// carries the `data-source` / `data-key` the in-place action handler uses to address it.
 #[allow(clippy::too_many_arguments)]
 fn row_shell(
+    source_slug: &str,
+    key: &str,
     link: &str,
     title_html: &str,
     badge_html: &str,
@@ -312,28 +401,26 @@ fn row_shell(
         format!(r#"<div class="row__snippet">{snippet_html}</div>"#)
     };
     format!(
-        r#"<a class="row" href="{link}">
-  <div class="row__top"><span class="row__title">{title_html}</span>{badge_html}</div>
-  {snippet}
-  {meta}
-</a>"#,
+        r#"<div class="row" data-source="{source}" data-key="{key}">
+  <a class="row__link" href="{link}">
+    <div class="row__top"><span class="row__title">{title_html}</span>{badge_html}</div>
+    {snippet}
+    {meta}
+  </a>
+  {actions}
+</div>"#,
+        source = esc(source_slug),
+        key = esc(key),
         link = esc(link),
         title_html = title_html,
         badge_html = badge_html,
         snippet = snippet,
         meta = meta,
+        actions = row_actions(key),
     )
 }
 
 // --- Audit helpers ---------------------------------------------------------------------
-
-fn section_slug(kind: SectionKind) -> &'static str {
-    match kind {
-        SectionKind::Chat => "chat",
-        SectionKind::Notifications => "notifications",
-        SectionKind::Feed => "feed",
-    }
-}
 
 fn source_name(kind: SectionKind) -> &'static str {
     match kind {
@@ -359,6 +446,7 @@ mod tests {
             rows: titles
                 .iter()
                 .map(|t| InboxRow {
+                    key: t.to_string(),
                     title: t.to_string(),
                     snippet: "preview".to_string(),
                     link: "https://chat.w33d.xyz/r/x".to_string(),
@@ -406,6 +494,74 @@ mod tests {
         assert!(html.contains(r#"id="summary-slot""#), "summary refresh slot present");
         assert!(html.contains(r#"id="columns-slot""#), "columns refresh slot present");
         assert!(html.contains("/api/inbox"), "poll fetches the JSON endpoint");
+    }
+
+    #[tokio::test]
+    async fn dashboard_renders_search_actions_and_sets_csrf_cookie() {
+        let app = crate::app(state_with_sources());
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-auth-subject", "u_1")
+                    .header("x-auth-email", "ops@w33d.xyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // A CSRF cookie is planted on the page load (double-submit half).
+        let set_cookie = res
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(set_cookie.contains("atrium_csrf="), "csrf cookie set");
+        assert!(set_cookie.contains("SameSite=Strict"), "csrf cookie is strict");
+        let html = String::from_utf8(
+            axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains(r#"class="searchbar""#), "unified search bar rendered");
+        assert!(html.contains(r#"name="source""#), "source filter present");
+        assert!(html.contains(r#"data-action="dismiss""#), "row dismiss control present");
+        assert!(html.contains(r#"data-action="read""#), "row mark-read control present");
+        assert!(html.contains(r#"meta name="csrf-token""#), "csrf meta echoed into page");
+    }
+
+    #[tokio::test]
+    async fn dashboard_search_filters_rows() {
+        // Two chat rooms; a query keeps only the matching one.
+        let engine = Engine::new(
+            Some(Arc::new(InMemorySource::new(
+                SectionKind::Chat,
+                section(4, &["#general", "#random"]),
+            ))),
+            None,
+            None,
+        );
+        let app = crate::app(crate::build_state_with_engine(engine));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/?q=random")
+                    .header("x-auth-subject", "u_1")
+                    .header("x-auth-email", "ops@w33d.xyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = String::from_utf8(
+            axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("#random"), "matching row kept");
+        assert!(!html.contains("#general"), "non-matching row filtered out");
+        // The query is echoed back into the search input, escaped.
+        assert!(html.contains(r#"value="random""#), "query reflected in the search box");
     }
 
     #[tokio::test]

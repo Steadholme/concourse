@@ -13,7 +13,7 @@ use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::config::{MAX_BODY_CHARS, MAX_TITLE_CHARS};
+use crate::config::{MAX_BODY_CHARS, MAX_SEVERITY_CHARS, MAX_TITLE_CHARS};
 use crate::delivery;
 use crate::error::AppError;
 use crate::store::Notification;
@@ -29,6 +29,8 @@ pub struct NotifyBody {
     pub user_email: Option<String>,
     #[serde(default)]
     pub source: String,
+    #[serde(default)]
+    pub severity: Option<String>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -80,11 +82,24 @@ async fn handle(state: &AppState, headers: &HeaderMap, body: NotifyBody) -> Resu
     title.truncate_chars(MAX_TITLE_CHARS);
     let url = body.url.unwrap_or_default().trim().to_string();
 
+    // Severity is an optional producer classification used only for per-severity muting; normalize
+    // to a short lower-case token and default to `info` when absent/blank.
+    let mut severity = body
+        .severity
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if severity.is_empty() {
+        severity = "info".to_string();
+    }
+    severity.truncate_chars(MAX_SEVERITY_CHARS);
+
     let now = now_secs();
     let notification = Notification {
         id: new_id("ntf"),
         user_sub: user_key,
         source: source.to_string(),
+        severity,
         title,
         body: body_text,
         url,

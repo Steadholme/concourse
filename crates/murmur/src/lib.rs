@@ -22,6 +22,8 @@
 //! - `POST /api/rooms/{id}/messages`  send `{body}` -> insert + broadcast (CSRF)
 //! - `POST /api/rooms/{id}/messages/{msg_id}/edit`    author edits `{body}` -> update + broadcast (CSRF)
 //! - `POST /api/rooms/{id}/messages/{msg_id}/delete`  author soft-deletes -> `[deleted]` + broadcast (CSRF)
+//! - `POST /api/rooms/{id}/messages/{msg_id}/react`   toggle an emoji reaction -> counts + broadcast (CSRF)
+//! - `GET  /api/rooms/{id}/messages/{msg_id}/reactions`  per-emoji reaction tallies + the caller's own
 //! - `POST /api/rooms/{id}/read`      advance `last_read_at`
 //! - `GET  /ws`                       WebSocket: live messages/presence for the user's rooms
 //! - `GET  /admin`                    moderator panel: all rooms (admins/infra-admins only)
@@ -85,6 +87,14 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/rooms/{id}/messages/{msg_id}/delete",
             post(handlers::rooms::delete_message),
+        )
+        .route(
+            "/api/rooms/{id}/messages/{msg_id}/react",
+            post(handlers::rooms::react),
+        )
+        .route(
+            "/api/rooms/{id}/messages/{msg_id}/reactions",
+            get(handlers::rooms::reactions),
         )
         .route("/api/rooms/{id}/read", post(handlers::rooms::read))
         .route("/ws", get(handlers::ws::ws_handler))

@@ -51,9 +51,21 @@ pub fn fan_out(state: AppState, notification: Notification) {
 
 async fn run(state: AppState, n: Notification) {
     let key = n.user_sub.clone();
-    let subs = state.store.list_subscriptions(&key).await;
-    let hooks = state.store.list_webhooks(&key).await;
+
+    // Owner delivery preferences gate every REAL-TIME channel. The in-inbox copy is already stored
+    // (before fan-out); prefs only decide whether we ALSO push/webhook/email right now. When the
+    // owner has muted-all, is in digest mode, is inside quiet-hours, or has muted this
+    // source/severity, all real-time delivery is skipped (the notification still shows in the inbox).
+    let prefs = state.store.get_prefs(&key).await;
+    let suppressed = prefs.suppresses_realtime(&n.source, &n.severity, minute_of_day(crate::now_secs()));
+
+    let subs = if suppressed { Vec::new() } else { state.store.list_subscriptions(&key).await };
+    let hooks = if suppressed { Vec::new() } else { state.store.list_webhooks(&key).await };
     let payload = serde_json::to_string(&n).unwrap_or_else(|_| "{}".to_string());
+
+    if suppressed {
+        tracing::info!(user = %key, source = %n.source, severity = %n.severity, "delivery suppressed by owner prefs — stored in-inbox only");
+    }
 
     // --- Webhooks (best-effort, signed, retry-once) ---
     let mut webhook_ok = 0usize;
@@ -90,7 +102,7 @@ async fn run(state: AppState, n: Notification) {
 
     // --- Email (optional, env-gated, best-effort) ---
     let mut email_ok = false;
-    if state.config.smtp_enabled {
+    if !suppressed && state.config.smtp_enabled {
         if let Some(rcpt) = recipient_email(&n.user_sub) {
             match deliver_email(&state, &rcpt, &n).await {
                 Ok(()) => email_ok = true,
@@ -105,15 +117,21 @@ async fn run(state: AppState, n: Notification) {
         &n.user_sub,
         &n.source,
         &format!(
-            "webhooks={}/{} push={}/{} push_configured={} email={}",
+            "webhooks={}/{} push={}/{} push_configured={} email={} suppressed={}",
             webhook_ok,
             hooks.len(),
             push_ok,
             subs.len(),
             push_configured,
-            email_ok
+            email_ok,
+            suppressed
         ),
     ));
+}
+
+/// Minute-of-day (`0..=1439`, UTC) for an epoch-seconds instant — the quiet-hours comparison unit.
+fn minute_of_day(now_secs: i64) -> i64 {
+    now_secs.rem_euclid(86_400) / 60
 }
 
 /// Treat a `user_sub` that looks like an address (`local@domain`) as an email recipient.

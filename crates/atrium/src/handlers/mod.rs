@@ -6,11 +6,24 @@
 //! matching the HOLDFAST service UI kit (the same polished, light-canvas look as the apex portal):
 //! shield wordmark, refined app-bar (All-apps pill + user chip), indigo accent, cards, WCAG-AA contrast.
 
+pub mod actions;
 pub mod api;
 pub mod dashboard;
 pub mod health;
 
 use axum::http::StatusCode;
+use serde::Deserialize;
+
+/// The unified search + source-filter query string shared by the dashboard page and the JSON poll
+/// (`?q=` free text, `?source=` one of `chat` / `notifications` / `feed` / `all`). Both fields are
+/// optional so a bare `/` or `/api/inbox` still deserializes.
+#[derive(Debug, Default, Deserialize)]
+pub struct InboxQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
 
 /// Embedded design system, inlined into each rendered page's `<style>`.
 pub const APP_CSS: &str = include_str!("../../static/app.css");

@@ -238,9 +238,32 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .col__open:hover { color: var(--accent); }
 .col__body { display: flex; flex-direction: column; padding: 6px; gap: 2px; max-height: 64vh; overflow-y: auto; }
 
+/* -------------------------------------------------------------- unified search bar */
+.searchbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 16px; padding: 12px 16px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--sh-xs);
+}
+.searchbar__q { flex: 1 1 240px; min-width: 180px; margin: 0; }
+.searchbar__source { flex: 0 0 auto; width: auto; margin: 0; }
+.searchbar__clear { font-size: 13px; font-weight: 550; color: var(--ink-3); }
+.searchbar__clear:hover { color: var(--accent-2); }
+
 /* -------------------------------------------------------------- activity rows */
-.row { display: block; padding: 11px 14px; border-radius: var(--radius-sm); color: var(--ink); transition: background-color .1s ease; }
+.row { position: relative; display: block; padding: 11px 14px; border-radius: var(--radius-sm); color: var(--ink); transition: background-color .1s ease; }
 .row:hover { background: var(--surface-2); color: var(--ink); }
+.row__link { display: block; color: inherit; }
+.row__link:hover { color: inherit; }
+.row__actions { display: flex; gap: 6px; margin-top: 8px; opacity: 0; transition: opacity .1s ease; }
+.row:hover .row__actions, .row:focus-within .row__actions { opacity: 1; }
+.row__act {
+  font: inherit; font-size: 11.5px; font-weight: 600; line-height: 1; cursor: pointer;
+  padding: 5px 9px; border-radius: var(--radius-sm); border: 1px solid var(--border-2);
+  background: var(--surface); color: var(--ink-2);
+}
+.row__act:hover { background: var(--bg-2); color: var(--ink); }
+.row__act--dismiss { color: var(--down-ink); border-color: var(--down-border); }
+.row__act--dismiss:hover { background: var(--down-soft); }
+.row__act:disabled { opacity: .5; cursor: default; }
 .row__top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .row__title { font-weight: 550; font-size: 14px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row__badge {

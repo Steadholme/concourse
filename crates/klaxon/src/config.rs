@@ -27,6 +27,13 @@ pub const LIST_LIMIT: usize = 200;
 pub const MAX_TITLE_CHARS: usize = 300;
 /// Hard cap on a notification body, in characters.
 pub const MAX_BODY_CHARS: usize = 8 * 1024;
+/// Hard cap on a notification severity token, in characters.
+pub const MAX_SEVERITY_CHARS: usize = 32;
+
+/// Hard cap on how many sources/severities a single owner may mute (per kind).
+pub const MAX_MUTES_PER_KIND: usize = 50;
+/// Hard cap on a single muted source/severity token, in characters.
+pub const MAX_MUTE_VALUE_CHARS: usize = 64;
 
 /// Hard cap on a registered webhook URL, in characters.
 pub const MAX_WEBHOOK_URL_CHARS: usize = 2048;

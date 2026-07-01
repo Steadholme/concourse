@@ -38,6 +38,29 @@ pub enum SectionKind {
     Feed,
 }
 
+impl SectionKind {
+    /// The stable, lowercase slug for this column. Used as the `source` key everywhere a row is
+    /// addressed by (the overlay action table, the `?source=` filter, the audit target).
+    pub fn slug(&self) -> &'static str {
+        match self {
+            SectionKind::Chat => "chat",
+            SectionKind::Notifications => "notifications",
+            SectionKind::Feed => "feed",
+        }
+    }
+
+    /// Parse a column slug back to its kind (for the `?source=` filter / an action POST body).
+    /// `all`, an empty string, or anything unknown yields `None` (= "no source restriction").
+    pub fn from_slug(s: &str) -> Option<SectionKind> {
+        match s.trim() {
+            "chat" => Some(SectionKind::Chat),
+            "notifications" => Some(SectionKind::Notifications),
+            "feed" => Some(SectionKind::Feed),
+            _ => None,
+        }
+    }
+}
+
 /// One render-ready row in a section. The fields are deliberately generic so all three columns
 /// share one renderer: `title` is the primary line (room / notification title / item title),
 /// `snippet` the secondary line (latest message preview / notification body / item summary),
@@ -45,6 +68,10 @@ pub enum SectionKind {
 /// deep-link OUT to the owning service, and `count` the per-room unread badge (chat only).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InboxRow {
+    /// Stable per-row identity WITHIN its source (room id / notification id / feed item id). This
+    /// is the token a mark-read / dismiss action addresses the row by, and the key the per-viewer
+    /// overlay ([`crate::store`]) hides it against. Never rendered.
+    pub key: String,
     pub title: String,
     pub snippet: String,
     pub source: String,
@@ -193,6 +220,7 @@ impl Source for MurmurSource {
             let preview: Option<String> = r.try_get("latest_body").map_err(|e| e.to_string())?;
             let at: Option<i64> = r.try_get("latest_at").map_err(|e| e.to_string())?;
             out.push(InboxRow {
+                key: room_id.clone(),
                 title: name,
                 snippet: preview.unwrap_or_default(),
                 source: String::new(),
@@ -234,7 +262,7 @@ impl Source for KlaxonSource {
 
     async fn fetch(&self, user_sub: &str, limit: i64) -> Result<Section, String> {
         let rows = sqlx::query(
-            "SELECT id, title, body, url AS link, created_at \
+            "SELECT CAST(id AS TEXT) AS row_key, title, body, url AS link, created_at \
              FROM notifications \
              WHERE user_sub = $1 AND read_at = 0 \
              ORDER BY created_at DESC \
@@ -250,6 +278,7 @@ impl Source for KlaxonSource {
             .iter()
             .map(|r| {
                 Ok(InboxRow {
+                    key: r.try_get("row_key").map_err(|e: sqlx::Error| e.to_string())?,
                     title: r.try_get("title").map_err(|e: sqlx::Error| e.to_string())?,
                     snippet: r.try_get("body").map_err(|e: sqlx::Error| e.to_string())?,
                     source: String::new(),
@@ -288,7 +317,8 @@ impl Source for CurrentSource {
 
     async fn fetch(&self, user_sub: &str, limit: i64) -> Result<Section, String> {
         let rows = sqlx::query(
-            "SELECT i.title AS title, \
+            "SELECT CAST(i.id AS TEXT) AS row_key, \
+                    i.title AS title, \
                     i.link AS link, \
                     i.summary AS summary, \
                     i.published_at AS published_at, \
@@ -309,6 +339,7 @@ impl Source for CurrentSource {
             .iter()
             .map(|r| {
                 Ok(InboxRow {
+                    key: r.try_get("row_key").map_err(|e: sqlx::Error| e.to_string())?,
                     title: r.try_get("title").map_err(|e: sqlx::Error| e.to_string())?,
                     snippet: r.try_get("summary").map_err(|e: sqlx::Error| e.to_string())?,
                     source: r.try_get("feed_title").map_err(|e: sqlx::Error| e.to_string())?,

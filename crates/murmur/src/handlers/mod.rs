@@ -16,7 +16,7 @@ pub mod ws;
 
 use serde_json::json;
 
-use crate::store::Message;
+use crate::store::{Message, ReactionCount};
 
 /// Embedded design system, inlined into the dashboard `<style>`.
 pub const APP_CSS: &str = include_str!("../../static/app.css");
@@ -98,6 +98,19 @@ pub fn message_frame(m: &Message) -> String {
         "created_at": m.created_at,
         "edited_at": m.edited_at,
         "deleted": m.deleted,
+        "reply_to_id": m.reply_to_id,
+    })
+    .to_string()
+}
+
+/// Build the JSON reaction frame fanned out when a message's reaction tallies change. Carries the
+/// full per-emoji counts for the message so a live client can replace its chip row wholesale.
+pub fn reaction_frame(room_id: &str, message_id: &str, reactions: &[ReactionCount]) -> String {
+    json!({
+        "type": "reaction",
+        "room_id": room_id,
+        "message_id": message_id,
+        "reactions": reactions,
     })
     .to_string()
 }

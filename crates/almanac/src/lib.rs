@@ -13,7 +13,8 @@
 //!
 //! Endpoints:
 //! - `GET /healthz` — liveness (public; the container HEALTHCHECK).
-//! - `GET /` — this-month calendar grid + the owner's upcoming agenda (`?y=&m=` to navigate).
+//! - `GET /` — calendar: month grid + upcoming agenda (`?y=&m=`), or the `?view=week&date=` /
+//!   `?view=day&date=` time-grids (both expand recurring series over the shown span).
 //! - `GET /new` / `POST /new` — create an event (`?date=YYYY-MM-DD` pre-fills the day).
 //! - `GET /edit/{id}` / `POST /edit/{id}` — edit one of the owner's events.
 //! - `POST /delete/{id}` — delete one of the owner's events.

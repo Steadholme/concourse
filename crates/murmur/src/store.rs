@@ -74,6 +74,18 @@ pub struct Message {
     /// Soft-delete flag. A deleted message keeps its row (id/author/timestamps) but its `body`
     /// is cleared and the timeline renders `[deleted]`.
     pub deleted: bool,
+    /// Optional parent message this is a threaded reply to (`NULL`/`None` for a top-level post).
+    /// The timeline renders a quoted parent above a reply and a reply count on the parent.
+    #[serde(default)]
+    pub reply_to_id: Option<String>,
+}
+
+/// A reaction tally on one message: an emoji with how many DISTINCT users applied it. Derived by
+/// grouping `message_reactions` (never stored directly).
+#[derive(Clone, Debug, Serialize)]
+pub struct ReactionCount {
+    pub emoji: String,
+    pub count: i64,
 }
 
 /// Storage failure surfaced to the handler layer (always maps to a 500 — there are no
@@ -130,6 +142,25 @@ pub trait Store: Send + Sync {
     /// message. Idempotent.
     async fn delete_message(&self, id: &str) -> Result<(), StoreError>;
 
+    // --- reactions + threaded replies --------------------------------------
+    /// Toggle a `(message_id, user_sub, emoji)` reaction: remove it when it already exists, else
+    /// add it. Idempotent per unique triple. Returns `true` when the reaction is now PRESENT
+    /// (added), `false` when it was removed.
+    async fn toggle_reaction(
+        &self,
+        message_id: &str,
+        user_sub: &str,
+        emoji: &str,
+    ) -> Result<bool, StoreError>;
+    /// Per-emoji reaction tallies for a message (distinct users per emoji), most-used first then
+    /// emoji for a stable order. Empty when the message has no reactions.
+    async fn list_reactions(&self, message_id: &str) -> Vec<ReactionCount>;
+    /// The emojis `user_sub` has personally applied to `message_id` (used to highlight the
+    /// caller's own reactions), sorted for stability.
+    async fn list_user_reactions(&self, message_id: &str, user_sub: &str) -> Vec<String>;
+    /// How many messages are threaded replies to `message_id` (their `reply_to_id` equals it).
+    async fn count_replies(&self, message_id: &str) -> i64;
+
     // --- admin panel -------------------------------------------------------
     /// ALL rooms in the system, newest-created first (admin room list; includes archived).
     async fn list_all_rooms(&self) -> Vec<Room>;
@@ -158,6 +189,15 @@ pub struct InMemoryStore {
     rooms: Mutex<Vec<Room>>,
     memberships: Mutex<Vec<MembershipRow>>,
     messages: Mutex<Vec<Message>>,
+    reactions: Mutex<Vec<ReactionRow>>,
+}
+
+/// In-memory reaction row (the PK is the whole `(message_id, user_sub, emoji)` triple).
+#[derive(Clone, Debug)]
+struct ReactionRow {
+    message_id: String,
+    user_sub: String,
+    emoji: String,
 }
 
 /// In-memory membership row (the PK is `(room_id, user_sub)`).
@@ -362,6 +402,70 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn toggle_reaction(
+        &self,
+        message_id: &str,
+        user_sub: &str,
+        emoji: &str,
+    ) -> Result<bool, StoreError> {
+        let mut reactions = self.reactions.lock().expect("reactions lock poisoned");
+        let before = reactions.len();
+        // Remove the exact triple if present (toggle-off).
+        reactions
+            .retain(|r| !(r.message_id == message_id && r.user_sub == user_sub && r.emoji == emoji));
+        if reactions.len() != before {
+            return Ok(false); // was present -> removed
+        }
+        // Absent -> add it (toggle-on).
+        reactions.push(ReactionRow {
+            message_id: message_id.to_string(),
+            user_sub: user_sub.to_string(),
+            emoji: emoji.to_string(),
+        });
+        Ok(true)
+    }
+
+    async fn list_reactions(&self, message_id: &str) -> Vec<ReactionCount> {
+        let reactions = self.reactions.lock().expect("reactions lock poisoned");
+        // Tally distinct-user counts per emoji.
+        let mut counts: Vec<ReactionCount> = Vec::new();
+        for r in reactions.iter().filter(|r| r.message_id == message_id) {
+            if let Some(c) = counts.iter_mut().find(|c| c.emoji == r.emoji) {
+                c.count += 1;
+            } else {
+                counts.push(ReactionCount {
+                    emoji: r.emoji.clone(),
+                    count: 1,
+                });
+            }
+        }
+        // Most-used first, ties broken by emoji for a stable order (matches the SQL ORDER BY).
+        counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.emoji.cmp(&b.emoji)));
+        counts
+    }
+
+    async fn list_user_reactions(&self, message_id: &str, user_sub: &str) -> Vec<String> {
+        let mut mine: Vec<String> = self
+            .reactions
+            .lock()
+            .expect("reactions lock poisoned")
+            .iter()
+            .filter(|r| r.message_id == message_id && r.user_sub == user_sub)
+            .map(|r| r.emoji.clone())
+            .collect();
+        mine.sort();
+        mine
+    }
+
+    async fn count_replies(&self, message_id: &str) -> i64 {
+        self.messages
+            .lock()
+            .expect("messages lock poisoned")
+            .iter()
+            .filter(|m| m.reply_to_id.as_deref() == Some(message_id))
+            .count() as i64
+    }
+
     async fn list_all_rooms(&self) -> Vec<Room> {
         let mut out: Vec<Room> = self
             .rooms
@@ -392,10 +496,21 @@ impl Store for InMemoryStore {
             .lock()
             .expect("memberships lock poisoned")
             .retain(|m| m.room_id != room_id);
-        self.messages
+        // Capture the message ids in this room so their reactions can be purged too.
+        let doomed: Vec<String> = {
+            let mut messages = self.messages.lock().expect("messages lock poisoned");
+            let ids = messages
+                .iter()
+                .filter(|m| m.room_id == room_id)
+                .map(|m| m.id.clone())
+                .collect();
+            messages.retain(|m| m.room_id != room_id);
+            ids
+        };
+        self.reactions
             .lock()
-            .expect("messages lock poisoned")
-            .retain(|m| m.room_id != room_id);
+            .expect("reactions lock poisoned")
+            .retain(|r| !doomed.contains(&r.message_id));
         Ok(())
     }
 
@@ -536,6 +651,26 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
 
+        // Threaded-reply parent pointer. Nullable TEXT (no default => NULL = top-level post);
+        // added idempotently so an existing `messages` table upgrades in place.
+        sqlx::query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id TEXT")
+            .execute(&self.pool)
+            .await?;
+
+        // Message reactions: one row per (message, user, emoji). The composite PRIMARY KEY IS the
+        // uniqueness/idempotency guard, so a repeat toggle-on is a no-op via ON CONFLICT.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS message_reactions (\
+                 message_id TEXT NOT NULL, \
+                 user_sub TEXT NOT NULL, \
+                 emoji TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (message_id, user_sub, emoji)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Admin panel columns. Added idempotently so an existing schema upgrades in place
         // (portable ALTER — defaults backfill old rows, no data migration).
         sqlx::query(
@@ -559,6 +694,19 @@ impl PgStore {
         // Backs the "rooms this user belongs to" lookup.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships (user_sub)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Backs the per-message reaction tally + per-user reaction lookup.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_reactions_message \
+             ON message_reactions (message_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Backs the per-parent reply count.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages (reply_to_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -595,6 +743,7 @@ impl PgStore {
             created_at: row.try_get("created_at")?,
             edited_at: row.try_get("edited_at")?,
             deleted: row.try_get("deleted")?,
+            reply_to_id: row.try_get("reply_to_id")?,
         })
     }
 
@@ -732,7 +881,8 @@ impl PgStore {
         // (no dynamic string building).
         let cursor = before.unwrap_or(i64::MAX);
         let rows = sqlx::query(
-            "SELECT id, room_id, sender_sub, sender_email, body, created_at, edited_at, deleted \
+            "SELECT id, room_id, sender_sub, sender_email, body, created_at, edited_at, deleted, \
+             reply_to_id \
              FROM messages WHERE room_id = $1 AND created_at < $2 \
              ORDER BY created_at DESC, id DESC LIMIT $3",
         )
@@ -747,8 +897,9 @@ impl PgStore {
     async fn create_message_async(&self, m: &Message) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO messages \
-             (id, room_id, sender_sub, sender_email, body, created_at, edited_at, deleted) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (id, room_id, sender_sub, sender_email, body, created_at, edited_at, deleted, \
+              reply_to_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(&m.id)
         .bind(&m.room_id)
@@ -758,6 +909,7 @@ impl PgStore {
         .bind(m.created_at)
         .bind(m.edited_at)
         .bind(m.deleted)
+        .bind(&m.reply_to_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -765,7 +917,8 @@ impl PgStore {
 
     async fn get_message_async(&self, id: &str) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, room_id, sender_sub, sender_email, body, created_at, edited_at, deleted \
+            "SELECT id, room_id, sender_sub, sender_email, body, created_at, edited_at, deleted, \
+             reply_to_id \
              FROM messages WHERE id = $1",
         )
         .bind(id)
@@ -804,6 +957,87 @@ impl PgStore {
         Ok(())
     }
 
+    async fn toggle_reaction_async(
+        &self,
+        message_id: &str,
+        user_sub: &str,
+        emoji: &str,
+    ) -> Result<bool, sqlx::Error> {
+        // Toggle = try to delete the exact triple; if a row was removed it was ON, so we turned it
+        // OFF. If nothing was deleted it was absent, so we insert (ON CONFLICT DO NOTHING keeps the
+        // insert idempotent against a concurrent add). Standard SQL, no upsert-with-toggle needed.
+        let deleted = sqlx::query(
+            "DELETE FROM message_reactions \
+             WHERE message_id = $1 AND user_sub = $2 AND emoji = $3",
+        )
+        .bind(message_id)
+        .bind(user_sub)
+        .bind(emoji)
+        .execute(&self.pool)
+        .await?;
+        if deleted.rows_affected() > 0 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO message_reactions (message_id, user_sub, emoji, created_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (message_id, user_sub, emoji) DO NOTHING",
+        )
+        .bind(message_id)
+        .bind(user_sub)
+        .bind(emoji)
+        .bind(crate::now_secs())
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    async fn list_reactions_async(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<ReactionCount>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT emoji, COUNT(*) AS cnt FROM message_reactions \
+             WHERE message_id = $1 GROUP BY emoji \
+             ORDER BY COUNT(*) DESC, emoji ASC",
+        )
+        .bind(message_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(ReactionCount {
+                    emoji: r.try_get("emoji")?,
+                    count: r.try_get("cnt")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_user_reactions_async(
+        &self,
+        message_id: &str,
+        user_sub: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT emoji FROM message_reactions \
+             WHERE message_id = $1 AND user_sub = $2 ORDER BY emoji ASC",
+        )
+        .bind(message_id)
+        .bind(user_sub)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|r| r.try_get("emoji")).collect()
+    }
+
+    async fn count_replies_async(&self, message_id: &str) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query("SELECT COUNT(*) AS cnt FROM messages WHERE reply_to_id = $1")
+            .bind(message_id)
+            .fetch_one(&self.pool)
+            .await?;
+        row.try_get("cnt")
+    }
+
     async fn list_all_rooms_async(&self) -> Result<Vec<Room>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT id, name, kind, created_by, created_at, archived FROM rooms \
@@ -828,7 +1062,16 @@ impl PgStore {
     }
 
     async fn delete_room_async(&self, room_id: &str) -> Result<(), sqlx::Error> {
-        // Hard delete: messages + memberships first, then the room row. Portable, no FK cascade.
+        // Hard delete: reactions (via the room's messages) + messages + memberships first, then the
+        // room row. Portable, no FK cascade. The reaction sweep uses a correlated subquery so it
+        // stays standard SQL.
+        sqlx::query(
+            "DELETE FROM message_reactions WHERE message_id IN \
+             (SELECT id FROM messages WHERE room_id = $1)",
+        )
+        .bind(room_id)
+        .execute(&self.pool)
+        .await?;
         sqlx::query("DELETE FROM messages WHERE room_id = $1")
             .bind(room_id)
             .execute(&self.pool)
@@ -985,6 +1228,42 @@ impl Store for PgStore {
         self.delete_message_async(id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn toggle_reaction(
+        &self,
+        message_id: &str,
+        user_sub: &str,
+        emoji: &str,
+    ) -> Result<bool, StoreError> {
+        self.toggle_reaction_async(message_id, user_sub, emoji)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_reactions(&self, message_id: &str) -> Vec<ReactionCount> {
+        self.list_reactions_async(message_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_reactions failed");
+                Vec::new()
+            })
+    }
+
+    async fn list_user_reactions(&self, message_id: &str, user_sub: &str) -> Vec<String> {
+        self.list_user_reactions_async(message_id, user_sub)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_user_reactions failed");
+                Vec::new()
+            })
+    }
+
+    async fn count_replies(&self, message_id: &str) -> i64 {
+        self.count_replies_async(message_id).await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg count_replies failed");
+            0
+        })
     }
 
     async fn list_all_rooms(&self) -> Vec<Room> {

@@ -23,21 +23,24 @@
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod csrf;
 pub mod error;
 pub mod handlers;
 pub mod inbox;
 pub mod source;
+pub mod store;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use crate::audit::AuditSink;
 use crate::config::Config;
 use crate::inbox::{Engine, InboxCache, CACHE_TTL};
 use crate::source::{CurrentSource, KlaxonSource, MurmurSource, Source};
+use crate::store::{ActionStore, InMemoryActionStore, PgActionStore};
 
 /// Shared application state. Cheap to clone (everything behind `Arc` / a cloneable sink+cache).
 #[derive(Clone)]
@@ -46,6 +49,8 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     pub cache: InboxCache,
     pub audit: AuditSink,
+    /// The per-viewer mark-read / dismiss overlay (see [`crate::store`]).
+    pub store: Arc<dyn ActionStore>,
 }
 
 /// Build the router wiring all endpoints onto `state`.
@@ -56,6 +61,10 @@ pub fn app(state: AppState) -> Router {
         // JSON feed for the dashboard's live auto-refresh poll (re-renders unread sections without
         // a full page reload). Same viewer-scoped, cached read as `/`, just no page chrome.
         .route("/api/inbox", get(handlers::api::api_inbox))
+        // In-place row actions: mark-read / dismiss one aggregated row and re-render WITHOUT a full
+        // reload. State-changing POSTs, so each is guarded by the double-submit CSRF check.
+        .route("/api/inbox/read", post(handlers::actions::mark_read))
+        .route("/api/inbox/dismiss", post(handlers::actions::dismiss))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (healthz / dev).
@@ -88,16 +97,19 @@ pub fn build_dev_state() -> AppState {
         engine: Arc::new(Engine::default()),
         cache: InboxCache::new(CACHE_TTL),
         audit: AuditSink::disabled(),
+        store: Arc::new(InMemoryActionStore::new()),
     }
 }
 
-/// Build a dev state around a pre-built [`Engine`] (used by handler tests with fake sources).
+/// Build a dev state around a pre-built [`Engine`] (used by handler tests with fake sources). The
+/// action overlay is in-process, so tests can dismiss a row and observe it disappear.
 pub fn build_state_with_engine(engine: Engine) -> AppState {
     AppState {
         config: Arc::new(Config::dev()),
         engine: Arc::new(engine),
         cache: InboxCache::new(CACHE_TTL),
         audit: AuditSink::disabled(),
+        store: Arc::new(InMemoryActionStore::new()),
     }
 }
 
@@ -150,11 +162,32 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         config::env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
     );
 
+    // The mark-read / dismiss overlay Atrium owns. A configured DSN backs it with Postgres (schema
+    // ensured idempotently up front); if that bootstrap fails — or no DSN is set — fall back to the
+    // in-process store so actions still work single-node and startup is never fatal.
+    let store: Arc<dyn ActionStore> = match &config.atrium_dsn {
+        Some(dsn) => match PgActionStore::connect(dsn).await {
+            Ok(s) => {
+                tracing::info!("action overlay backed by ATRIUM_DATABASE_URL (Postgres)");
+                Arc::new(s)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "ATRIUM_DATABASE_URL unusable — actions overlay is in-process only");
+                Arc::new(InMemoryActionStore::new())
+            }
+        },
+        None => {
+            tracing::info!("no ATRIUM_DATABASE_URL — actions overlay is in-process only");
+            Arc::new(InMemoryActionStore::new())
+        }
+    };
+
     Ok(AppState {
         config: Arc::new(config),
         engine: Arc::new(Engine::new(chat, notifications, feed)),
         cache: InboxCache::new(CACHE_TTL),
         audit,
+        store,
     })
 }
 

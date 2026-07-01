@@ -23,6 +23,10 @@ pub const MAX_BODY_CHARS: usize = 8 * 1024;
 /// Maximum room name length, in characters.
 pub const MAX_ROOM_NAME_CHARS: usize = 120;
 
+/// Maximum reaction emoji length, in characters. Generous enough for multi-codepoint emoji
+/// (skin-tone modifiers, ZWJ / flag sequences) while rejecting arbitrary text as a "reaction".
+pub const MAX_EMOJI_CHARS: usize = 32;
+
 /// Tombstone body a message is redacted TO by an admin/moderator (replaces the original text).
 pub const REDACTED_BODY: &str = "[removed by moderator]";
 

@@ -24,6 +24,8 @@
 //! - `GET  /settings/webhooks`        list this user's webhooks + create form (SSO)
 //! - `POST /settings/webhooks`        register a webhook (SSO, CSRF)
 //! - `POST /settings/webhooks/delete` delete one of this user's webhooks (SSO, CSRF)
+//! - `GET  /settings/prefs`           this user's delivery preferences form (SSO)
+//! - `POST /settings/prefs`           save this user's delivery preferences (SSO, CSRF)
 //! - `GET  /vapidPublicKey`  the configured VAPID public key, or empty
 
 pub mod audit;
@@ -72,6 +74,10 @@ pub fn app(state: AppState) -> Router {
             get(handlers::webhooks::index).post(handlers::webhooks::create),
         )
         .route("/settings/webhooks/delete", post(handlers::webhooks::delete))
+        .route(
+            "/settings/prefs",
+            get(handlers::prefs::index).post(handlers::prefs::save),
+        )
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (health/ingest/dev).

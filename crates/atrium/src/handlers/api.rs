@@ -11,7 +11,7 @@
 //! background poll fires every 20 s per open tab, so auditing it would flood Watchtower for zero
 //! extra signal (the `inbox.view` / `source_unavailable` events already ride the page load).
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::Serialize;
@@ -19,7 +19,8 @@ use serde::Serialize;
 use crate::auth;
 use crate::config::SECTION_LIMIT;
 use crate::handlers::dashboard::{empty_inbox, render_columns, render_summary};
-use crate::inbox::Inbox;
+use crate::handlers::InboxQuery;
+use crate::inbox::{self, Inbox, ViewFilter};
 use crate::AppState;
 
 /// The live-refresh payload: the grand unread total plus the two pre-rendered HTML fragments the
@@ -36,16 +37,27 @@ pub struct InboxPayload {
 
 /// `GET /api/inbox` — the aggregated inbox as JSON for the client poll. Scoped to the injected
 /// viewer subject; an unauthenticated probe gets the same empty shell the page renders.
-pub async fn api_inbox(State(state): State<AppState>, headers: HeaderMap) -> Json<InboxPayload> {
+pub async fn api_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InboxQuery>,
+) -> Json<InboxPayload> {
     let now = crate::now_secs();
+    let filter = ViewFilter::new(query.q, query.source);
 
     // No gateway identity -> nothing to federate; return the calm empty shell (matches the page).
     let Some(sub) = auth::subject(&headers) else {
-        return Json(payload(&empty_inbox(), now));
+        let empty = empty_inbox();
+        let view = inbox::view(&empty, &Default::default(), &filter);
+        return Json(payload(&view, now));
     };
 
-    let (inbox, _fresh) = state.cache.get(&state.engine, &sub, SECTION_LIMIT).await;
-    Json(payload(&inbox, now))
+    let (raw, _fresh) = state.cache.get(&state.engine, &sub, SECTION_LIMIT).await;
+    // Hide acted-on rows (fail-open on a down overlay DB) and apply the search + source filter, so
+    // the live poll re-renders exactly what the filtered page shows.
+    let hidden = state.store.hidden(&sub).await.unwrap_or_default();
+    let view = inbox::view(&raw, &hidden, &filter);
+    Json(payload(&view, now))
 }
 
 /// Build the JSON payload by reusing the page's own render helpers.

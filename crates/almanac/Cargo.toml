@@ -34,6 +34,10 @@ tracing-subscriber = "0.3"
 getrandom = "0.2"
 # Hex-encode the random bytes for the CSRF token / row ids.
 hex = "0.4"
+# HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). Shared
+# primitive with the rest of the estate; the canonical message matches Sluice's Go signer.
+hmac = "0.12"
+sha2 = "0.10"
 # Calendar math (month grid, weekday of the 1st, days-in-month) + epoch <-> UTC components for
 # the datetime-local form inputs and human-readable labels. `std` only — no extra C deps.
 time = { version = "0.3", default-features = false, features = ["std"] }

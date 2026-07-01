@@ -40,6 +40,10 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # libc-backed shim, and `hex` (already used by watchtower) encodes the bytes.
 getrandom = "0.2"
 hex = "0.4"
+# HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). Shared
+# primitive with the rest of the estate; the canonical message matches Sluice's Go signer.
+hmac = "0.12"
+sha2 = "0.10"
 # Split the WebSocket into a Sink/Stream pair so the send loop (broadcast fan-out) and the
 # receive loop (client close/keepalive) run concurrently over one socket.
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

@@ -14,7 +14,7 @@ const APP_CSS: &str = include_str!("../static/app.css");
 const LAYOUT: &str = include_str!("../templates/layout.html");
 
 /// Cross-subdomain SSO logout (terminated at the Keystone IdP behind the gateway).
-const LOGOUT_URL: &str = "https://id.w33d.xyz/_gw/auth/logout";
+const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 
 /// The right side of the app-bar: an "All apps" pill back to the apex portal, the signed-in user
 /// chip (avatar initial + email) when a gateway identity is known, and the cross-subdomain logout
@@ -132,7 +132,7 @@ mod tests {
         assert!(html.contains("<p>hi</p>"));
         assert!(html.contains("me@holdfast.local"));
         assert!(html.contains("HOLDFAST"));
-        assert!(html.contains("id.w33d.xyz/_gw/auth/logout"));
+        assert!(html.contains("sso.w33d.xyz/_gw/auth/logout"));
     }
 
     #[test]

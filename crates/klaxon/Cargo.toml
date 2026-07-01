@@ -41,6 +41,10 @@ rand = "0.8"
 # Stateful async generator for the `/api/stream` Server-Sent-Events poller. Pure Rust
 # (futures-core only) — no OpenSSL, no extra runtime.
 async-stream = "0.3"
+# HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). Shared
+# primitive with the rest of the estate; the canonical message matches Sluice's Go signer.
+hmac = "0.12"
+sha2 = "0.10"
 # Portable PostgreSQL data layer. Runtime queries only (sqlx::query/Row) — NO compile-time
 # macros, so the build needs NO database. rustls TLS (ring) — no openssl. The same standard SQL
 # later runs unchanged on FusionDB over pgwire.

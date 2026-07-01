@@ -155,7 +155,6 @@ async fn open_dm_is_deterministic_and_bidirectional() {
 async fn dm_messages_flow_and_third_party_locked_out() {
     let state = build_dev_state();
     let alice = Some(("u_alice", "alice@hf"));
-    let bob = Some(("u_bob", "bob@hf"));
 
     let (_, body) = call(
         &state,

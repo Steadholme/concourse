@@ -131,6 +131,26 @@ async fn vapid_public_key_is_returned() {
 }
 
 #[tokio::test]
+async fn sw_js_is_served_as_javascript_with_root_scope() {
+    let st = state();
+    let resp = send(&st, Request::builder().uri("/sw.js").body(Body::empty()).unwrap()).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let ct = resp
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(ct.starts_with("application/javascript"), "content type: {ct}");
+    assert_eq!(
+        resp.headers.get("service-worker-allowed").and_then(|v| v.to_str().ok()),
+        Some("/"),
+        "root scope must be explicitly allowed"
+    );
+    assert!(resp.body.contains("showNotification"), "push display handler present");
+    assert!(resp.body.contains("notificationclick"), "click handler present");
+}
+
+#[tokio::test]
 async fn ingest_requires_valid_bearer() {
     let st = state();
     let body = format!(r#"{{"user_sub":"{SUBJECT}","source":"loom","title":"PR merged"}}"#);
@@ -226,6 +246,88 @@ async fn mark_read_requires_csrf_then_succeeds() {
     // Now the inbox shows zero unread.
     let page = send(&st, inbox(SUBJECT, EMAIL)).await;
     assert!(page.body.contains(r#"<span class="count" data-zero="0">0</span>"#));
+}
+
+#[tokio::test]
+async fn subscribe_unsubscribe_roundtrip_is_owner_scoped() {
+    let st = state();
+    let page = send(&st, inbox(SUBJECT, EMAIL)).await;
+    let cookie = page.csrf_cookie().expect("csrf cookie set on first render");
+
+    // Subscribe this browser (the page JS posts endpoint + browser keys).
+    let req = form_post(
+        "/api/subscribe",
+        SUBJECT,
+        &cookie,
+        format!("csrf_token={cookie}&endpoint=https://push.example/ep1&p256dh=BKey&auth=AuthSecret"),
+    );
+    assert_eq!(send(&st, req).await.status, StatusCode::SEE_OTHER);
+    assert_eq!(st.store.list_subscriptions(SUBJECT).await.len(), 1);
+
+    // Unsubscribe requires CSRF.
+    let req = form_post(
+        "/api/unsubscribe",
+        SUBJECT,
+        &cookie,
+        "csrf_token=wrong&endpoint=https://push.example/ep1".to_string(),
+    );
+    assert_eq!(send(&st, req).await.status, StatusCode::UNAUTHORIZED);
+
+    // A foreign unsubscribe for the same endpoint removes nothing (owner-scoped delete).
+    let mallory_page = send(&st, inbox("u_mallory", "m@w33d.xyz")).await;
+    let mallory_cookie = mallory_page.csrf_cookie().unwrap();
+    let req = form_post(
+        "/api/unsubscribe",
+        "u_mallory",
+        &mallory_cookie,
+        format!("csrf_token={mallory_cookie}&endpoint=https://push.example/ep1"),
+    );
+    assert_eq!(send(&st, req).await.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        st.store.list_subscriptions(SUBJECT).await.len(),
+        1,
+        "owner's subscription survives a foreign unsubscribe"
+    );
+
+    // The owner unsubscribes -> the row is gone.
+    let req = form_post(
+        "/api/unsubscribe",
+        SUBJECT,
+        &cookie,
+        format!("csrf_token={cookie}&endpoint=https://push.example/ep1"),
+    );
+    assert_eq!(send(&st, req).await.status, StatusCode::SEE_OTHER);
+    assert!(st.store.list_subscriptions(SUBJECT).await.is_empty());
+}
+
+#[tokio::test]
+async fn test_notification_requires_identity_and_csrf() {
+    let st = state();
+
+    // No SSO identity -> 401 (identity guard).
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/test")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from("csrf_token=x"))
+        .unwrap();
+    assert_eq!(send(&st, req).await.status, StatusCode::UNAUTHORIZED);
+
+    // Identity but mismatched CSRF -> 401 (double-submit guard).
+    let page = send(&st, inbox(SUBJECT, EMAIL)).await;
+    let cookie = page.csrf_cookie().expect("csrf cookie set on first render");
+    let req = form_post("/api/test", SUBJECT, &cookie, "csrf_token=wrong".to_string());
+    assert_eq!(send(&st, req).await.status, StatusCode::UNAUTHORIZED);
+
+    // Valid -> 303, and the test notification lands in the CALLER's own inbox.
+    let req = form_post("/api/test", SUBJECT, &cookie, format!("csrf_token={cookie}"));
+    assert_eq!(send(&st, req).await.status, StatusCode::SEE_OTHER);
+    let page = send(&st, inbox(SUBJECT, EMAIL)).await;
+    assert!(page.body.contains("Test notification"));
+
+    // Nobody else sees it (self-addressed only).
+    let other = send(&st, inbox("u_mallory", "m@w33d.xyz")).await;
+    assert!(!other.body.contains("Test notification"));
 }
 
 #[tokio::test]

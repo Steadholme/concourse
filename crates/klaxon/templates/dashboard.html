@@ -29,7 +29,11 @@
     </div>
     <div class="prefs__status">
       <span id="push-msg"></span>
-      <button id="push-btn" class="btn btn-secondary btn-sm" type="button">Register this browser</button>
+      <button id="push-btn" class="btn btn-secondary btn-sm" type="button" hidden>Enable push</button>
+      <form class="inline-form" method="post" action="/api/test">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <button class="btn btn-ghost btn-sm" type="submit">Send test notification</button>
+      </form>
     </div>
   </section>
 
@@ -63,8 +67,19 @@
   // ---- Web Push registration ------------------------------------------------
   var btn = document.getElementById("push-btn");
   var msg = document.getElementById("push-msg");
+  var subscribed = false;
 
   function setMsg(t) { if (msg) msg.textContent = t; }
+  function setBtn(label, disabled) {
+    if (!btn) { return; }
+    btn.hidden = false;
+    btn.textContent = label;
+    btn.disabled = !!disabled;
+  }
+  function permissionDenied() {
+    setMsg("Notifications are blocked for this site — allow them in your browser settings first.");
+    setBtn("Enable push", true);
+  }
 
   function urlB64ToUint8Array(base64String) {
     var padding = "=".repeat((4 - (base64String.length % 4)) % 4);
@@ -82,48 +97,111 @@
     return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
+  // Graceful fallbacks: no SW/Push support, or no server keypair — text only, no button.
   if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
-    if (btn) { btn.disabled = true; }
-    setMsg("Not supported in this browser");
+    setMsg("Push is not supported in this browser — notifications still collect in this inbox.");
     return;
   }
   if (!VAPID_PUBLIC) {
-    if (btn) { btn.disabled = true; }
     setMsg("Server push keys not configured");
     return;
   }
 
-  btn.addEventListener("click", function () {
-    btn.disabled = true;
+  // The application-server key, fetched fresh (falls back to the page-embedded copy).
+  function serverKey() {
+    return fetch("/vapidPublicKey", { credentials: "same-origin" }).then(function (resp) {
+      return resp.ok ? resp.text() : "";
+    }).catch(function () {
+      return "";
+    }).then(function (key) {
+      key = (key || "").trim() || VAPID_PUBLIC;
+      if (!key) { throw new Error("push keys not configured"); }
+      return urlB64ToUint8Array(key);
+    });
+  }
+
+  // POST a CSRF-carrying form body to a same-origin endpoint; reject on a non-2xx answer.
+  function postForm(path, fields) {
+    var body = new URLSearchParams();
+    body.set("csrf_token", CSRF);
+    Object.keys(fields || {}).forEach(function (k) { body.set(k, fields[k]); });
+    return fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      credentials: "same-origin",
+      body: body.toString()
+    }).then(function (resp) {
+      if (!resp.ok) { throw new Error("server said " + resp.status); }
+    });
+  }
+
+  function currentSubscription() {
+    return navigator.serviceWorker.getRegistration("/").then(function (reg) {
+      return reg ? reg.pushManager.getSubscription() : null;
+    });
+  }
+
+  // Reflect the browser's actual state into the button on load.
+  function refresh() {
+    currentSubscription().then(function (sub) {
+      subscribed = !!sub;
+      if (Notification.permission === "denied") { permissionDenied(); return; }
+      setMsg(subscribed ? "This browser receives push" : "");
+      setBtn(subscribed ? "Disable push" : "Enable push", false);
+    }).catch(function () {
+      setBtn("Enable push", false);
+    });
+  }
+
+  function enable() {
+    setBtn("Enable push", true);
     setMsg("Registering…");
-    navigator.serviceWorker.register("/sw.js").then(function (reg) {
+    navigator.serviceWorker.register("/sw.js", { scope: "/" }).then(function (reg) {
       return Notification.requestPermission().then(function (perm) {
         if (perm !== "granted") { throw new Error("permission " + perm); }
-        return reg.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: urlB64ToUint8Array(VAPID_PUBLIC)
+        return serverKey().then(function (key) {
+          return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
         });
       });
     }).then(function (sub) {
       var json = sub.toJSON();
-      var body = new URLSearchParams();
-      body.set("csrf_token", CSRF);
-      body.set("endpoint", sub.endpoint);
-      body.set("p256dh", (json.keys && json.keys.p256dh) || b64(sub.getKey("p256dh")));
-      body.set("auth", (json.keys && json.keys.auth) || b64(sub.getKey("auth")));
-      return fetch("/api/subscribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        credentials: "same-origin",
-        body: body.toString()
+      return postForm("/api/subscribe", {
+        endpoint: sub.endpoint,
+        p256dh: (json.keys && json.keys.p256dh) || b64(sub.getKey("p256dh")),
+        auth: (json.keys && json.keys.auth) || b64(sub.getKey("auth"))
       });
     }).then(function () {
-      setMsg("This browser is registered");
+      subscribed = true;
+      setMsg("This browser receives push");
+      setBtn("Disable push", false);
     }).catch(function (err) {
-      btn.disabled = false;
+      if (Notification.permission === "denied") { permissionDenied(); return; }
       setMsg("Could not register: " + err.message);
+      setBtn("Enable push", false);
     });
-  });
+  }
+
+  function disable() {
+    setBtn("Disable push", true);
+    setMsg("Unregistering…");
+    currentSubscription().then(function (sub) {
+      if (!sub) { return null; }
+      var endpoint = sub.endpoint;
+      return sub.unsubscribe().then(function () {
+        return postForm("/api/unsubscribe", { endpoint: endpoint });
+      });
+    }).then(function () {
+      subscribed = false;
+      setMsg("Push disabled in this browser");
+      setBtn("Enable push", false);
+    }).catch(function (err) {
+      setMsg("Could not disable: " + err.message);
+      setBtn(subscribed ? "Disable push" : "Enable push", false);
+    });
+  }
+
+  btn.addEventListener("click", function () { subscribed ? disable() : enable(); });
+  refresh();
 })();
 </script>
 </body>

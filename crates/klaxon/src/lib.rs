@@ -20,7 +20,10 @@
 //! - `GET  /`               inbox: this user's notifications (unread first) + push registration
 //! - `POST /api/read`        mark one/all read (SSO, CSRF)
 //! - `POST /api/subscribe`   store a Web Push subscription (SSO, CSRF)
+//! - `POST /api/unsubscribe` remove this browser's Web Push subscription (SSO, CSRF)
+//! - `POST /api/test`        send yourself a test notification through the fan-out (SSO, CSRF)
 //! - `GET  /api/stream`      Server-Sent-Events live stream of new notifications (SSO)
+//! - `GET  /sw.js`           the push-display service worker (same-origin, scope `/`)
 //! - `GET  /settings/webhooks`        list this user's webhooks + create form (SSO)
 //! - `POST /settings/webhooks`        register a webhook (SSO, CSRF)
 //! - `POST /settings/webhooks/delete` delete one of this user's webhooks (SSO, CSRF)
@@ -68,6 +71,8 @@ pub fn app(state: AppState) -> Router {
         .route("/", get(handlers::inbox::index))
         .route("/api/read", post(handlers::inbox::mark_read))
         .route("/api/subscribe", post(handlers::inbox::subscribe))
+        .route("/api/unsubscribe", post(handlers::inbox::unsubscribe))
+        .route("/api/test", post(handlers::inbox::send_test))
         .route("/api/stream", get(handlers::inbox::stream))
         .route(
             "/settings/webhooks",

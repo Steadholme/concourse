@@ -1,8 +1,8 @@
 // HOLDFAST Klaxon — minimal Web Push display service worker.
-// Registered by the inbox page so the browser will accept a PushManager subscription. On a push
-// message it shows a notification; clicking it focuses/open the inbox. Klaxon itself stores
-// subscriptions and records delivery intent; the encrypted server-side send is a deferred
-// refinement, but this worker makes the browser-side registration a real, end-to-end flow.
+// Registered from the inbox page with scope '/'. On a push message it decodes the (RFC 8291
+// encrypted, JSON) payload sent by Klaxon's fan-out and shows a notification; clicking it focuses
+// an already-open tab for the target URL, or opens one. Everything is defensive: a payload that
+// is missing, non-JSON, or partial still produces a usable notification.
 
 self.addEventListener('install', function (event) {
   self.skipWaiting();
@@ -13,7 +13,7 @@ self.addEventListener('activate', function (event) {
 });
 
 self.addEventListener('push', function (event) {
-  var payload = { title: 'New notification', body: '', url: '/' };
+  var payload = { title: 'New notification', body: '', url: '/', icon: undefined };
   try {
     if (event.data) {
       payload = Object.assign(payload, event.data.json());
@@ -26,9 +26,8 @@ self.addEventListener('push', function (event) {
   event.waitUntil(
     self.registration.showNotification(payload.title || 'New notification', {
       body: payload.body || '',
-      data: { url: payload.url || '/' },
-      icon: undefined,
-      badge: undefined
+      icon: payload.icon || undefined,
+      data: { url: payload.url || '/' }
     })
   );
 });
@@ -38,14 +37,15 @@ self.addEventListener('notificationclick', function (event) {
   var url = (event.notification.data && event.notification.data.url) || '/';
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (list) {
+      var target;
+      try { target = new URL(url, self.location.origin).href; } catch (e) { target = url; }
       for (var i = 0; i < list.length; i++) {
-        if ('focus' in list[i]) {
-          list[i].focus();
-          return;
+        if (list[i].url === target && 'focus' in list[i]) {
+          return list[i].focus();
         }
       }
       if (self.clients.openWindow) {
-        return self.clients.openWindow(url);
+        return self.clients.openWindow(target);
       }
     })
   );

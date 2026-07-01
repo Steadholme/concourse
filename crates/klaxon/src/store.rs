@@ -148,6 +148,10 @@ pub trait Store: Send + Sync {
     async fn upsert_subscription(&self, sub: &PushSubscription) -> Result<(), StoreError>;
     /// A user's Web Push subscriptions (fan-out targets).
     async fn list_subscriptions(&self, key: &str) -> Vec<PushSubscription>;
+    /// Delete one of a user's Web Push subscriptions by endpoint. Owner-scoped: only a row whose
+    /// `user_sub` matches `key` AND whose endpoint matches is removed. Returns the number of rows
+    /// deleted (0 or 1).
+    async fn delete_subscription(&self, key: &str, endpoint: &str) -> Result<u64, StoreError>;
     /// Register an outbound webhook for a user.
     async fn create_webhook(&self, hook: &Webhook) -> Result<(), StoreError>;
     /// A user's registered webhooks (fan-out targets), newest-first.
@@ -272,6 +276,13 @@ impl Store for InMemoryStore {
             .filter(|s| s.user_sub == key)
             .cloned()
             .collect()
+    }
+
+    async fn delete_subscription(&self, key: &str, endpoint: &str) -> Result<u64, StoreError> {
+        let mut subs = self.subscriptions.lock().expect("subscriptions lock poisoned");
+        let before = subs.len();
+        subs.retain(|s| !(s.user_sub == key && s.endpoint == endpoint));
+        Ok((before - subs.len()) as u64)
     }
 
     async fn create_webhook(&self, hook: &Webhook) -> Result<(), StoreError> {
@@ -617,6 +628,15 @@ impl PgStore {
         rows.iter().map(Self::subscription_from_row).collect()
     }
 
+    async fn delete_subscription_async(&self, key: &str, endpoint: &str) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_sub = $2")
+            .bind(endpoint)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn create_webhook_async(&self, h: &Webhook) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO webhooks (id, user_sub, url, secret, created_at) VALUES ($1, $2, $3, $4, $5)",
@@ -782,6 +802,12 @@ impl Store for PgStore {
             tracing::error!(error = %e, "pg list_subscriptions failed");
             Vec::new()
         })
+    }
+
+    async fn delete_subscription(&self, key: &str, endpoint: &str) -> Result<u64, StoreError> {
+        self.delete_subscription_async(key, endpoint)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     async fn create_webhook(&self, hook: &Webhook) -> Result<(), StoreError> {

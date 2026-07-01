@@ -1,9 +1,10 @@
-//! The SSO notification inbox: list, mark-read, Web Push subscribe, and the live SSE stream.
+//! The SSO notification inbox: list, mark-read, Web Push subscribe/unsubscribe, the self test
+//! notification, and the live SSE stream.
 //!
 //! Every endpoint here is mounted behind the Sluice `auth=sso` route: the viewer identity is
 //! ALWAYS taken from the injected `X-Auth-Subject` / `X-Auth-Email` (never a client field), and the
-//! inbox is scoped to that identity. State-changing POSTs (`/api/read`, `/api/subscribe`) are
-//! double-submit CSRF protected.
+//! inbox is scoped to that identity. State-changing POSTs (`/api/read`, `/api/subscribe`,
+//! `/api/unsubscribe`, `/api/test`) are double-submit CSRF protected.
 
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -16,10 +17,12 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Form;
 use serde::Deserialize;
 
+use crate::audit::AuditEvent;
 use crate::auth;
+use crate::delivery;
 use crate::error::AppError;
 use crate::handlers::{esc, fmt_datetime, safe_url, topbar, APP_CSS};
-use crate::store::PushSubscription;
+use crate::store::{Notification, PushSubscription};
 use crate::{new_id, now_secs, AppState};
 
 const DASHBOARD_HTML: &str = include_str!("../../templates/dashboard.html");
@@ -43,6 +46,23 @@ pub struct SubscribeForm {
     pub p256dh: String,
     #[serde(default)]
     pub auth: String,
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+/// Web Push unsubscribe form (posted by the page's registration JS): the subscription `endpoint`
+/// to remove, plus the CSRF token.
+#[derive(Debug, Deserialize)]
+pub struct UnsubscribeForm {
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+/// Test-notification form: just the CSRF token (the recipient is ALWAYS the signed-in user).
+#[derive(Debug, Deserialize)]
+pub struct TestForm {
     #[serde(default)]
     pub csrf_token: String,
 }
@@ -211,6 +231,93 @@ pub async fn subscribe(
     state.store.upsert_subscription(&sub).await?;
     tracing::info!(user = %sub.user_sub, "web push subscription stored");
 
+    // Audit: value-free detail (a push endpoint is a capability URL — never log it).
+    state.audit.emit(AuditEvent::notice(
+        "push.subscribe",
+        &sub.user_sub,
+        &sub.id,
+        "web push subscription stored",
+    ));
+
+    Ok(redirect("/"))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/unsubscribe — remove a Web Push subscription
+// ---------------------------------------------------------------------------
+
+/// `POST /api/unsubscribe` — remove this browser's Web Push subscription for the signed-in user.
+/// The delete is owner-scoped in the store, so a forged `endpoint` belonging to another user's
+/// subscription removes nothing.
+pub async fn unsubscribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UnsubscribeForm>,
+) -> Result<Response, AppError> {
+    let keys = auth::require_keys(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+
+    let endpoint = form.endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(AppError::InvalidRequest("endpoint is required".to_string()));
+    }
+
+    let owner = keys[0].clone();
+    let removed = state.store.delete_subscription(&owner, endpoint).await?;
+    tracing::info!(user = %owner, removed, "web push unsubscribe");
+
+    if removed > 0 {
+        state.audit.emit(AuditEvent::notice(
+            "push.unsubscribe",
+            &owner,
+            &owner,
+            "web push subscription removed",
+        ));
+    }
+
+    Ok(redirect("/"))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/test — send yourself a test notification
+// ---------------------------------------------------------------------------
+
+/// `POST /api/test` — store a self-addressed test notification and fan it out through the normal
+/// delivery path (Web Push / webhooks / email), honoring the owner's delivery preferences exactly
+/// like a real ingest. Lets a user verify their freshly-registered channels end-to-end.
+pub async fn send_test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TestForm>,
+) -> Result<Response, AppError> {
+    let keys = auth::require_keys(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+
+    let notification = Notification {
+        id: new_id("ntf"),
+        // The recipient is ALWAYS the signed-in subject — a user can only test their own channels.
+        user_sub: keys[0].clone(),
+        source: "klaxon".to_string(),
+        severity: "info".to_string(),
+        title: "Test notification".to_string(),
+        body: "This is a test from your Klaxon inbox. If it reached this browser or your webhook, delivery works.".to_string(),
+        url: state.config.public_base_url.clone(),
+        created_at: now_secs(),
+        read_at: 0,
+    };
+    state.store.create_notification(&notification).await?;
+    tracing::info!(user = %notification.user_sub, id = %notification.id, "test notification created");
+
+    state.audit.emit(AuditEvent::notice(
+        "notify.test",
+        &notification.user_sub,
+        &notification.id,
+        "self test notification",
+    ));
+
+    // Best-effort fan-out on a detached task — never blocks this response.
+    delivery::fan_out(state.clone(), notification);
+
     Ok(redirect("/"))
 }
 
@@ -259,10 +366,14 @@ pub async fn vapid_public_key(State(state): State<AppState>) -> Response {
 }
 
 /// `GET /sw.js` — the tiny push-display service worker registered by the inbox page. Served with a
-/// JS content type so the browser accepts it as a same-origin worker.
+/// JS content type so the browser accepts it as a same-origin worker, plus an explicit
+/// `Service-Worker-Allowed: /` so the root scope is always permitted.
 pub async fn service_worker() -> Response {
     (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::HeaderName::from_static("service-worker-allowed"), "/"),
+        ],
         SERVICE_WORKER_JS,
     )
         .into_response()

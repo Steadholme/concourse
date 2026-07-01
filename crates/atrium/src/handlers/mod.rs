@@ -56,44 +56,81 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// Render the shared app-bar: shield + HOLDFAST wordmark on the left; the page title, an
-/// "All apps" pill back to the apex portal, the signed-in user chip (avatar initial + email),
-/// and a Logout link to the gateway on the right. A probe with no known identity (email "—")
-/// drops the user chip but keeps the rest of the chrome.
-pub fn topbar(page_title: &str, email: &str) -> String {
-    let chip = if email.is_empty() || email == "—" {
-        String::new()
-    } else {
+/// Lucide-style line icons (viewBox 0 0 24 24, no fill, rounded caps) used across the app-bar.
+const IC_GRID: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>"#;
+const IC_USER: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"#;
+const IC_LOGOUT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>"#;
+const IC_INBOX: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>"#;
+
+/// The signed-in avatar menu — a CSS focus-within dropdown from the v2 kit. The button shows the
+/// user's initial + email; the dropdown lists Account, All apps, and the PRESERVED gateway sign-out
+/// link (same route/method as before). A blank identity falls back to a static glyph so the chrome
+/// always renders.
+fn usermenu(email: &str) -> String {
+    let signed_in = !(email.is_empty() || email == "—");
+    let (initial, name, head) = if signed_in {
         let initial = email
             .chars()
             .next()
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_else(|| "H".to_string());
-        format!(
-            r#"<span class="userchip"><span class="userchip__avatar" aria-hidden="true">{initial}</span><span class="user-email">{email}</span></span>"#,
-            initial = esc(&initial),
+        let initial = esc(&initial);
+        let head = format!(
+            r#"<div class="usermenu__head"><span class="avatar" aria-hidden="true">{initial}</span><div><b>{email}</b><span>Signed in</span></div></div>"#,
+            initial = initial,
             email = esc(email),
-        )
+        );
+        (initial, esc(email), head)
+    } else {
+        ("?".to_string(), "Account".to_string(), String::new())
     };
     format!(
-        r#"<header class="topbar">
-  <div class="topbar__inner">
-    <a class="brand" href="/" aria-label="HOLDFAST Atrium">
-      <span class="brand__glyph" aria-hidden="true">{shield}</span>
-      <span class="brand__word">HOLDFAST</span>
-    </a>
-    <div class="topbar__right">
-      <span class="topbar__title">{title}</span>
-      <a class="allapps" href="https://w33d.xyz" title="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>All apps</a>
-      {chip}
-      <a class="btn btn-ghost btn-sm" href="{logout}">Log out</a>
-    </div>
+        r#"<div class="usermenu">
+        <button class="usermenu__btn" type="button" aria-haspopup="menu" aria-expanded="false">
+          <span class="avatar" aria-hidden="true">{initial}</span>
+          <span class="usermenu__name">{name}</span>
+          <svg class="usermenu__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div class="usermenu__pop" role="menu">
+          {head}
+          <a class="menuitem" role="menuitem" href="https://account.w33d.xyz">{user}Account</a>
+          <a class="menuitem" role="menuitem" href="https://w33d.xyz">{grid}All apps</a>
+          <a class="menuitem menuitem--danger" role="menuitem" href="{logout}">{out}Log out</a>
+        </div>
+      </div>"#,
+        initial = initial,
+        name = name,
+        head = head,
+        user = IC_USER,
+        grid = IC_GRID,
+        out = IC_LOGOUT,
+        logout = LOGOUT_URL,
+    )
+}
+
+/// Render the shared v2 app-bar: an app-tile (inbox in Inbox's blue) + the Atrium/host lockup on
+/// the left; the surface's Inbox nav; then an "All apps" button back to the apex portal and the
+/// signed-in avatar menu on the right. A probe with no identity (email `"—"`) still renders a
+/// minimal avatar. Routes and the gateway logout are unchanged — only the chrome is modernized.
+pub fn topbar(page_title: &str, email: &str) -> String {
+    let _ = page_title;
+    format!(
+        r#"<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="HOLDFAST Atrium">
+    <span class="app-tile" style="--app:#2563eb;--app-soft:#e6effe" aria-hidden="true">{tile}</span>
+    <span class="appbar__name"><b>Atrium</b><span>inbox.w33d.xyz</span></span>
+  </a>
+  <nav class="appbar__nav" aria-label="Atrium"><a class="appnav is-active" href="/">{tab}Inbox</a></nav>
+  <div class="appbar__spacer"></div>
+  <div class="appbar__right">
+    <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps">{grid}</a>
+    {usermenu}
   </div>
 </header>"#,
-        shield = SHIELD_SVG,
-        title = esc(page_title),
-        chip = chip,
-        logout = LOGOUT_URL,
+        tile = IC_INBOX,
+        tab = IC_INBOX,
+        grid = IC_GRID,
+        usermenu = usermenu(email),
     )
 }
 

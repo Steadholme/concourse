@@ -35,45 +35,93 @@ pub fn esc(s: &str) -> String {
     crate::text::esc(s)
 }
 
-/// Render the shared app-bar: shield + HOLDFAST wordmark + page title on the left; an
-/// "All apps" pill back to the apex portal, the signed-in user chip (avatar initial + email),
-/// and a Logout link to the gateway on the right. Same chrome as every HOLDFAST service.
-pub fn topbar(page_title: &str, email: &str) -> String {
-    // The user chip: an avatar initial (first letter of the email) + the address. Omitted when
-    // no identity is known (e.g. public pages), keeping the rest of the chrome intact.
-    let chip = if email.is_empty() {
-        String::new()
-    } else {
+/// Lucide-style line icons (viewBox 0 0 24 24, no fill, rounded caps) used across the app-bar.
+const IC_GRID: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>"#;
+const IC_USER: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"#;
+const IC_LOGOUT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>"#;
+
+/// The signed-in avatar menu — a CSS focus-within dropdown from the v2 kit. The button shows the
+/// user's initial + email; the dropdown lists Account, All apps, and the PRESERVED gateway sign-out
+/// link (same route/method as before). A blank identity falls back to a static glyph so the chrome
+/// always renders.
+fn usermenu(email: &str) -> String {
+    let signed_in = !(email.is_empty() || email == "—");
+    let (initial, name, head) = if signed_in {
         let initial = email
             .chars()
             .next()
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_else(|| "H".to_string());
-        format!(
-            "<span class=\"userchip\"><span class=\"userchip__avatar\" aria-hidden=\"true\">{}</span><span class=\"user-email\">{}</span></span>",
-            esc(&initial),
-            esc(email),
-        )
+        let initial = esc(&initial);
+        let head = format!(
+            r#"<div class="usermenu__head"><span class="avatar" aria-hidden="true">{initial}</span><div><b>{email}</b><span>Signed in</span></div></div>"#,
+            initial = initial,
+            email = esc(email),
+        );
+        (initial, esc(email), head)
+    } else {
+        ("?".to_string(), "Account".to_string(), String::new())
     };
     format!(
-        r#"<header class="topbar">
-  <div class="topbar__inner">
-    <a class="brand" href="/" aria-label="HOLDFAST Murmur">
-      <span class="brand__glyph" aria-hidden="true">{shield}</span>
-      <span class="brand__word">HOLDFAST</span>
-    </a>
-    <div class="topbar__right">
-      <span class="topbar__title">{title}</span>
-      <a class="allapps" href="https://w33d.xyz" title="All apps"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>All apps</a>
-      {chip}
-      <a class="btn btn-ghost btn-sm" href="{logout}">Log out</a>
-    </div>
+        r#"<div class="usermenu">
+        <button class="usermenu__btn" type="button" aria-haspopup="menu" aria-expanded="false">
+          <span class="avatar" aria-hidden="true">{initial}</span>
+          <span class="usermenu__name">{name}</span>
+          <svg class="usermenu__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <div class="usermenu__pop" role="menu">
+          {head}
+          <a class="menuitem" role="menuitem" href="https://account.w33d.xyz">{user}Account</a>
+          <a class="menuitem" role="menuitem" href="https://w33d.xyz">{grid}All apps</a>
+          <a class="menuitem menuitem--danger" role="menuitem" href="{logout}">{out}Log out</a>
+        </div>
+      </div>"#,
+        initial = initial,
+        name = name,
+        head = head,
+        user = IC_USER,
+        grid = IC_GRID,
+        out = IC_LOGOUT,
+        logout = LOGOUT_URL,
+    )
+}
+
+/// Render the shared v2 app-bar: an app-tile (message-circle in Chat's green) + the Murmur/host
+/// lockup on the left; the surface's nav (Chat, plus Admin on moderator pages); then an "All apps"
+/// button back to the apex portal and the signed-in avatar menu on the right. Same routes and the
+/// same gateway logout as before — only the chrome is modernized.
+pub fn topbar(page_title: &str, email: &str) -> String {
+    let tile = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>"#;
+    let chat_ic = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>"#;
+    let admin_ic = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>"#;
+    // Regular chat pages surface only the Chat tab; moderator pages add an active Admin tab (both
+    // routes already exist — no new destinations invented).
+    let nav = if page_title == "Admin" {
+        format!(
+            r#"<a class="appnav" href="/">{chat}Chat</a><a class="appnav is-active" href="/admin">{admin}Admin</a>"#,
+            chat = chat_ic,
+            admin = admin_ic,
+        )
+    } else {
+        format!(r#"<a class="appnav is-active" href="/">{chat}Chat</a>"#, chat = chat_ic)
+    };
+    format!(
+        r#"<header class="appbar">
+  <a class="appbar__brand" href="/" aria-label="HOLDFAST Murmur">
+    <span class="app-tile" style="--app:#16a34a;--app-soft:#e6f6ec" aria-hidden="true">{tile}</span>
+    <span class="appbar__name"><b>Murmur</b><span>chat.w33d.xyz</span></span>
+  </a>
+  <nav class="appbar__nav" aria-label="Murmur">{nav}</nav>
+  <div class="appbar__spacer"></div>
+  <div class="appbar__right">
+    <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps">{grid}</a>
+    {usermenu}
   </div>
 </header>"#,
-        shield = SHIELD_SVG,
-        title = esc(page_title),
-        chip = chip,
-        logout = LOGOUT_URL,
+        tile = tile,
+        nav = nav,
+        grid = IC_GRID,
+        usermenu = usermenu(email),
     )
 }
 

@@ -9,27 +9,18 @@
   <style>{{STYLE}}</style>
 </head>
 <body class="page-almanac">
-  <header class="topbar">
-    <div class="topbar__inner">
-      <a class="brand brand--sm" href="/" aria-label="HOLDFAST Almanac home">
-        <span class="brand__glyph" aria-hidden="true">
-          <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <defs>
-              <linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse">
-                <stop stop-color="#818CF8"/>
-                <stop offset="1" stop-color="#4F46E5"/>
-              </linearGradient>
-            </defs>
-            <path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/>
-            <rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/>
-            <path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/>
-          </svg>
-        </span>
-        <span class="brand__word">HOLDFAST</span>
-      </a>
-      <span class="topbar__title">Almanac · Calendar &amp; Contacts</span>
-      {{USERBOX}}
-    </div>
+  <header class="appbar">
+    <a class="appbar__brand" href="/" aria-label="HOLDFAST Almanac">
+      <span class="app-tile" style="--app:#0891b2;--app-soft:#e0f5f9" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+      </span>
+      <span class="appbar__name"><b>Almanac</b><span>cal.w33d.xyz</span></span>
+    </a>
+    <nav class="appbar__nav" aria-label="Almanac">{{NAV}}</nav>
+    <div class="appbar__spacer"></div>
+    <div class="appbar__right">{{USERBOX}}</div>
   </header>
 
   <main class="wrap">

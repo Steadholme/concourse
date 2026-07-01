@@ -94,6 +94,8 @@ pub fn message_frame(m: &Message) -> String {
         "sender_email": m.sender_email,
         "body": m.body,
         "created_at": m.created_at,
+        "edited_at": m.edited_at,
+        "deleted": m.deleted,
     })
     .to_string()
 }

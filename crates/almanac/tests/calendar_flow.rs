@@ -261,6 +261,87 @@ async fn stored_text_is_escaped() {
 }
 
 #[tokio::test]
+async fn settings_timezone_shifts_rendering_and_persists() {
+    let state = build_dev_state();
+
+    // Default settings page renders UTC + Sunday-first selected.
+    let (status, headers, body) = call(&state, get_as("/settings", "u_alice", "a@x.co")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Settings"));
+    assert!(body.contains("value=\"UTC\" selected"), "UTC is the default timezone");
+    assert!(body.contains("value=\"sunday\" selected"), "Sunday-first is the default");
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+
+    // A POST with no CSRF cookie is rejected (nothing saved).
+    let forged = post_form(
+        "/settings",
+        "",
+        "u_alice",
+        "a@x.co",
+        &[("csrf_token", "x"), ("timezone", "UTC+08:00"), ("week_start", "monday")],
+    );
+    let (status, _h, _b) = call(&state, forged).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Save UTC+08:00 / Monday-first.
+    let save = post_form(
+        "/settings",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[("csrf_token", &csrf), ("timezone", "UTC+08:00"), ("week_start", "monday")],
+    );
+    let (status, _h, _b) = call(&state, save).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // The form now reflects the saved choice.
+    let (_s, _h, body) = call(&state, get_as("/settings", "u_alice", "a@x.co")).await;
+    assert!(body.contains("value=\"UTC+08:00\" selected"));
+    assert!(body.contains("value=\"monday\" selected"));
+
+    // Create an event: 10:00 typed under UTC+8 stores 02:00 UTC and renders back as 10:00 local.
+    let (_s, ch, _b) = call(&state, get_as("/new", "u_alice", "a@x.co")).await;
+    let ccookie = set_cookie(&ch).unwrap();
+    let ccsrf = cookie_value(&ccookie).unwrap();
+    let create = post_form(
+        "/new",
+        &ccookie,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &ccsrf),
+            ("title", "Tokyo sync"),
+            ("starts_at", "2099-06-15T10:00"),
+            ("ends_at", "2099-06-15T11:00"),
+        ],
+    );
+    let (status, _h, _b) = call(&state, create).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (_s, _h, month) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
+    assert!(month.contains("Tokyo sync"));
+    assert!(month.contains("10:00 Tokyo sync"), "chip time shown in the owner's timezone");
+    assert!(month.contains("times shown in UTC+08:00"), "footer names the timezone");
+    // Monday-first grid puts Monday in the first column.
+    let mon_idx = month.find(">Mon<").unwrap();
+    let sun_idx = month.find(">Sun<").unwrap();
+    assert!(mon_idx < sun_idx, "Monday column precedes Sunday");
+
+    // The edit form pre-fills the LOCAL wall-clock value.
+    let id = find_between(&month, "/edit/", "\"").expect("event id");
+    let (_s, _h, edit) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
+    assert!(edit.contains("value=\"2099-06-15T10:00\""), "edit shows local start time");
+
+    // Bob (still on UTC defaults) sees the same instant as 02:00, Sunday-first.
+    let (_s, _h, bob) = call(&state, get_as("/?y=2099&m=6", "u_bob", "b@x.co")).await;
+    assert!(bob.contains("times shown in UTC"));
+    let bob_mon = bob.find(">Mon<").unwrap();
+    let bob_sun = bob.find(">Sun<").unwrap();
+    assert!(bob_sun < bob_mon, "bob keeps the Sunday-first default");
+}
+
+#[tokio::test]
 async fn unknown_route_renders_404() {
     let state = build_dev_state();
     let (status, _h, body) = call(&state, get("/no/such/path")).await;

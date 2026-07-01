@@ -36,6 +36,13 @@ pub struct SendReq {
     pub body: String,
 }
 
+/// Body for `POST /api/rooms/{id}/messages/{msg_id}/edit`.
+#[derive(Debug, Deserialize)]
+pub struct EditReq {
+    #[serde(default)]
+    pub body: String,
+}
+
 /// Query for `GET /api/rooms/{id}/messages` — keyset cursor (messages strictly older than this).
 #[derive(Debug, Deserialize)]
 pub struct MessagesQuery {
@@ -171,6 +178,8 @@ pub async fn send(
         sender_email: email.clone(),
         body: body.to_string(),
         created_at: now_secs(),
+        edited_at: 0,
+        deleted: false,
     };
     state.store.create_message(&message).await?;
 
@@ -187,6 +196,90 @@ pub async fn send(
     ));
 
     Ok((StatusCode::CREATED, Json(json!({ "message": message }))).into_response())
+}
+
+/// `POST /api/rooms/{id}/messages/{msg_id}/edit` — the AUTHOR edits their own message body.
+/// Gated by `sender_sub == gateway subject`; CSRF-checked; persists, fans the updated frame out
+/// over the hub, and audits.
+pub async fn edit_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, msg_id)): Path<(String, String)>,
+    Json(req): Json<EditReq>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_user(&headers)?;
+    auth::verify_csrf(&headers)?;
+    require_membership(&state, &id, &sub).await?;
+
+    let existing = require_own_message(&state, &id, &msg_id, &sub).await?;
+    if existing.deleted {
+        return Err(AppError::InvalidRequest("message is deleted".to_string()));
+    }
+
+    let body = req.body.trim();
+    if body.is_empty() {
+        return Err(AppError::InvalidRequest("message body is required".to_string()));
+    }
+    if body.chars().count() > MAX_BODY_CHARS {
+        return Err(AppError::InvalidRequest("message body too long".to_string()));
+    }
+
+    let edited_at = now_secs();
+    state
+        .store
+        .edit_message(&msg_id, body, edited_at)
+        .await?;
+
+    // Re-read so the fan-out frame reflects the persisted row exactly.
+    let updated = state
+        .store
+        .get_message(&msg_id)
+        .await
+        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
+    state.hub.publish(&id, message_frame(&updated));
+
+    state.audit.emit(AuditEvent::info(
+        "chat.message.edit",
+        &actor(&email, &sub),
+        &msg_id,
+        &format!("len={}", body.chars().count()),
+    ));
+
+    Ok(Json(json!({ "message": updated })).into_response())
+}
+
+/// `POST /api/rooms/{id}/messages/{msg_id}/delete` — the AUTHOR soft-deletes their own message.
+/// Gated by `sender_sub == gateway subject`; CSRF-checked; marks deleted + clears the body, fans
+/// the updated frame out over the hub, and audits.
+pub async fn delete_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, msg_id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_user(&headers)?;
+    auth::verify_csrf(&headers)?;
+    require_membership(&state, &id, &sub).await?;
+
+    require_own_message(&state, &id, &msg_id, &sub).await?;
+
+    state.store.delete_message(&msg_id).await?;
+
+    let updated = state
+        .store
+        .get_message(&msg_id)
+        .await
+        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
+    state.hub.publish(&id, message_frame(&updated));
+
+    // Destructive action -> `notice` severity (value-free: which message, by whom).
+    state.audit.emit(AuditEvent::notice(
+        "chat.message.delete",
+        &actor(&email, &sub),
+        &msg_id,
+        "soft-deleted",
+    ));
+
+    Ok(Json(json!({ "message": updated })).into_response())
 }
 
 /// `POST /api/rooms/{id}/read` — advance the caller's read cursor (no CSRF; non-destructive).
@@ -218,6 +311,27 @@ async fn require_membership(state: &AppState, room_id: &str, sub: &str) -> Resul
         return Err(AppError::Forbidden("not a member of this room".to_string()));
     }
     Ok(())
+}
+
+/// Fetch a message and enforce that it lives in `room_id` AND was authored by `sub`
+/// (`created_by == gateway subject`). `NotFound` for a missing/other-room message; `Forbidden`
+/// when the caller is not the author. Returns the message so callers can inspect its state.
+async fn require_own_message(
+    state: &AppState,
+    room_id: &str,
+    msg_id: &str,
+    sub: &str,
+) -> Result<Message, AppError> {
+    let message = state
+        .store
+        .get_message(msg_id)
+        .await
+        .filter(|m| m.room_id == room_id)
+        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
+    if message.sender_sub != sub {
+        return Err(AppError::Forbidden("not the message author".to_string()));
+    }
+    Ok(message)
 }
 
 /// Prefer the email as the human-readable actor; fall back to the subject id.

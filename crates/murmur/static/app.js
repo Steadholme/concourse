@@ -52,10 +52,23 @@
     time.textContent = fmtTime(m.created_at);
     head.appendChild(author);
     head.appendChild(time);
+    if (m.edited_at && !m.deleted) {
+      var edited = document.createElement("span");
+      edited.className = "msg__edited";
+      edited.textContent = "(edited)";
+      head.appendChild(edited);
+    }
 
     var body = document.createElement("div");
     body.className = "msg__body";
-    appendLinkified(body, m.body || "");
+    if (m.deleted) {
+      var del = document.createElement("span");
+      del.className = "msg__deleted";
+      del.textContent = "[deleted]";
+      body.appendChild(del);
+    } else {
+      appendLinkified(body, m.body || "");
+    }
 
     row.appendChild(head);
     row.appendChild(body);
@@ -251,8 +264,13 @@
   }
 
   function onLiveMessage(frame) {
-    if (frame.room_id !== selected) return; // (unread bumps for other rooms: future work)
-    if (timeline && timeline.querySelector('[data-id="' + cssEscape(frame.id) + '"]')) return;
+    if (frame.room_id !== selected || !timeline) return; // (unread bumps for other rooms: future work)
+    // An edit/soft-delete arrives with the SAME id as an on-screen row: update it in place.
+    var existing = timeline.querySelector('[data-id="' + cssEscape(frame.id) + '"]');
+    if (existing) {
+      existing.parentNode.replaceChild(buildMessage(frame), existing);
+      return;
+    }
     var emptyEl = timeline ? timeline.querySelector(".timeline__empty") : null;
     if (emptyEl) emptyEl.remove();
     var nearBottom = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 80;

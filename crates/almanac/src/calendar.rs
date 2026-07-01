@@ -83,16 +83,36 @@ pub fn end_of_day(ms: i64) -> i64 {
     start_of_day(ms) + 86_400_000 - 1
 }
 
-/// Build the grid for `year`/`month` (1..=12). `today_ms` marks the live "today" cell.
+/// Build the grid for `year`/`month` (1..=12) in UTC, Sunday-first. `today_ms` marks the live
+/// "today" cell. Thin wrapper over [`build_month_at`] for the plain UTC callers/tests.
 pub fn build_month(year: i32, month: u8, today_ms: i64) -> MonthView {
+    build_month_at(year, month, today_ms, 0, false)
+}
+
+/// Build the grid in the owner's timezone. `off_min` shifts UTC into the owner's local wall clock
+/// (so day cells span LOCAL midnights and "today" is the owner's local date); `monday_first`
+/// selects a Monday-first column order. `off_min == 0 && !monday_first` reproduces [`build_month`].
+pub fn build_month_at(
+    year: i32,
+    month: u8,
+    today_ms: i64,
+    off_min: i32,
+    monday_first: bool,
+) -> MonthView {
     let month = month.clamp(1, 12);
     let m = num_to_month(month);
     let days = m.length(year);
     let first = Date::from_calendar_date(year, m, 1).expect("first-of-month is always valid");
-    // Number of leading padding cells: 0 (Sun) .. 6 (Sat).
-    let lead = first.weekday().number_days_from_sunday() as usize;
+    // Number of leading padding cells, relative to the chosen first column.
+    let lead = if monday_first {
+        first.weekday().number_days_from_monday()
+    } else {
+        first.weekday().number_days_from_sunday()
+    } as usize;
 
-    let (ty, tm, td) = match OffsetDateTime::from_unix_timestamp(today_ms.div_euclid(1000)) {
+    // "Today" is the owner's LOCAL calendar date.
+    let local_today = shift(today_ms, off_min);
+    let (ty, tm, td) = match OffsetDateTime::from_unix_timestamp(local_today.div_euclid(1000)) {
         Ok(dt) => (dt.year(), dt.month() as u8, dt.day()),
         Err(_) => (0, 0, 0),
     };
@@ -103,7 +123,10 @@ pub fn build_month(year: i32, month: u8, today_ms: i64) -> MonthView {
     }
     for d in 1..=days {
         let date = Date::from_calendar_date(year, m, d).expect("day in range is valid");
-        let start_ms = date.midnight().assume_utc().unix_timestamp() * 1000;
+        // Local midnight of this day, expressed as the real UTC instant (subtract the offset),
+        // so overlap tests against events' UTC `starts_at`/`ends_at` are apples-to-apples.
+        let local_midnight = date.midnight().assume_utc().unix_timestamp() * 1000;
+        let start_ms = shift(local_midnight, -off_min);
         cells.push(Some(DayCell {
             day: d,
             start_ms,
@@ -129,6 +152,62 @@ pub fn build_month(year: i32, month: u8, today_ms: i64) -> MonthView {
         prev,
         next,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-user timezone: a fixed UTC offset (minutes) shifts every render, and
+// week-start selects the grid's first column. No IANA tz database / DST — a
+// deliberately portable, dependency-free model matching the estate's constraints.
+// ---------------------------------------------------------------------------
+
+/// Minutes to ADD to a UTC epoch to reach the owner's local wall clock (e.g. `+480` for
+/// `UTC+08:00`, `-300` for `UTC-05:00`). Parsed from the stored timezone string; an unknown or
+/// blank value maps to `0` (UTC) so rendering never breaks. Clamped to +-14h.
+pub fn tz_offset_minutes(tz: &str) -> i32 {
+    let t = tz.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("UTC") {
+        return 0;
+    }
+    // Accept "UTC+HH:MM" / "UTC-HH:MM" and the bare "+HH:MM" / "-HH:MM" forms.
+    let rest = t.strip_prefix("UTC").or_else(|| t.strip_prefix("utc")).unwrap_or(t);
+    let (sign, hm) = match rest.as_bytes().first() {
+        Some(b'+') => (1, &rest[1..]),
+        Some(b'-') => (-1, &rest[1..]),
+        _ => return 0,
+    };
+    let (h, m) = hm.split_once(':').unwrap_or((hm, "0"));
+    let h: i32 = h.trim().parse().unwrap_or(0);
+    let m: i32 = m.trim().parse().unwrap_or(0);
+    (sign * (h * 60 + m)).clamp(-14 * 60, 14 * 60)
+}
+
+/// Shift a UTC epoch-ms by `off_min` minutes — the primitive behind every `_at` renderer.
+fn shift(ms: i64, off_min: i32) -> i64 {
+    ms + off_min as i64 * 60_000
+}
+
+/// Weekday column headers for the grid, respecting the owner's week-start.
+pub fn weekday_headers(monday_first: bool) -> [&'static str; 7] {
+    if monday_first {
+        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    } else {
+        WEEKDAY_HEADERS
+    }
+}
+
+/// `(year, month)` of the LOCAL month containing `ms` (for "current month" + post-save redirect).
+pub fn month_of_at(ms: i64, off_min: i32) -> (i32, u8) {
+    month_of(shift(ms, off_min))
+}
+
+/// Real UTC instant of the owner's LOCAL midnight for the day containing `ms`.
+pub fn start_of_day_at(ms: i64, off_min: i32) -> i64 {
+    shift(start_of_day(shift(ms, off_min)), -off_min)
+}
+
+/// Real UTC instant of the last millisecond of the owner's LOCAL day containing `ms`.
+pub fn end_of_day_at(ms: i64, off_min: i32) -> i64 {
+    start_of_day_at(ms, off_min) + 86_400_000 - 1
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +350,37 @@ pub fn fmt_event_when(starts_at: i64, ends_at: i64, all_day: bool) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Timezone-aware wrappers: format in / parse against the owner's local wall clock.
+// Each shifts the epoch by the offset, reuses the UTC primitive, then (for parsing)
+// shifts back so what is stored stays a real UTC instant.
+// ---------------------------------------------------------------------------
+
+/// `YYYY-MM-DDTHH:MM` in the owner's local wall clock, for pre-filling a `datetime-local` input.
+pub fn fmt_datetime_local_at(ms: i64, off_min: i32) -> String {
+    fmt_datetime_local(shift(ms, off_min))
+}
+
+/// Parse a `datetime-local` value the owner typed in LOCAL time -> the real UTC epoch ms to store.
+pub fn parse_datetime_local_at(s: &str, off_min: i32) -> Option<i64> {
+    parse_datetime_local(s).map(|ms| shift(ms, -off_min))
+}
+
+/// Parse a `date` value (`YYYY-MM-DD`) as the owner's LOCAL midnight -> real UTC epoch ms.
+pub fn parse_date_at(s: &str, off_min: i32) -> Option<i64> {
+    parse_date(s).map(|ms| shift(ms, -off_min))
+}
+
+/// Human time label in the owner's local wall clock, e.g. `14:30`.
+pub fn human_time_at(ms: i64, off_min: i32) -> String {
+    human_time(shift(ms, off_min))
+}
+
+/// A friendly "when" label rendered in the owner's local wall clock (see [`fmt_event_when`]).
+pub fn fmt_event_when_at(starts_at: i64, ends_at: i64, all_day: bool, off_min: i32) -> String {
+    fmt_event_when(shift(starts_at, off_min), shift(ends_at, off_min), all_day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +451,57 @@ mod tests {
         assert_eq!(fmt_event_when(s, e, false), "Jun 29, 2026 · 14:30 – 15:30");
         let day = parse_date("2026-06-29").unwrap();
         assert_eq!(fmt_event_when(day, end_of_day(day), true), "All day · Jun 29, 2026");
+    }
+
+    #[test]
+    fn tz_offset_parses_common_forms() {
+        assert_eq!(tz_offset_minutes("UTC"), 0);
+        assert_eq!(tz_offset_minutes(""), 0);
+        assert_eq!(tz_offset_minutes("UTC+08:00"), 480);
+        assert_eq!(tz_offset_minutes("UTC-05:00"), -300);
+        assert_eq!(tz_offset_minutes("UTC+05:30"), 330);
+        assert_eq!(tz_offset_minutes("-05:00"), -300);
+        assert_eq!(tz_offset_minutes("garbage"), 0, "unknown => UTC");
+        assert_eq!(tz_offset_minutes("UTC+99:00"), 14 * 60, "clamped to +14h");
+    }
+
+    #[test]
+    fn datetime_local_round_trips_in_a_timezone() {
+        // The owner in UTC+8 types 10:00 local; we store 02:00 UTC and render it back as 10:00.
+        let off = tz_offset_minutes("UTC+08:00");
+        let utc = parse_datetime_local_at("2026-06-29T10:00", off).unwrap();
+        // Stored value is the real UTC instant (02:00 UTC).
+        assert_eq!(fmt_datetime_local(utc), "2026-06-29T02:00");
+        assert_eq!(human_time(utc), "02:00");
+        // Rendered back through the offset, the owner sees their local 10:00.
+        assert_eq!(fmt_datetime_local_at(utc, off), "2026-06-29T10:00");
+        assert_eq!(human_time_at(utc, off), "10:00");
+    }
+
+    #[test]
+    fn grid_today_and_cells_shift_with_offset() {
+        // 2026-01-01 00:30 UTC is still 2025-12-31 (19:30) in UTC-05:00.
+        let now = parse_datetime_local("2026-01-01T00:30").unwrap();
+        let off = tz_offset_minutes("UTC-05:00");
+        let view = build_month_at(2025, 12, now, off, false);
+        let dec31 = view
+            .weeks
+            .iter()
+            .flatten()
+            .flatten()
+            .find(|c| c.day == 31)
+            .unwrap();
+        assert!(dec31.is_today, "local date is Dec 31, not Jan 1");
+        // The cell's start is the real UTC instant of local midnight (05:00 UTC).
+        assert_eq!(human_time(dec31.start_ms), "05:00");
+    }
+
+    #[test]
+    fn grid_monday_first_reorders_columns() {
+        assert_eq!(weekday_headers(false)[0], "Sun");
+        assert_eq!(weekday_headers(true)[0], "Mon");
+        // June 2026: the 1st is a Monday => Monday-first has zero leading pads.
+        let view = build_month_at(2026, 6, 0, 0, true);
+        assert_eq!(view.weeks[0][0].as_ref().unwrap().day, 1, "Monday column holds the 1st");
     }
 }

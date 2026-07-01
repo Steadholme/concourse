@@ -21,6 +21,7 @@
 //! - `POST /contacts/new` — add a contact.
 //! - `GET /contacts/edit/{id}` / `POST /contacts/edit/{id}` — edit a contact.
 //! - `POST /contacts/delete/{id}` — delete a contact.
+//! - `GET /settings` / `POST /settings` — the owner's timezone + week-start preferences.
 
 pub mod auth;
 pub mod calendar;
@@ -69,6 +70,11 @@ pub fn app(state: AppState) -> Router {
             get(handlers::contacts::edit_form).post(handlers::contacts::update),
         )
         .route("/contacts/delete/{id}", post(handlers::contacts::delete))
+        // Per-owner settings (timezone + week-start).
+        .route(
+            "/settings",
+            get(handlers::settings::index).post(handlers::settings::update),
+        )
         .fallback(handlers::not_found)
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.

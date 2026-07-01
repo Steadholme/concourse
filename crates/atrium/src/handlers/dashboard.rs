@@ -66,8 +66,9 @@ pub async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Htm
     Html(render(&inbox, &email, crate::now_secs()))
 }
 
-/// The empty inbox shown to an unauthenticated probe (all columns empty + available).
-fn empty_inbox() -> Inbox {
+/// The empty inbox shown to an unauthenticated probe (all columns empty + available). Shared with
+/// the JSON poll endpoint so both surfaces render the same calm shell.
+pub(crate) fn empty_inbox() -> Inbox {
     use crate::source::Section;
     Inbox {
         chat: SectionState::Ready(Section::empty()),
@@ -81,49 +82,51 @@ fn render(inbox: &Inbox, email: &str, now: i64) -> String {
         .replace("{{CSS}}", APP_CSS)
         .replace("{{TOPBAR}}", &topbar("Inbox", email))
         .replace("{{SUMMARY}}", &render_summary(inbox))
-        .replace(
-            "{{CHAT}}",
-            &render_column(
-                "Chat",
-                "Unread messages",
-                CHAT_URL,
-                "Open chat",
-                &inbox.chat,
-                row_chat,
-                "You're all caught up on chat.",
-                now,
-            ),
-        )
-        .replace(
-            "{{NOTIFS}}",
-            &render_column(
-                "Notifications",
-                "Unread alerts",
-                NOTIFY_URL,
-                "Open notifications",
-                &inbox.notifications,
-                row_notification,
-                "No unread notifications.",
-                now,
-            ),
-        )
-        .replace(
-            "{{FEED}}",
-            &render_column(
-                "Feed river",
-                "Fresh items",
-                RSS_URL,
-                "Open reader",
-                &inbox.feed,
-                row_feed,
-                "No fresh feed items.",
-                now,
-            ),
-        )
+        .replace("{{COLUMNS}}", &render_columns(inbox, now))
 }
 
-/// The summary bar: a grand total plus a per-column unread chip (or "—" when unavailable).
-fn render_summary(inbox: &Inbox) -> String {
+/// The three activity columns concatenated (Chat, Notifications, Feed). Shared by the full page
+/// render and by the JSON poll endpoint, which swaps this fragment into the `#columns-slot`
+/// container so a live refresh re-renders the columns without a full page reload.
+pub(crate) fn render_columns(inbox: &Inbox, now: i64) -> String {
+    format!(
+        "{}{}{}",
+        render_column(
+            "Chat",
+            "Unread messages",
+            CHAT_URL,
+            "Open chat",
+            &inbox.chat,
+            row_chat,
+            "You're all caught up on chat.",
+            now,
+        ),
+        render_column(
+            "Notifications",
+            "Unread alerts",
+            NOTIFY_URL,
+            "Open notifications",
+            &inbox.notifications,
+            row_notification,
+            "No unread notifications.",
+            now,
+        ),
+        render_column(
+            "Feed river",
+            "Fresh items",
+            RSS_URL,
+            "Open reader",
+            &inbox.feed,
+            row_feed,
+            "No fresh feed items.",
+            now,
+        ),
+    )
+}
+
+/// The summary bar: a grand total plus a per-column unread chip (or "—" when unavailable). Shared
+/// with the JSON poll endpoint, which swaps it into the `#summary-slot` container on each refresh.
+pub(crate) fn render_summary(inbox: &Inbox) -> String {
     let grand = inbox.total_unread();
     let lead = if grand == 0 {
         "You're all caught up".to_string()
@@ -399,6 +402,10 @@ mod tests {
         assert!(html.contains("Source unavailable"), "down notifications column degrades");
         assert!(html.contains("No fresh feed items."), "empty feed column shows caught-up state");
         assert!(html.contains("ops@w33d.xyz"), "signed-in email in app bar");
+        // Live auto-refresh wiring: the poll targets + fetch of the JSON endpoint are present.
+        assert!(html.contains(r#"id="summary-slot""#), "summary refresh slot present");
+        assert!(html.contains(r#"id="columns-slot""#), "columns refresh slot present");
+        assert!(html.contains("/api/inbox"), "poll fetches the JSON endpoint");
     }
 
     #[tokio::test]

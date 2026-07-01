@@ -10,6 +10,7 @@
 pub mod contacts;
 pub mod events;
 pub mod health;
+pub mod settings;
 
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};

@@ -18,6 +18,8 @@
 //! - `POST /api/rooms/{id}/join`      join a room (CSRF)
 //! - `GET  /api/rooms/{id}/messages`  recent messages (keyset `?before=`)
 //! - `POST /api/rooms/{id}/messages`  send `{body}` -> insert + broadcast (CSRF)
+//! - `POST /api/rooms/{id}/messages/{msg_id}/edit`    author edits `{body}` -> update + broadcast (CSRF)
+//! - `POST /api/rooms/{id}/messages/{msg_id}/delete`  author soft-deletes -> `[deleted]` + broadcast (CSRF)
 //! - `POST /api/rooms/{id}/read`      advance `last_read_at`
 //! - `GET  /ws`                       WebSocket: live messages/presence for the user's rooms
 
@@ -64,6 +66,14 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/rooms/{id}/messages",
             get(handlers::rooms::messages).post(handlers::rooms::send),
+        )
+        .route(
+            "/api/rooms/{id}/messages/{msg_id}/edit",
+            post(handlers::rooms::edit_message),
+        )
+        .route(
+            "/api/rooms/{id}/messages/{msg_id}/delete",
+            post(handlers::rooms::delete_message),
         )
         .route("/api/rooms/{id}/read", post(handlers::rooms::read))
         .route("/ws", get(handlers::ws::ws_handler))

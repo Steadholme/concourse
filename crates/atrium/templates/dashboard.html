@@ -17,12 +17,10 @@
     </div>
   </div>
 
-  {{SUMMARY}}
+  <div id="summary-slot">{{SUMMARY}}</div>
 
-  <div class="columns">
-    {{CHAT}}
-    {{NOTIFS}}
-    {{FEED}}
+  <div class="columns" id="columns-slot">
+    {{COLUMNS}}
   </div>
 
   <nav class="quicklinks" aria-label="Quick links">
@@ -33,5 +31,36 @@
     <a class="quicklinks__link" href="https://w33d.xyz">Home</a>
   </nav>
 </main>
+<script>
+// Live auto-refresh: poll the aggregated inbox JSON (~20 s) and swap the freshly server-rendered
+// summary + columns fragments into their slots WITHOUT a full page reload. Because only the inner
+// HTML of the two slots is replaced, the window scroll position is preserved. Every fragment is
+// server-escaped (identical to the initial render), so assigning innerHTML carries no new XSS risk.
+// A transient network error is swallowed — the last good render simply stays on screen.
+(function () {
+  var INTERVAL_MS = 20000;
+  function apply(id, html) {
+    if (typeof html !== 'string') return;
+    var el = document.getElementById(id);
+    if (el) el.innerHTML = html;
+  }
+  async function refresh() {
+    try {
+      var res = await fetch('/api/inbox', {
+        headers: { 'Accept': 'application/json' },
+        credentials: 'same-origin',
+        cache: 'no-store'
+      });
+      if (!res.ok) return;
+      var data = await res.json();
+      apply('summary-slot', data.summary);
+      apply('columns-slot', data.columns);
+    } catch (e) {
+      /* transient error — keep the current view */
+    }
+  }
+  setInterval(refresh, INTERVAL_MS);
+})();
+</script>
 </body>
 </html>

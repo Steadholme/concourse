@@ -251,6 +251,8 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .msg__time { font-size: 11px; color: var(--ink-3); }
 .msg__body { margin-top: 3px; color: var(--ink-2); font-size: 14px; line-height: 1.6; word-wrap: break-word; overflow-wrap: anywhere; white-space: normal; }
 .msg__body a { color: var(--accent-2); text-decoration: underline; text-underline-offset: 2px; }
+.msg__edited { font-size: 11px; color: var(--ink-3); font-style: italic; }
+.msg__deleted { color: var(--ink-3); font-style: italic; }
 
 /* ---- Composer ----------------------------------------------------------- */
 .composer {

@@ -83,8 +83,11 @@ pub trait Store: Send + Sync {
     async fn list_subscriptions(&self, key: &str) -> Vec<PushSubscription>;
     /// Register an outbound webhook for a user.
     async fn create_webhook(&self, hook: &Webhook) -> Result<(), StoreError>;
-    /// A user's registered webhooks (fan-out targets).
+    /// A user's registered webhooks (fan-out targets), newest-first.
     async fn list_webhooks(&self, key: &str) -> Vec<Webhook>;
+    /// Delete one of a user's webhooks by id. Owner-scoped: only a row whose `user_sub` matches
+    /// `key` AND whose id matches is removed. Returns the number of rows deleted (0 or 1).
+    async fn delete_webhook(&self, key: &str, id: &str) -> Result<u64, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -206,13 +209,24 @@ impl Store for InMemoryStore {
     }
 
     async fn list_webhooks(&self, key: &str) -> Vec<Webhook> {
-        self.webhooks
+        let mut v: Vec<Webhook> = self
+            .webhooks
             .lock()
             .expect("webhooks lock poisoned")
             .iter()
             .filter(|h| h.user_sub == key)
             .cloned()
-            .collect()
+            .collect();
+        // Newest-first for stable UI rendering, ties broken by id.
+        v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        v
+    }
+
+    async fn delete_webhook(&self, key: &str, id: &str) -> Result<u64, StoreError> {
+        let mut hooks = self.webhooks.lock().expect("webhooks lock poisoned");
+        let before = hooks.len();
+        hooks.retain(|h| !(h.user_sub == key && h.id == id));
+        Ok((before - hooks.len()) as u64)
     }
 }
 
@@ -488,12 +502,22 @@ impl PgStore {
 
     async fn list_webhooks_async(&self, key: &str) -> Result<Vec<Webhook>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT id, user_sub, url, secret, created_at FROM webhooks WHERE user_sub = $1",
+            "SELECT id, user_sub, url, secret, created_at FROM webhooks WHERE user_sub = $1 \
+             ORDER BY created_at DESC, id DESC",
         )
         .bind(key)
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(Self::webhook_from_row).collect()
+    }
+
+    async fn delete_webhook_async(&self, key: &str, id: &str) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM webhooks WHERE id = $1 AND user_sub = $2")
+            .bind(id)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -556,5 +580,11 @@ impl Store for PgStore {
             tracing::error!(error = %e, "pg list_webhooks failed");
             Vec::new()
         })
+    }
+
+    async fn delete_webhook(&self, key: &str, id: &str) -> Result<u64, StoreError> {
+        self.delete_webhook_async(key, id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 }

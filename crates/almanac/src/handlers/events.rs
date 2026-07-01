@@ -13,7 +13,7 @@ use axum::Form;
 use serde::Deserialize;
 
 use crate::auth;
-use crate::calendar::{self, DayCell, MonthView, WEEKDAY_HEADERS};
+use crate::calendar::{self, DayCell, MonthView};
 use crate::config::{AGENDA_LIMIT, DAY_CHIP_LIMIT};
 use crate::error::AppError;
 use crate::handlers::html_with_csrf_cookie;
@@ -75,8 +75,11 @@ pub async fn index(
     Query(q): Query<MonthQuery>,
 ) -> Result<Response, AppError> {
     let owner = auth::owner_subject(&headers);
+    let settings = state.store.get_settings(&owner).await?;
+    let off = calendar::tz_offset_minutes(&settings.timezone);
+    let monday_first = settings.week_start.eq_ignore_ascii_case("monday");
     let now = now_ms();
-    let (cur_y, cur_m) = calendar::month_of(now);
+    let (cur_y, cur_m) = calendar::month_of_at(now, off);
     let year = q.y.unwrap_or(cur_y);
     let month = match q.m {
         Some(m) if (1..=12).contains(&m) => m,
@@ -84,19 +87,27 @@ pub async fn index(
     };
 
     let events = state.store.list_events(&owner).await?;
-    let view = calendar::build_month(year, month, now);
+    let view = calendar::build_month_at(year, month, now, off, monday_first);
     let csrf = auth::new_csrf_token();
 
     let content = format!(
         "{}{}",
         render::subnav("calendar"),
-        render_calendar(&view, &events, now, &csrf)
+        render_calendar(&view, &events, now, &csrf, off, monday_first, &settings.timezone)
     );
     let html = layout("Calendar", &headers, &content);
     Ok(html_with_csrf_cookie(html, &csrf))
 }
 
-fn render_calendar(view: &MonthView, events: &[Event], now: i64, csrf: &str) -> String {
+fn render_calendar(
+    view: &MonthView,
+    events: &[Event],
+    now: i64,
+    csrf: &str,
+    off: i32,
+    monday_first: bool,
+    tz_label: &str,
+) -> String {
     let head = format!(
         "<div class=\"cal-head\">\
            <h1>{month} {year}</h1>\
@@ -115,7 +126,7 @@ fn render_calendar(view: &MonthView, events: &[Event], now: i64, csrf: &str) -> 
         nm = view.next.1,
     );
 
-    let weekdays: String = WEEKDAY_HEADERS
+    let weekdays: String = calendar::weekday_headers(monday_first)
         .iter()
         .map(|w| format!("<span class=\"cal-weekday\">{w}</span>"))
         .collect();
@@ -126,7 +137,7 @@ fn render_calendar(view: &MonthView, events: &[Event], now: i64, csrf: &str) -> 
         for cell in week {
             match cell {
                 None => weeks.push_str("<div class=\"cal-day cal-day--pad\"></div>"),
-                Some(c) => weeks.push_str(&render_day_cell(c, events)),
+                Some(c) => weeks.push_str(&render_day_cell(c, events, off)),
             }
         }
         weeks.push_str("</div>");
@@ -139,15 +150,16 @@ fn render_calendar(view: &MonthView, events: &[Event], now: i64, csrf: &str) -> 
            <div class=\"cal-weeks\">{weeks}</div>\
          </section>\
          {agenda}\
-         <p class=\"site-foot\">HOLDFAST Almanac · personal calendar &amp; contacts · times shown in UTC</p>",
+         <p class=\"site-foot\">HOLDFAST Almanac · personal calendar &amp; contacts · times shown in {tz}</p>",
         head = head,
         weekdays = weekdays,
         weeks = weeks,
-        agenda = render_agenda(events, now, csrf),
+        agenda = render_agenda(events, now, csrf, off),
+        tz = esc(tz_label),
     )
 }
 
-fn render_day_cell(c: &DayCell, events: &[Event]) -> String {
+fn render_day_cell(c: &DayCell, events: &[Event], off: i32) -> String {
     let day_events: Vec<&Event> = events
         .iter()
         .filter(|e| e.starts_at <= c.end_ms && e.ends_at >= c.start_ms)
@@ -158,11 +170,11 @@ fn render_day_cell(c: &DayCell, events: &[Event]) -> String {
         let label = if e.all_day {
             esc(&e.title)
         } else {
-            format!("{} {}", calendar::human_time(e.starts_at), esc(&e.title))
+            format!("{} {}", calendar::human_time_at(e.starts_at, off), esc(&e.title))
         };
         let tooltip = esc(&format!(
             "{} — {}",
-            calendar::fmt_event_when(e.starts_at, e.ends_at, e.all_day),
+            calendar::fmt_event_when_at(e.starts_at, e.ends_at, e.all_day, off),
             e.title
         ));
         chips.push_str(&format!(
@@ -192,7 +204,7 @@ fn render_day_cell(c: &DayCell, events: &[Event]) -> String {
     )
 }
 
-fn render_agenda(events: &[Event], now: i64, csrf: &str) -> String {
+fn render_agenda(events: &[Event], now: i64, csrf: &str, off: i32) -> String {
     // `events` is already sorted by starts_at ascending; keep only those that haven't ended.
     let upcoming: Vec<&Event> = events
         .iter()
@@ -203,7 +215,7 @@ fn render_agenda(events: &[Event], now: i64, csrf: &str) -> String {
     let body = if upcoming.is_empty() {
         "<p class=\"agenda-empty\">No upcoming events. <a href=\"/new\">Add one.</a></p>".to_string()
     } else {
-        upcoming.iter().map(|e| render_agenda_item(e, csrf)).collect()
+        upcoming.iter().map(|e| render_agenda_item(e, csrf, off)).collect()
     };
 
     format!(
@@ -212,7 +224,7 @@ fn render_agenda(events: &[Event], now: i64, csrf: &str) -> String {
     )
 }
 
-fn render_agenda_item(e: &Event, csrf: &str) -> String {
+fn render_agenda_item(e: &Event, csrf: &str, off: i32) -> String {
     let loc = if e.location.trim().is_empty() {
         String::new()
     } else {
@@ -230,7 +242,7 @@ fn render_agenda_item(e: &Event, csrf: &str) -> String {
              <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Delete</button>\
            </form>\
          </div>",
-        when = esc(&calendar::fmt_event_when(e.starts_at, e.ends_at, e.all_day)),
+        when = esc(&calendar::fmt_event_when_at(e.starts_at, e.ends_at, e.all_day, off)),
         id = esc(&e.id),
         title = esc(&e.title),
         loc = loc,
@@ -242,16 +254,22 @@ fn render_agenda_item(e: &Event, csrf: &str) -> String {
 // GET /new  — the create form
 // ---------------------------------------------------------------------------
 
-pub async fn new_form(headers: HeaderMap, Query(q): Query<NewQuery>) -> Response {
+pub async fn new_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<NewQuery>,
+) -> Result<Response, AppError> {
+    let owner = auth::owner_subject(&headers);
+    let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
     let csrf = auth::new_csrf_token();
 
-    // If a day was clicked, default to a 09:00–10:00 UTC slot on that day; else leave blank.
-    let (starts_local, ends_local) = match q.date.as_deref().and_then(calendar::parse_date) {
+    // If a day was clicked, default to a 09:00–10:00 LOCAL slot on that day; else leave blank.
+    let (starts_local, ends_local) = match q.date.as_deref().and_then(|d| calendar::parse_date_at(d, off)) {
         Some(day) => {
             let s = day + 9 * 3_600_000;
             (
-                calendar::fmt_datetime_local(s),
-                calendar::fmt_datetime_local(s + 3_600_000),
+                calendar::fmt_datetime_local_at(s, off),
+                calendar::fmt_datetime_local_at(s + 3_600_000, off),
             )
         }
         None => (String::new(), String::new()),
@@ -270,7 +288,10 @@ pub async fn new_form(headers: HeaderMap, Query(q): Query<NewQuery>) -> Response
         id: String::new(),
     };
     let content = format!("{}{}", render::subnav("calendar"), render_event_form(&view));
-    html_with_csrf_cookie(layout("New event", &headers, &content), &csrf)
+    Ok(html_with_csrf_cookie(
+        layout("New event", &headers, &content),
+        &csrf,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +305,8 @@ pub async fn create(
 ) -> Result<Response, AppError> {
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
-    let parsed = parse_event_form(&form)?;
+    let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
+    let parsed = parse_event_form(&form, off)?;
 
     state
         .store
@@ -301,7 +323,7 @@ pub async fn create(
         })
         .await?;
 
-    Ok(redirect_to_month(parsed.starts_at))
+    Ok(redirect_to_month(parsed.starts_at, off))
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +336,7 @@ pub async fn edit_form(
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
     let owner = auth::owner_subject(&headers);
+    let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
     let event = state
         .store
         .get_event(&owner, &id)
@@ -324,8 +347,8 @@ pub async fn edit_form(
     let view = FormView {
         action: format!("/edit/{}", event.id),
         title: event.title.clone(),
-        starts_local: calendar::fmt_datetime_local(event.starts_at),
-        ends_local: calendar::fmt_datetime_local(event.ends_at),
+        starts_local: calendar::fmt_datetime_local_at(event.starts_at, off),
+        ends_local: calendar::fmt_datetime_local_at(event.ends_at, off),
         all_day: event.all_day,
         location: event.location.clone(),
         notes: event.notes.clone(),
@@ -352,13 +375,14 @@ pub async fn update(
 ) -> Result<Response, AppError> {
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
+    let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
 
     let existing = state
         .store
         .get_event(&owner, &id)
         .await?
         .ok_or_else(|| AppError::NotFound("That event does not exist.".to_string()))?;
-    let parsed = parse_event_form(&form)?;
+    let parsed = parse_event_form(&form, off)?;
 
     state
         .store
@@ -375,7 +399,7 @@ pub async fn update(
         })
         .await?;
 
-    Ok(redirect_to_month(parsed.starts_at))
+    Ok(redirect_to_month(parsed.starts_at, off))
 }
 
 // ---------------------------------------------------------------------------
@@ -485,22 +509,24 @@ struct ParsedEvent {
     notes: String,
 }
 
-/// Validate + normalize an [`EventForm`] into a [`ParsedEvent`]. All-day events snap to whole
-/// UTC days; a missing/earlier end collapses to the start so a range is never negative.
-fn parse_event_form(form: &EventForm) -> Result<ParsedEvent, AppError> {
+/// Validate + normalize an [`EventForm`] into a [`ParsedEvent`]. The `datetime-local` inputs are
+/// interpreted in the owner's timezone (`off` minutes from UTC) and stored as real UTC epoch ms.
+/// All-day events snap to whole LOCAL days; a missing/earlier end collapses to the start so a
+/// range is never negative.
+fn parse_event_form(form: &EventForm, off: i32) -> Result<ParsedEvent, AppError> {
     let title = form.title.trim().to_string();
     if title.is_empty() {
         return Err(AppError::BadRequest("An event needs a title.".to_string()));
     }
 
     let all_day = checkbox_on(form.all_day.as_deref());
-    let mut starts_at = calendar::parse_datetime_local(&form.starts_at)
+    let mut starts_at = calendar::parse_datetime_local_at(&form.starts_at, off)
         .ok_or_else(|| AppError::BadRequest("A valid start date and time is required.".to_string()))?;
-    let mut ends_at = calendar::parse_datetime_local(&form.ends_at).unwrap_or(starts_at);
+    let mut ends_at = calendar::parse_datetime_local_at(&form.ends_at, off).unwrap_or(starts_at);
 
     if all_day {
-        starts_at = calendar::start_of_day(starts_at);
-        ends_at = calendar::end_of_day(ends_at.max(starts_at));
+        starts_at = calendar::start_of_day_at(starts_at, off);
+        ends_at = calendar::end_of_day_at(ends_at.max(starts_at), off);
     } else if ends_at < starts_at {
         ends_at = starts_at;
     }
@@ -519,9 +545,9 @@ fn checkbox_on(v: Option<&str>) -> bool {
     matches!(v, Some("on" | "true" | "1" | "yes"))
 }
 
-/// 303 back to the month that contains `ms` so the just-saved event is visible.
-fn redirect_to_month(ms: i64) -> Response {
-    let (y, m) = calendar::month_of(ms);
+/// 303 back to the LOCAL month that contains `ms` so the just-saved event is visible.
+fn redirect_to_month(ms: i64, off: i32) -> Response {
+    let (y, m) = calendar::month_of_at(ms, off);
     Redirect::to(&format!("/?y={y}&m={m}")).into_response()
 }
 

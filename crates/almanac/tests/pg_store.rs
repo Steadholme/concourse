@@ -48,6 +48,7 @@ async fn pg_store_full_integration() {
     let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
     sqlx::query("DELETE FROM events").execute(&raw).await.unwrap();
     sqlx::query("DELETE FROM contacts").execute(&raw).await.unwrap();
+    sqlx::query("DELETE FROM settings").execute(&raw).await.unwrap();
 
     // --- create an event through the real HTTP flow ------------------------
     let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "alice@holdfast.local")).await;
@@ -196,9 +197,44 @@ async fn pg_store_full_integration() {
     let (_s, _h, list) = call(&state, get_as("/contacts", "u_alice", "alice@holdfast.local")).await;
     assert!(list.contains("Ada Lovelace"));
 
+    // --- settings round-trip through Postgres ------------------------------
+    let (_s, sh, sbody) = call(&state, get_as("/settings", "u_alice", "alice@holdfast.local")).await;
+    assert!(sbody.contains("value=\"UTC\" selected"), "defaults to UTC before any save");
+    let scookie = set_cookie(&sh).unwrap();
+    let scsrf = cookie_value(&scookie).unwrap();
+    let save_settings = post_form(
+        &state,
+        "/settings",
+        &scookie,
+        "u_alice",
+        "alice@holdfast.local",
+        &[("csrf_token", &scsrf), ("timezone", "UTC+08:00"), ("week_start", "monday")],
+    )
+    .await;
+    assert_eq!(save_settings.0, StatusCode::SEE_OTHER);
+    let srow = sqlx::query("SELECT timezone, week_start FROM settings WHERE owner_sub = $1")
+        .bind("u_alice")
+        .fetch_one(&raw)
+        .await
+        .unwrap();
+    let tz: String = srow.try_get("timezone").unwrap();
+    let ws: String = srow.try_get("week_start").unwrap();
+    assert_eq!(tz, "UTC+08:00", "timezone persisted to Postgres");
+    assert_eq!(ws, "monday", "week_start persisted to Postgres");
+    // Re-saving the same owner updates the single row (no duplicate).
+    let settings_count: i64 = sqlx::query("SELECT count(*) AS n FROM settings WHERE owner_sub = $1")
+        .bind("u_alice")
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap();
+    assert_eq!(settings_count, 1, "one settings row per owner");
+
     // Teardown.
     sqlx::query("DELETE FROM events").execute(&raw).await.unwrap();
     sqlx::query("DELETE FROM contacts").execute(&raw).await.unwrap();
+    sqlx::query("DELETE FROM settings").execute(&raw).await.unwrap();
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + event create/edit upsert + created_at \
          preserved + owner isolation + CSRF enforced + delete + contacts — all through Postgres."

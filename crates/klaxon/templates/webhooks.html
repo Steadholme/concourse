@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Webhooks · HOLDFAST Klaxon</title>
+  <style>{{CSS}}</style>
+</head>
+<body class="page-reading">
+{{TOPBAR}}
+<main class="reader">
+  <div class="reader__head">
+    <div>
+      <h1 class="reader__title">Webhooks<span class="count" data-zero="0">{{COUNT}}</span></h1>
+      <p class="reader__sub">Forward your notifications to an external endpoint. Each delivery is a JSON <code class="code">POST</code> of the notification.</p>
+    </div>
+    <div class="reader__actions">
+      <a class="btn btn-ghost btn-sm" href="/">Back to inbox</a>
+    </div>
+  </div>
+
+  <section class="card">
+    <div class="card__head"><h2>Add a webhook</h2></div>
+    <div class="card__body">
+      <form method="post" action="/settings/webhooks">
+        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+        <div class="field">
+          <label for="wh-url">Endpoint URL</label>
+          <input id="wh-url" type="url" name="url" placeholder="https://example.com/hooks/klaxon" required>
+        </div>
+        <div class="field">
+          <label for="wh-secret">Signing secret <span class="hint">(optional)</span></label>
+          <input id="wh-secret" type="text" name="secret" placeholder="shared secret for verifying deliveries">
+        </div>
+        <button class="btn btn-primary" type="submit">Add webhook</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card__head"><h2>Your webhooks</h2></div>
+    <div class="card__body">
+      {{ITEMS}}
+    </div>
+  </section>
+</main>
+</body>
+</html>

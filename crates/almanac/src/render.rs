@@ -65,7 +65,8 @@ pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
         .replace("{{CONTENT}}", content)
 }
 
-/// The two-tab section nav (`Calendar` / `Contacts`). `active` is `"calendar"` or `"contacts"`.
+/// The section nav (`Calendar` / `Contacts` / `Settings`). `active` is `"calendar"`,
+/// `"contacts"`, or `"settings"`.
 pub fn subnav(active: &str) -> String {
     let tab = |href: &str, label: &str, key: &str| {
         let cls = if key == active {
@@ -76,9 +77,10 @@ pub fn subnav(active: &str) -> String {
         format!("<a class=\"{cls}\" href=\"{href}\">{label}</a>")
     };
     format!(
-        "<nav class=\"subnav\">{}{}</nav>",
+        "<nav class=\"subnav\">{}{}{}</nav>",
         tab("/", "Calendar", "calendar"),
         tab("/contacts", "Contacts", "contacts"),
+        tab("/settings", "Settings", "settings"),
     )
 }
 

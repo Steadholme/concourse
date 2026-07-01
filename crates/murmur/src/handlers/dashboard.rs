@@ -96,17 +96,29 @@ fn render_messages(messages: &[Message]) -> String {
 }
 
 /// One message row. `sender_email` / time are escaped; the body goes through the
-/// escape-then-autolink renderer.
+/// escape-then-autolink renderer. A soft-deleted message renders a fixed `[deleted]` tombstone
+/// (its stored body is already cleared); an edited message carries an `(edited)` marker.
 pub fn render_message(m: &Message) -> String {
+    let body = if m.deleted {
+        r#"<span class="msg__deleted">[deleted]</span>"#.to_string()
+    } else {
+        render_body(&m.body)
+    };
+    let edited = if m.edited_at > 0 && !m.deleted {
+        r#"<span class="msg__edited">(edited)</span>"#
+    } else {
+        ""
+    };
     format!(
         r#"<div class="msg" data-id="{id}">
-  <div class="msg__head"><span class="msg__author">{author}</span><span class="msg__time">{time}</span></div>
+  <div class="msg__head"><span class="msg__author">{author}</span><span class="msg__time">{time}</span>{edited}</div>
   <div class="msg__body">{body}</div>
 </div>"#,
         id = esc(&m.id),
         author = esc(&m.sender_email),
         time = esc(&fmt_time(m.created_at)),
-        body = render_body(&m.body),
+        edited = edited,
+        body = body,
     )
 }
 

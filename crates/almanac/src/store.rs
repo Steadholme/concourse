@@ -55,6 +55,32 @@ pub struct Contact {
     pub created_at: i64,
 }
 
+/// Per-owner display preferences. There is at most ONE row per subject (`owner_sub` is the key),
+/// so it is fetched with a plain default when the user has never saved: the whole app keeps
+/// working (renders in UTC, Sunday-first) with no settings row present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settings {
+    pub owner_sub: String,
+    /// Timezone string, e.g. `UTC`, `UTC+08:00`, `UTC-05:00`. Interpreted as a fixed UTC offset.
+    pub timezone: String,
+    /// First column of the month grid: `sunday` (default) or `monday`.
+    pub week_start: String,
+    /// Epoch ms of the last save (0 for the synthesized default).
+    pub updated_at: i64,
+}
+
+impl Settings {
+    /// The defaults used until the owner saves anything: UTC, Sunday-first.
+    pub fn default_for(owner_sub: &str) -> Self {
+        Settings {
+            owner_sub: owner_sub.to_string(),
+            timezone: "UTC".to_string(),
+            week_start: "sunday".to_string(),
+            updated_at: 0,
+        }
+    }
+}
+
 /// Pluggable store. Methods are `async`: the axum handlers `.await` them directly on the serving
 /// runtime, and `PgStore` drives sqlx natively, so a worker thread is never blocked on a DB
 /// round-trip (no `block_in_place`, no sync-over-async bridge).
@@ -84,6 +110,12 @@ pub trait Store: Send + Sync {
 
     /// Delete a contact; returns `true` if a row owned by `owner_sub` was removed.
     async fn delete_contact(&self, owner_sub: &str, id: &str) -> Result<bool, StoreError>;
+
+    /// The owner's display settings, or [`Settings::default_for`] when no row exists yet.
+    async fn get_settings(&self, owner_sub: &str) -> Result<Settings, StoreError>;
+
+    /// Insert or replace the owner's settings row. Returns the stored value.
+    async fn upsert_settings(&self, settings: Settings) -> Result<Settings, StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -94,6 +126,7 @@ pub trait Store: Send + Sync {
 struct MemData {
     events: HashMap<String, Event>,
     contacts: HashMap<String, Contact>,
+    settings: HashMap<String, Settings>,
 }
 
 /// In-memory `Store`. A single `Mutex` guards both maps.
@@ -207,6 +240,21 @@ impl Store for InMemoryStore {
         }
         Ok(owned)
     }
+
+    async fn get_settings(&self, owner_sub: &str) -> Result<Settings, StoreError> {
+        let data = self.data.lock().expect("almanac store lock poisoned");
+        Ok(data
+            .settings
+            .get(owner_sub)
+            .cloned()
+            .unwrap_or_else(|| Settings::default_for(owner_sub)))
+    }
+
+    async fn upsert_settings(&self, settings: Settings) -> Result<Settings, StoreError> {
+        let mut data = self.data.lock().expect("almanac store lock poisoned");
+        data.settings.insert(settings.owner_sub.clone(), settings.clone());
+        Ok(settings)
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -282,6 +330,32 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+
+        // Per-owner settings: one row per subject. Created as a new table; the ADD COLUMN IF NOT
+        // EXISTS statements make the migration forward-safe (idempotent) if an older, narrower
+        // `settings` table already exists. Portable standard SQL only.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS settings (\
+                 owner_sub TEXT PRIMARY KEY\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE settings ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'UTC'",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE settings ADD COLUMN IF NOT EXISTS week_start TEXT NOT NULL DEFAULT 'sunday'",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE settings ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -308,6 +382,15 @@ impl PgStore {
             phone: row.try_get("phone")?,
             notes: row.try_get("notes")?,
             created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn settings_from_row(row: &PgRow) -> Result<Settings, sqlx::Error> {
+        Ok(Settings {
+            owner_sub: row.try_get("owner_sub")?,
+            timezone: row.try_get("timezone")?,
+            week_start: row.try_get("week_start")?,
+            updated_at: row.try_get("updated_at")?,
         })
     }
 
@@ -435,6 +518,37 @@ impl PgStore {
             .await?;
         Ok(res.rows_affected() > 0)
     }
+
+    async fn get_settings_async(&self, owner_sub: &str) -> Result<Settings, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT owner_sub, timezone, week_start, updated_at FROM settings WHERE owner_sub = $1",
+        )
+        .bind(owner_sub)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row.as_ref() {
+            Some(r) => Self::settings_from_row(r),
+            None => Ok(Settings::default_for(owner_sub)),
+        }
+    }
+
+    async fn upsert_settings_async(&self, s: &Settings) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO settings (owner_sub, timezone, week_start, updated_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (owner_sub) DO UPDATE SET \
+                 timezone = EXCLUDED.timezone, \
+                 week_start = EXCLUDED.week_start, \
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(&s.owner_sub)
+        .bind(&s.timezone)
+        .bind(&s.week_start)
+        .bind(s.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -487,6 +601,19 @@ impl Store for PgStore {
         self.delete_contact_async(owner_sub, id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_settings(&self, owner_sub: &str) -> Result<Settings, StoreError> {
+        self.get_settings_async(owner_sub)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn upsert_settings(&self, settings: Settings) -> Result<Settings, StoreError> {
+        self.upsert_settings_async(&settings)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(settings)
     }
 }
 
@@ -562,5 +689,33 @@ mod tests {
         assert_eq!(alice.len(), 2);
         assert_eq!(alice[0].name, "amy", "case-insensitive name order");
         assert_eq!(alice[1].name, "Zoe");
+    }
+
+    #[tokio::test]
+    async fn settings_default_then_persist_and_scope() {
+        let store = InMemoryStore::new();
+        // No row yet => the UTC/Sunday default, echoing the requested owner.
+        let def = store.get_settings("alice").await.unwrap();
+        assert_eq!(def, Settings::default_for("alice"));
+        assert_eq!(def.timezone, "UTC");
+        assert_eq!(def.week_start, "sunday");
+
+        store
+            .upsert_settings(Settings {
+                owner_sub: "alice".to_string(),
+                timezone: "UTC+08:00".to_string(),
+                week_start: "monday".to_string(),
+                updated_at: 42,
+            })
+            .await
+            .unwrap();
+
+        let got = store.get_settings("alice").await.unwrap();
+        assert_eq!(got.timezone, "UTC+08:00");
+        assert_eq!(got.week_start, "monday");
+        assert_eq!(got.updated_at, 42);
+
+        // Another owner is unaffected — still the default.
+        assert_eq!(store.get_settings("bob").await.unwrap(), Settings::default_for("bob"));
     }
 }

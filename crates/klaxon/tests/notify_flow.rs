@@ -80,6 +80,29 @@ fn inbox(subject: &str, email: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// GET the webhooks settings page as `subject`.
+fn webhooks_page(subject: &str, email: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri("/settings/webhooks")
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", email)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// POST a form to `uri` as `subject` with the double-submit CSRF cookie+field set to `csrf`.
+fn form_post(uri: &str, subject: &str, csrf: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("x-auth-subject", subject)
+        .header(header::COOKIE, format!("__Host-csrf={csrf}"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn healthz_is_public_ok() {
     let st = state();
@@ -192,4 +215,109 @@ async fn mark_read_requires_csrf_then_succeeds() {
     // Now the inbox shows zero unread.
     let page = send(&st, inbox(SUBJECT, EMAIL)).await;
     assert!(page.body.contains(r#"<span class="count" data-zero="0">0</span>"#));
+}
+
+#[tokio::test]
+async fn webhooks_page_requires_sso_identity() {
+    let st = state();
+    let resp = send(
+        &st,
+        Request::builder().uri("/settings/webhooks").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webhook_create_requires_csrf() {
+    let st = state();
+    // Mint a CSRF cookie by loading the page first.
+    let page = send(&st, webhooks_page(SUBJECT, EMAIL)).await;
+    let cookie = page.csrf_cookie().expect("csrf cookie set on first render");
+
+    // Wrong CSRF field -> 401 (cookie present, mismatched field).
+    let req = form_post(
+        "/settings/webhooks",
+        SUBJECT,
+        &cookie,
+        "csrf_token=wrong&url=https://example.com/hook".to_string(),
+    );
+    let resp = send(&st, req).await;
+    assert_eq!(resp.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webhook_create_rejects_non_http_url() {
+    let st = state();
+    let page = send(&st, webhooks_page(SUBJECT, EMAIL)).await;
+    let cookie = page.csrf_cookie().unwrap();
+
+    let req = form_post(
+        "/settings/webhooks",
+        SUBJECT,
+        &cookie,
+        format!("csrf_token={cookie}&url=ftp://example.com/x"),
+    );
+    let resp = send(&st, req).await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn webhook_create_list_and_delete_roundtrip() {
+    let st = state();
+    let page = send(&st, webhooks_page(SUBJECT, EMAIL)).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("No webhooks"), "empty state before any create");
+    let cookie = page.csrf_cookie().unwrap();
+
+    // Create -> 303 redirect back to the settings page.
+    let req = form_post(
+        "/settings/webhooks",
+        SUBJECT,
+        &cookie,
+        format!("csrf_token={cookie}&url=https://example.com/hook&secret=s3cr3t"),
+    );
+    let resp = send(&st, req).await;
+    assert_eq!(resp.status, StatusCode::SEE_OTHER);
+
+    // The page now lists it; the secret VALUE is never rendered, only its presence.
+    let page = send(&st, webhooks_page(SUBJECT, EMAIL)).await;
+    assert!(page.body.contains("https://example.com/hook"));
+    assert!(page.body.contains("secret set"));
+    assert!(!page.body.contains("s3cr3t"), "secret value must never be rendered");
+    assert!(page.body.contains(r#"<span class="count" data-zero="0">1</span>"#));
+
+    // Another user cannot see it (owner scoping).
+    let other = send(&st, webhooks_page("u_mallory", "m@w33d.xyz")).await;
+    assert!(other.body.contains("No webhooks"));
+
+    // Extract the webhook id from the delete form's hidden input.
+    let marker = r#"name="id" value=""#;
+    let start = page.body.find(marker).expect("id field present") + marker.len();
+    let id: String = page.body[start..].chars().take_while(|&c| c != '"').collect();
+    assert!(id.starts_with("whk_"), "generated id has the whk prefix: {id}");
+
+    // A forged delete from another user removes nothing (owner-scoped store delete).
+    let mallory_page = send(&st, webhooks_page("u_mallory", "m@w33d.xyz")).await;
+    let mallory_cookie = mallory_page.csrf_cookie().unwrap();
+    let req = form_post(
+        "/settings/webhooks/delete",
+        "u_mallory",
+        &mallory_cookie,
+        format!("csrf_token={mallory_cookie}&id={id}"),
+    );
+    assert_eq!(send(&st, req).await.status, StatusCode::SEE_OTHER);
+    let page = send(&st, webhooks_page(SUBJECT, EMAIL)).await;
+    assert!(page.body.contains("https://example.com/hook"), "owner's webhook survives a foreign delete");
+
+    // The owner deletes it -> 303, then the list is empty again.
+    let req = form_post(
+        "/settings/webhooks/delete",
+        SUBJECT,
+        &cookie,
+        format!("csrf_token={cookie}&id={id}"),
+    );
+    assert_eq!(send(&st, req).await.status, StatusCode::SEE_OTHER);
+    let page = send(&st, webhooks_page(SUBJECT, EMAIL)).await;
+    assert!(page.body.contains("No webhooks"));
 }

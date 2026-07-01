@@ -16,6 +16,9 @@
 //! - `GET /`         the unified dashboard: three columns (Chat unread / Notifications / Feed
 //!                   river) + a summary bar of total unread, concurrently fetched, ~10 s cached,
 //!                   and resilient (a down source renders "unavailable", the page still renders)
+//! - `GET /api/inbox` the same viewer-scoped, cached aggregate as JSON (pre-rendered `summary` +
+//!                   `columns` fragments) — the payload the page's ~20 s live-refresh poll swaps in
+//!                   without a full reload (scroll preserved)
 
 pub mod audit;
 pub mod auth;
@@ -50,6 +53,9 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::health::healthz))
         .route("/", get(handlers::dashboard::dashboard))
+        // JSON feed for the dashboard's live auto-refresh poll (re-renders unread sections without
+        // a full page reload). Same viewer-scoped, cached read as `/`, just no page chrome.
+        .route("/api/inbox", get(handlers::api::api_inbox))
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (healthz / dev).

@@ -6,6 +6,7 @@
 //! matching the HOLDFAST service UI kit (the same polished, light-canvas look as the apex portal):
 //! shield wordmark, refined app-bar (All-apps pill + user chip), indigo accent, cards, WCAG-AA contrast.
 
+pub mod api;
 pub mod dashboard;
 pub mod health;
 

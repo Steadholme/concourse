@@ -25,6 +25,13 @@ pub const MAX_TITLE_CHARS: usize = 300;
 /// Hard cap on a notification body, in characters.
 pub const MAX_BODY_CHARS: usize = 8 * 1024;
 
+/// Hard cap on a registered webhook URL, in characters.
+pub const MAX_WEBHOOK_URL_CHARS: usize = 2048;
+/// Hard cap on a webhook signing secret, in characters.
+pub const MAX_WEBHOOK_SECRET_CHARS: usize = 256;
+/// Hard cap on how many webhooks a single user may register.
+pub const MAX_WEBHOOKS_PER_USER: usize = 50;
+
 /// Runtime configuration. Cheap to clone; shared read-only behind `Arc`.
 #[derive(Clone, Debug)]
 pub struct Config {

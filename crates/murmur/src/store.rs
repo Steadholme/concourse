@@ -46,6 +46,11 @@ pub struct Message {
     pub sender_email: String,
     pub body: String,
     pub created_at: i64,
+    /// When the author last edited the body (epoch seconds); `0` means never edited.
+    pub edited_at: i64,
+    /// Soft-delete flag. A deleted message keeps its row (id/author/timestamps) but its `body`
+    /// is cleared and the timeline renders `[deleted]`.
+    pub deleted: bool,
 }
 
 /// Storage failure surfaced to the handler layer (always maps to a 500 — there are no
@@ -89,6 +94,14 @@ pub trait Store: Send + Sync {
     async fn list_messages(&self, room_id: &str, before: Option<i64>, limit: i64) -> Vec<Message>;
     /// Insert a new message.
     async fn create_message(&self, message: &Message) -> Result<(), StoreError>;
+    /// One message by id (used to authorize edit/delete against `sender_sub`).
+    async fn get_message(&self, id: &str) -> Option<Message>;
+    /// Replace a message's body and stamp `edited_at` (author edit). No-op on a missing or
+    /// already-deleted message.
+    async fn edit_message(&self, id: &str, body: &str, edited_at: i64) -> Result<(), StoreError>;
+    /// Soft-delete a message: mark it deleted and clear the stored body. No-op on a missing
+    /// message. Idempotent.
+    async fn delete_message(&self, id: &str) -> Result<(), StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -240,6 +253,36 @@ impl Store for InMemoryStore {
             .push(message.clone());
         Ok(())
     }
+
+    async fn get_message(&self, id: &str) -> Option<Message> {
+        self.messages
+            .lock()
+            .expect("messages lock poisoned")
+            .iter()
+            .find(|m| m.id == id)
+            .cloned()
+    }
+
+    async fn edit_message(&self, id: &str, body: &str, edited_at: i64) -> Result<(), StoreError> {
+        let mut messages = self.messages.lock().expect("messages lock poisoned");
+        if let Some(m) = messages.iter_mut().find(|m| m.id == id) {
+            // A deleted message is inert — editing it would resurrect content.
+            if !m.deleted {
+                m.body = body.to_string();
+                m.edited_at = edited_at;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_message(&self, id: &str) -> Result<(), StoreError> {
+        let mut messages = self.messages.lock().expect("messages lock poisoned");
+        if let Some(m) = messages.iter_mut().find(|m| m.id == id) {
+            m.deleted = true;
+            m.body = String::new();
+        }
+        Ok(())
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -315,6 +358,19 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
 
+        // Author edit/soft-delete columns. Added idempotently so an existing `messages` table
+        // upgrades in place (portable ALTER — no data migration, defaults backfill old rows).
+        sqlx::query(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Backs the per-room newest-first timeline scan + keyset pagination.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_messages_room_created \
@@ -349,6 +405,8 @@ impl PgStore {
             sender_email: row.try_get("sender_email")?,
             body: row.try_get("body")?,
             created_at: row.try_get("created_at")?,
+            edited_at: row.try_get("edited_at")?,
+            deleted: row.try_get("deleted")?,
         })
     }
 
@@ -462,7 +520,7 @@ impl PgStore {
         // (no dynamic string building).
         let cursor = before.unwrap_or(i64::MAX);
         let rows = sqlx::query(
-            "SELECT id, room_id, sender_sub, sender_email, body, created_at \
+            "SELECT id, room_id, sender_sub, sender_email, body, created_at, edited_at, deleted \
              FROM messages WHERE room_id = $1 AND created_at < $2 \
              ORDER BY created_at DESC, id DESC LIMIT $3",
         )
@@ -476,8 +534,9 @@ impl PgStore {
 
     async fn create_message_async(&self, m: &Message) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO messages (id, room_id, sender_sub, sender_email, body, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO messages \
+             (id, room_id, sender_sub, sender_email, body, created_at, edited_at, deleted) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(&m.id)
         .bind(&m.room_id)
@@ -485,8 +544,51 @@ impl PgStore {
         .bind(&m.sender_email)
         .bind(&m.body)
         .bind(m.created_at)
+        .bind(m.edited_at)
+        .bind(m.deleted)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn get_message_async(&self, id: &str) -> Result<Option<Message>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, room_id, sender_sub, sender_email, body, created_at, edited_at, deleted \
+             FROM messages WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some(Self::message_from_row(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn edit_message_async(
+        &self,
+        id: &str,
+        body: &str,
+        edited_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        // A deleted message stays inert (`AND deleted = FALSE`): an edit must never resurrect it.
+        sqlx::query(
+            "UPDATE messages SET body = $1, edited_at = $2 WHERE id = $3 AND deleted = FALSE",
+        )
+        .bind(body)
+        .bind(edited_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_message_async(&self, id: &str) -> Result<(), sqlx::Error> {
+        // Soft delete: keep the row (id/author/timestamps) but clear the body. Idempotent.
+        sqlx::query("UPDATE messages SET deleted = TRUE, body = '' WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -558,6 +660,25 @@ impl Store for PgStore {
 
     async fn create_message(&self, message: &Message) -> Result<(), StoreError> {
         self.create_message_async(message)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_message(&self, id: &str) -> Option<Message> {
+        self.get_message_async(id).await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg get_message failed");
+            None
+        })
+    }
+
+    async fn edit_message(&self, id: &str, body: &str, edited_at: i64) -> Result<(), StoreError> {
+        self.edit_message_async(id, body, edited_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_message(&self, id: &str) -> Result<(), StoreError> {
+        self.delete_message_async(id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }

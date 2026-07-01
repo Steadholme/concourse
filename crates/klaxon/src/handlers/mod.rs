@@ -10,6 +10,7 @@
 pub mod health;
 pub mod inbox;
 pub mod notify;
+pub mod webhooks;
 
 use axum::http::StatusCode;
 

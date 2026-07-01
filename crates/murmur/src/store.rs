@@ -44,6 +44,14 @@ pub struct Member {
     pub joined_at: i64,
 }
 
+/// A person surfaced in the "New DM" people directory (a distinct known subject/email the
+/// requesting user can direct-message). Derived from the union of all memberships.
+#[derive(Clone, Debug, Serialize)]
+pub struct Person {
+    pub user_sub: String,
+    pub user_email: String,
+}
+
 /// A room the requesting user is a member of, with that membership's read cursor.
 #[derive(Clone, Debug, Serialize)]
 pub struct UserRoom {
@@ -87,6 +95,10 @@ pub trait Store: Send + Sync {
     /// Rooms the user is a member of, oldest-created first (so the lobby leads), with each
     /// membership's `last_read_at`. Capped at [`crate::config::ROOM_LIST_LIMIT`].
     async fn list_user_rooms(&self, user_sub: &str) -> Vec<UserRoom>;
+    /// The people directory backing "New DM": every DISTINCT known person (one row per
+    /// `user_sub`, with an email) drawn from the union of all memberships, EXCLUDING the
+    /// requesting user. Ordered by email then subject. Capped at [`crate::config::DIRECTORY_LIMIT`].
+    async fn list_directory(&self, exclude_sub: &str) -> Vec<Person>;
     /// Add a membership if one does not already exist (idempotent join).
     async fn ensure_membership(
         &self,
@@ -213,6 +225,32 @@ impl Store for InMemoryStore {
                 .then_with(|| a.room.id.cmp(&b.room.id))
         });
         out.truncate(crate::config::ROOM_LIST_LIMIT as usize);
+        out
+    }
+
+    async fn list_directory(&self, exclude_sub: &str) -> Vec<Person> {
+        let memberships = self.memberships.lock().expect("memberships lock poisoned");
+        // One entry per distinct subject (first email seen wins), excluding the caller.
+        let mut out: Vec<Person> = Vec::new();
+        for m in memberships.iter() {
+            if m.user_sub == exclude_sub {
+                continue;
+            }
+            if out.iter().any(|p| p.user_sub == m.user_sub) {
+                continue;
+            }
+            out.push(Person {
+                user_sub: m.user_sub.clone(),
+                user_email: m.user_email.clone(),
+            });
+        }
+        // Email-first ordering, ties broken by subject for a stable directory.
+        out.sort_by(|a, b| {
+            a.user_email
+                .cmp(&b.user_email)
+                .then_with(|| a.user_sub.cmp(&b.user_sub))
+        });
+        out.truncate(crate::config::DIRECTORY_LIMIT as usize);
         out
     }
 
@@ -610,6 +648,28 @@ impl PgStore {
             .collect()
     }
 
+    async fn list_directory_async(&self, exclude_sub: &str) -> Result<Vec<Person>, sqlx::Error> {
+        // One row per distinct subject (portable GROUP BY; MIN picks a stable email), excluding
+        // the caller. Standard SQL only — no DISTINCT ON, no window functions.
+        let rows = sqlx::query(
+            "SELECT user_sub, MIN(user_email) AS user_email FROM memberships \
+             WHERE user_sub <> $1 GROUP BY user_sub \
+             ORDER BY MIN(user_email) ASC, user_sub ASC LIMIT $2",
+        )
+        .bind(exclude_sub)
+        .bind(crate::config::DIRECTORY_LIMIT)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(Person {
+                    user_sub: r.try_get("user_sub")?,
+                    user_email: r.try_get("user_email")?,
+                })
+            })
+            .collect()
+    }
+
     async fn ensure_membership_async(
         &self,
         room_id: &str,
@@ -848,6 +908,15 @@ impl Store for PgStore {
             .await
             .unwrap_or_else(|e| {
                 tracing::error!(error = %e, "pg list_user_rooms failed");
+                Vec::new()
+            })
+    }
+
+    async fn list_directory(&self, exclude_sub: &str) -> Vec<Person> {
+        self.list_directory_async(exclude_sub)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_directory failed");
                 Vec::new()
             })
     }

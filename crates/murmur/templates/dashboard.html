@@ -13,7 +13,10 @@
   <aside class="sidebar">
     <div class="sidebar__head">
       <h1 class="sidebar__title">Rooms</h1>
-      <button id="new-room" class="btn btn-secondary btn-sm" type="button">New</button>
+      <div class="sidebar__actions">
+        <button id="new-dm" class="btn btn-secondary btn-sm" type="button">New DM</button>
+        <button id="new-room" class="btn btn-secondary btn-sm" type="button">New</button>
+      </div>
     </div>
     <ul id="room-list" class="room-list">
       {{ROOMS}}

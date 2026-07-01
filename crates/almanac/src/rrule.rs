@@ -9,10 +9,16 @@
 //! edit/delete naturally apply to the whole series (v1 semantics).
 //!
 //! Supported: `FREQ=DAILY|WEEKLY|MONTHLY|YEARLY` with `INTERVAL`, `COUNT`, `UNTIL`, and `BYDAY`.
-//! - `BYDAY` on `WEEKLY` selects which weekdays repeat (default: DTSTART's weekday).
-//! - `BYDAY` on `DAILY` acts as a weekday filter.
-//! - `MONTHLY`/`YEARLY` recur on DTSTART's day-of-month (a day that does not exist in a given
-//!   month/year — e.g. the 31st, or Feb 29 — is skipped, per RFC, and does not count toward COUNT).
+//! - `BYDAY` on `WEEKLY` selects which weekdays repeat (default: DTSTART's weekday); any ordinal
+//!   prefix is ignored (ordinals are not meaningful for WEEKLY).
+//! - `BYDAY` on `DAILY` acts as a weekday filter (ordinal prefix ignored).
+//! - `BYDAY` on `MONTHLY`/`YEARLY` selects weekdays with an optional ordinal: `3WE` = the 3rd
+//!   Wednesday, `-1FR` = the last Friday, plain `WE` = every Wednesday of the period. For YEARLY
+//!   the selection is restricted to DTSTART's month (so `-1FR` yearly = the last Friday of that
+//!   month, each year). An ordinal that does not exist in a period (e.g. a 5th Wednesday in a
+//!   month with only four) is skipped and does not count toward COUNT.
+//! - Without `BYDAY`, `MONTHLY`/`YEARLY` recur on DTSTART's day-of-month (a day that does not exist
+//!   in a given month/year — e.g. the 31st, or Feb 29 — is skipped, per RFC, and does not count).
 //! All timestamps are UTC epoch milliseconds, matching the rest of the crate (no DST/tz math here).
 
 use time::{Date, Month, OffsetDateTime, Weekday};
@@ -55,15 +61,25 @@ impl Freq {
     }
 }
 
+/// One `BYDAY` entry: a weekday with an optional ordinal. `ord` is `None` for a bare weekday code
+/// (e.g. `WE`), `Some(3)` for `3WE` (the 3rd Wednesday), `Some(-1)` for `-1FR` (the last Friday).
+/// The ordinal only takes effect for MONTHLY/YEARLY expansion; DAILY/WEEKLY use just the weekday.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByDay {
+    pub ord: Option<i32>,
+    pub weekday: Weekday,
+}
+
 /// A parsed recurrence rule. `interval >= 1`. `count` includes the first occurrence. `until` is an
-/// inclusive UTC epoch-ms bound. `byday` is the set of weekdays (only meaningful for DAILY/WEEKLY).
+/// inclusive UTC epoch-ms bound. `byday` is the ordered set of `BYDAY` entries (weekday + optional
+/// ordinal); the ordinal is honoured only for MONTHLY/YEARLY.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RRule {
     pub freq: Freq,
     pub interval: u32,
     pub count: Option<u32>,
     pub until: Option<i64>,
-    pub byday: Vec<Weekday>,
+    pub byday: Vec<ByDay>,
 }
 
 impl RRule {
@@ -79,7 +95,7 @@ impl RRule {
         let mut interval: u32 = 1;
         let mut count: Option<u32> = None;
         let mut until: Option<i64> = None;
-        let mut byday: Vec<Weekday> = Vec::new();
+        let mut byday: Vec<ByDay> = Vec::new();
 
         for part in s.split(';') {
             let (key, val) = match part.split_once('=') {
@@ -98,7 +114,7 @@ impl RRule {
                 "BYDAY" => {
                     byday = val
                         .split(',')
-                        .filter_map(|d| parse_weekday(d.trim()))
+                        .filter_map(|d| parse_byday(d.trim()))
                         .collect();
                 }
                 _ => {}
@@ -159,7 +175,7 @@ impl RRule {
                 break;
             }
             // BYDAY on DAILY is a weekday filter; filtered-out days do not count toward COUNT.
-            if self.byday.is_empty() || self.byday.contains(&weekday_of(start)) {
+            if self.byday.is_empty() || self.byday.iter().any(|bd| bd.weekday == weekday_of(start)) {
                 if !c.push(start) {
                     break;
                 }
@@ -171,8 +187,8 @@ impl RRule {
     }
 
     fn expand_weekly(&self, dtstart: i64, c: &mut Collector) {
-        // Default to DTSTART's own weekday when no BYDAY is given.
-        let mut days = self.byday.clone();
+        // Default to DTSTART's own weekday when no BYDAY is given. Ordinals are ignored for WEEKLY.
+        let mut days: Vec<Weekday> = self.byday.iter().map(|bd| bd.weekday).collect();
         if days.is_empty() {
             days.push(weekday_of(dtstart));
         }
@@ -243,12 +259,30 @@ impl RRule {
                     break;
                 }
             }
-            if let Some(start) = build_ms(y, mo, d0, tod) {
-                if !c.push(start) {
-                    break;
+            if self.byday.is_empty() {
+                if let Some(start) = build_ms(y, mo, d0, tod) {
+                    if !c.push(start) {
+                        break;
+                    }
+                }
+                // else: DTSTART's day-of-month does not exist this month — skipped, does not count.
+            } else {
+                // BYDAY: emit each selected weekday-of-month, in chronological order within the month.
+                for day in byday_days(y, mo, &self.byday) {
+                    if let Some(start) = build_ms(y, mo, day, tod) {
+                        // The first (partial) period skips any match that falls before DTSTART.
+                        if start < dtstart {
+                            continue;
+                        }
+                        if !c.push(start) {
+                            break;
+                        }
+                    }
                 }
             }
-            // else: DTSTART's day-of-month does not exist this month — skipped, does not count.
+            if c.stop {
+                break;
+            }
             k += 1;
         }
     }
@@ -267,12 +301,29 @@ impl RRule {
                     break;
                 }
             }
-            if let Some(start) = build_ms(y, mo0, d0, tod) {
-                if !c.push(start) {
-                    break;
+            if self.byday.is_empty() {
+                if let Some(start) = build_ms(y, mo0, d0, tod) {
+                    if !c.push(start) {
+                        break;
+                    }
+                }
+                // else: Feb 29 in a non-leap year — skipped, does not count.
+            } else {
+                // BYDAY on YEARLY: restrict the selection to DTSTART's month, each year.
+                for day in byday_days(y, mo0, &self.byday) {
+                    if let Some(start) = build_ms(y, mo0, day, tod) {
+                        if start < dtstart {
+                            continue;
+                        }
+                        if !c.push(start) {
+                            break;
+                        }
+                    }
                 }
             }
-            // else: Feb 29 in a non-leap year — skipped, does not count.
+            if c.stop {
+                break;
+            }
             k += 1;
         }
     }
@@ -433,20 +484,65 @@ fn parse_until(s: &str) -> Option<i64> {
     }
 }
 
-/// Parse a `BYDAY` two-letter weekday code (`MO`,`TU`,`WE`,`TH`,`FR`,`SA`,`SU`). Any leading
-/// ordinal (e.g. `2MO`) is ignored — only the weekday is honoured in this focused v1.
-fn parse_weekday(s: &str) -> Option<Weekday> {
-    let code = s.trim_start_matches(|c: char| c == '+' || c == '-' || c.is_ascii_digit());
-    match code.to_ascii_uppercase().as_str() {
-        "MO" => Some(Weekday::Monday),
-        "TU" => Some(Weekday::Tuesday),
-        "WE" => Some(Weekday::Wednesday),
-        "TH" => Some(Weekday::Thursday),
-        "FR" => Some(Weekday::Friday),
-        "SA" => Some(Weekday::Saturday),
-        "SU" => Some(Weekday::Sunday),
-        _ => None,
+/// Parse a `BYDAY` entry: an optional signed ordinal followed by a two-letter weekday code
+/// (`MO`,`TU`,`WE`,`TH`,`FR`,`SA`,`SU`) — e.g. `WE`, `3WE`, `+3WE`, `-1FR`. Returns `None` for an
+/// unknown code. A `0` ordinal (invalid per RFC) is treated as no ordinal.
+fn parse_byday(s: &str) -> Option<ByDay> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let (ord_str, code) = s.split_at(split);
+    let weekday = match code.to_ascii_uppercase().as_str() {
+        "MO" => Weekday::Monday,
+        "TU" => Weekday::Tuesday,
+        "WE" => Weekday::Wednesday,
+        "TH" => Weekday::Thursday,
+        "FR" => Weekday::Friday,
+        "SA" => Weekday::Saturday,
+        "SU" => Weekday::Sunday,
+        _ => return None,
+    };
+    // A bare `+` / `-` or unparsable prefix falls back to no ordinal (bare weekday).
+    let ord = ord_str
+        .trim_start_matches('+')
+        .parse::<i32>()
+        .ok()
+        .filter(|n| *n != 0);
+    Some(ByDay { ord, weekday })
+}
+
+/// The days-of-month (ascending, deduped) selected by `byday` in the given month. For an entry
+/// with an ordinal, resolves the nth matching weekday (negative counts from the month's end); an
+/// ordinal beyond the month's matching weekdays yields nothing. For a bare weekday, every matching
+/// day is returned.
+fn byday_days(year: i32, month: u8, byday: &[ByDay]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for bd in byday {
+        // All days in the month whose weekday matches, in ascending order.
+        let matches: Vec<u8> = (1u8..=31)
+            .filter(|&d| match build_ms(year, month, d, 0) {
+                Some(ms) => weekday_of(ms) == bd.weekday,
+                None => false,
+            })
+            .collect();
+        match bd.ord {
+            None => out.extend(matches),
+            Some(n) if n > 0 => {
+                if let Some(&d) = matches.get((n - 1) as usize) {
+                    out.push(d);
+                }
+            }
+            Some(n) => {
+                // n < 0: count from the end (-1 = last).
+                let idx = matches.len() as i32 + n;
+                if idx >= 0 {
+                    out.push(matches[idx as usize]);
+                }
+            }
+        }
     }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Build an RRULE string from the compose UI's simple fields (empty when `freq` is `None`). Only
@@ -498,7 +594,13 @@ mod tests {
         assert_eq!(r.freq, Freq::Weekly);
         assert_eq!(r.interval, 2);
         assert_eq!(r.count, Some(10));
-        assert_eq!(r.byday, vec![Weekday::Monday, Weekday::Wednesday]);
+        assert_eq!(
+            r.byday,
+            vec![
+                ByDay { ord: None, weekday: Weekday::Monday },
+                ByDay { ord: None, weekday: Weekday::Wednesday },
+            ]
+        );
         assert!(r.until.is_none());
         // Empty / no-FREQ => not a recurrence.
         assert!(RRule::parse("").is_none());
@@ -664,6 +766,111 @@ mod tests {
             "2040-12-31T23:59",
         );
         assert_eq!(got, vec!["2028-02-29T00:00", "2032-02-29T00:00"]);
+    }
+
+    #[test]
+    fn parse_byday_ordinals() {
+        let r = RRule::parse("FREQ=MONTHLY;BYDAY=3WE,-1FR,SU").unwrap();
+        assert_eq!(
+            r.byday,
+            vec![
+                ByDay { ord: Some(3), weekday: Weekday::Wednesday },
+                ByDay { ord: Some(-1), weekday: Weekday::Friday },
+                ByDay { ord: None, weekday: Weekday::Sunday },
+            ]
+        );
+        // Explicit '+' sign and a stray zero ordinal (invalid) degrade to a bare weekday.
+        let r2 = RRule::parse("FREQ=MONTHLY;BYDAY=+2MO,0TU").unwrap();
+        assert_eq!(
+            r2.byday,
+            vec![
+                ByDay { ord: Some(2), weekday: Weekday::Monday },
+                ByDay { ord: None, weekday: Weekday::Tuesday },
+            ]
+        );
+    }
+
+    #[test]
+    fn monthly_nth_weekday() {
+        // 3rd Wednesday each month, starting on the 3rd Wed of Jan 2026 (Jan 21).
+        let got = starts(
+            "FREQ=MONTHLY;BYDAY=3WE;COUNT=3",
+            "2026-01-21T10:00",
+            "2026-01-01T00:00",
+            "2026-12-31T23:59",
+        );
+        assert_eq!(
+            got,
+            vec!["2026-01-21T10:00", "2026-02-18T10:00", "2026-03-18T10:00"]
+        );
+    }
+
+    #[test]
+    fn monthly_last_weekday() {
+        // Last Friday each month, starting on the last Fri of Jan 2026 (Jan 30).
+        let got = starts(
+            "FREQ=MONTHLY;BYDAY=-1FR;COUNT=4",
+            "2026-01-30T17:00",
+            "2026-01-01T00:00",
+            "2026-12-31T23:59",
+        );
+        assert_eq!(
+            got,
+            vec![
+                "2026-01-30T17:00",
+                "2026-02-27T17:00",
+                "2026-03-27T17:00",
+                "2026-04-24T17:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn monthly_bare_weekday_is_every_matching_day() {
+        // BYDAY=WE (no ordinal) => every Wednesday of the month.
+        let got = starts(
+            "FREQ=MONTHLY;BYDAY=WE",
+            "2026-01-07T09:00", // first Wed of Jan 2026
+            "2026-01-01T00:00",
+            "2026-01-31T23:59",
+        );
+        assert_eq!(
+            got,
+            vec![
+                "2026-01-07T09:00",
+                "2026-01-14T09:00",
+                "2026-01-21T09:00",
+                "2026-01-28T09:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn monthly_missing_ordinal_is_skipped_and_not_counted() {
+        // 5th Wednesday: months without one (May, Jun) are skipped and do NOT count toward COUNT.
+        let got = starts(
+            "FREQ=MONTHLY;BYDAY=5WE;COUNT=2",
+            "2026-04-29T08:00", // 5th Wed of Apr 2026
+            "2026-01-01T00:00",
+            "2026-12-31T23:59",
+        );
+        // Apr has a 5th Wed (29); May & Jun do not; Jul does (29).
+        assert_eq!(got, vec!["2026-04-29T08:00", "2026-07-29T08:00"]);
+    }
+
+    #[test]
+    fn yearly_last_weekday_of_dtstart_month() {
+        // YEARLY BYDAY restricts to DTSTART's month: last Friday of January, each year.
+        let got = starts(
+            "FREQ=YEARLY;BYDAY=-1FR;COUNT=3",
+            "2026-01-30T17:00",
+            "2026-01-01T00:00",
+            "2030-12-31T23:59",
+        );
+        assert_eq!(
+            got,
+            vec!["2026-01-30T17:00", "2027-01-29T17:00", "2028-01-28T17:00"]
+        );
     }
 
     #[test]

@@ -13,6 +13,9 @@ pub const MESSAGE_PAGE_LIMIT: i64 = 50;
 /// Hard cap on how many rooms the room list returns for one user.
 pub const ROOM_LIST_LIMIT: i64 = 500;
 
+/// Hard cap on how many people the "New DM" directory returns.
+pub const DIRECTORY_LIMIT: i64 = 500;
+
 /// Maximum stored message body length, in characters (oversized bodies are rejected, not
 /// silently truncated).
 pub const MAX_BODY_CHARS: usize = 8 * 1024;

@@ -209,6 +209,34 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
   background: var(--surface);
 }
 .sidebar__title { margin: 0; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .12em; color: var(--ink-3); }
+.sidebar__actions { display: flex; align-items: center; gap: 8px; }
+
+/* ---- New-DM directory picker (modal) ------------------------------------ */
+.dm-picker {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px; background: rgba(15, 18, 34, .48);
+}
+.dm-picker__panel {
+  width: 100%; max-width: 420px; max-height: 70vh; display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--sh-lg, 0 20px 50px rgba(0,0,0,.25)); overflow: hidden;
+}
+.dm-picker__head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 15px 18px; border-bottom: 1px solid var(--border);
+}
+.dm-picker__title { margin: 0; font-size: 15px; font-weight: 600; color: var(--ink); }
+.dm-picker__list { list-style: none; margin: 0; padding: 8px; overflow-y: auto; flex: 1 1 auto; }
+.dm-picker__person {
+  display: block; width: 100%; text-align: left;
+  padding: 10px 12px; margin: 2px 0; border: 0; border-radius: var(--radius-md);
+  background: transparent; color: var(--ink-2); font: inherit; font-size: 14px; font-weight: 500;
+  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: background .1s, color .1s;
+}
+.dm-picker__person:hover { background: var(--surface-2); color: var(--ink); }
+.dm-picker__empty { color: var(--ink-3); font-size: 13px; padding: 14px; }
 .room-list { list-style: none; margin: 0; padding: 8px; overflow-y: auto; flex: 1 1 auto; }
 .room { margin: 0; }
 .room__btn {

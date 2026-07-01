@@ -15,6 +15,8 @@
 //! - `GET  /`                         dashboard: room list + timeline + composer + live `/ws`
 //! - `GET  /api/rooms`                rooms this user belongs to (+ auto-joined `#lobby`)
 //! - `POST /api/rooms`                create a room `{name, kind}` (CSRF)
+//! - `GET  /api/directory`            people the caller can DM (distinct known subjects/emails)
+//! - `POST /api/dms`                  open/reuse a 1:1 DM room `{subject, email}` (CSRF)
 //! - `POST /api/rooms/{id}/join`      join a room (CSRF)
 //! - `GET  /api/rooms/{id}/messages`  recent messages (keyset `?before=`)
 //! - `POST /api/rooms/{id}/messages`  send `{body}` -> insert + broadcast (CSRF)
@@ -69,6 +71,8 @@ pub fn app(state: AppState) -> Router {
             "/api/rooms",
             get(handlers::rooms::list).post(handlers::rooms::create),
         )
+        .route("/api/directory", get(handlers::dms::directory))
+        .route("/api/dms", post(handlers::dms::open))
         .route("/api/rooms/{id}/join", post(handlers::rooms::join))
         .route(
             "/api/rooms/{id}/messages",

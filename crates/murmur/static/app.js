@@ -238,6 +238,95 @@
 
   function cssEscape(s) { return String(s).replace(/["\\]/g, "\\$&"); }
 
+  // --- new DM (people directory) -------------------------------------------
+
+  var newDmBtn = document.getElementById("new-dm");
+  if (newDmBtn) {
+    newDmBtn.addEventListener("click", function () {
+      fetch("/api/directory", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : { people: [] }; })
+        .then(function (data) { openDirectoryPicker(data.people || []); })
+        .catch(function () {});
+    });
+  }
+
+  // Build a lightweight modal listing every person the user can DM; picking one opens the DM.
+  function openDirectoryPicker(people) {
+    closeDirectoryPicker();
+    var overlay = document.createElement("div");
+    overlay.className = "dm-picker";
+    overlay.id = "dm-picker";
+    var panel = document.createElement("div");
+    panel.className = "dm-picker__panel";
+
+    var head = document.createElement("div");
+    head.className = "dm-picker__head";
+    var title = document.createElement("h3");
+    title.className = "dm-picker__title";
+    title.textContent = "New direct message";
+    var close = document.createElement("button");
+    close.className = "btn btn-ghost btn-sm";
+    close.type = "button";
+    close.textContent = "Close";
+    close.addEventListener("click", closeDirectoryPicker);
+    head.appendChild(title);
+    head.appendChild(close);
+    panel.appendChild(head);
+
+    var list = document.createElement("ul");
+    list.className = "dm-picker__list";
+    if (people.length === 0) {
+      var empty = document.createElement("li");
+      empty.className = "dm-picker__empty";
+      empty.textContent = "No people to message yet.";
+      list.appendChild(empty);
+    } else {
+      for (var i = 0; i < people.length; i++) {
+        list.appendChild(buildPersonRow(people[i]));
+      }
+    }
+    panel.appendChild(list);
+    overlay.appendChild(panel);
+    // Click on the backdrop (outside the panel) dismisses the picker.
+    overlay.addEventListener("click", function (e) { if (e.target === overlay) closeDirectoryPicker(); });
+    document.body.appendChild(overlay);
+  }
+
+  function buildPersonRow(person) {
+    var li = document.createElement("li");
+    var btn = document.createElement("button");
+    btn.className = "dm-picker__person";
+    btn.type = "button";
+    btn.textContent = person.user_email || person.user_sub;
+    btn.addEventListener("click", function () { openDm(person); });
+    li.appendChild(btn);
+    return li;
+  }
+
+  function closeDirectoryPicker() {
+    var existing = document.getElementById("dm-picker");
+    if (existing) existing.remove();
+  }
+
+  function openDm(person) {
+    fetch("/api/dms", {
+      method: "POST",
+      headers: apiHeaders(true),
+      credentials: "same-origin",
+      body: JSON.stringify({ subject: person.user_sub, email: person.user_email })
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        closeDirectoryPicker();
+        if (!data || !data.room) return;
+        addRoomToList(data.room);
+        selectRoom(data.room.id, data.room.name);
+        // Re-open the live stream so the freshly-created DM room starts streaming immediately.
+        reconnect();
+      })
+      .catch(function () {});
+  }
+
   // --- live stream (WebSocket) ---------------------------------------------
 
   var ws = null, retry = 0;
@@ -261,6 +350,14 @@
   function scheduleReconnect() {
     retry = Math.min(retry + 1, 6);
     setTimeout(connect, 500 * Math.pow(2, retry));
+  }
+
+  // Force an immediate reconnect (e.g. after joining/creating a room) so the socket re-subscribes
+  // to the caller's current room set — the server snapshots membership at connect time.
+  function reconnect() {
+    retry = 0;
+    if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; }
+    connect();
   }
 
   function onLiveMessage(frame) {

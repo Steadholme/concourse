@@ -9,6 +9,7 @@
 
 pub mod admin;
 pub mod dashboard;
+pub mod dms;
 pub mod health;
 pub mod rooms;
 pub mod ws;

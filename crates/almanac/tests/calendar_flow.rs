@@ -144,6 +144,82 @@ async fn all_day_event_spans_the_day() {
 }
 
 #[tokio::test]
+async fn recurring_event_expands_in_month_and_agenda() {
+    let state = build_dev_state();
+    let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "a@x.co")).await;
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+
+    // A weekly series on a Wednesday (2099-06-03), 4 occurrences.
+    let save = post_form(
+        "/new",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf),
+            ("title", "Weekly sync"),
+            ("starts_at", "2099-06-03T09:00"),
+            ("ends_at", "2099-06-03T09:30"),
+            ("repeat", "weekly"),
+            ("repeat_interval", "1"),
+            ("repeat_count", "4"),
+        ],
+    );
+    let (status, _h, _b) = call(&state, save).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // June 2099: the four Wednesdays (3, 10, 17, 24) each render an occurrence chip.
+    let (_s, _h, month) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
+    let occurrences = month.matches("Weekly sync").count();
+    assert!(occurrences >= 4, "each weekly occurrence renders (got {occurrences})");
+    assert!(month.contains("↻"), "recurring occurrences carry a repeat marker");
+
+    // The edit form pre-fills the recurrence controls from the stored RRULE.
+    let id = find_between(&month, "/edit/", "\"").expect("event id");
+    let (_s, _h, edit) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
+    assert!(edit.contains("value=\"weekly\" selected"), "frequency pre-selected");
+    assert!(edit.contains("name=\"repeat_count\" min=\"1\" max=\"9999\" value=\"4\""), "count pre-filled");
+
+    // Editing the series (change the title) applies to every occurrence (v1 series semantics).
+    let (_s, h2, _b) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
+    let cookie2 = set_cookie(&h2).unwrap();
+    let csrf2 = cookie_value(&cookie2).unwrap();
+    let save2 = post_form(
+        &format!("/edit/{id}"),
+        &cookie2,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf2),
+            ("title", "Weekly sync (renamed)"),
+            ("starts_at", "2099-06-03T09:00"),
+            ("ends_at", "2099-06-03T09:30"),
+            ("repeat", "weekly"),
+            ("repeat_interval", "1"),
+            ("repeat_count", "4"),
+        ],
+    );
+    let (status, _h, _b) = call(&state, save2).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_s, _h, month2) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
+    assert!(month2.matches("Weekly sync (renamed)").count() >= 4, "rename hits the whole series");
+
+    // Deleting the series removes ALL occurrences.
+    let del = post_form(
+        &format!("/delete/{id}"),
+        &cookie2,
+        "u_alice",
+        "a@x.co",
+        &[("csrf_token", &csrf2)],
+    );
+    let (status, _h, _b) = call(&state, del).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let (_s, _h, gone) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
+    assert!(!gone.contains("Weekly sync"), "deleting the series clears every occurrence");
+}
+
+#[tokio::test]
 async fn contacts_crud_scoped_to_owner() {
     let state = build_dev_state();
 

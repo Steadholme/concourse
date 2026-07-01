@@ -15,6 +15,9 @@ pub const CONTACT_LIST_LIMIT: usize = 2000;
 pub const AGENDA_LIMIT: usize = 50;
 /// How many event chips a single calendar-day cell renders before collapsing to "+N more".
 pub const DAY_CHIP_LIMIT: usize = 3;
+/// How far past "now" recurring series are expanded for the upcoming agenda, in milliseconds
+/// (366 days). Bounds occurrence generation so an open-ended series stays cheap to render.
+pub const AGENDA_HORIZON_MS: i64 = 366 * 86_400_000;
 
 /// Runtime configuration. Cheap to clone; shared read-only behind `Arc`.
 #[derive(Clone, Debug)]

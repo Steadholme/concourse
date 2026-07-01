@@ -14,10 +14,11 @@ use serde::Deserialize;
 
 use crate::auth;
 use crate::calendar::{self, DayCell, MonthView};
-use crate::config::{AGENDA_LIMIT, DAY_CHIP_LIMIT};
+use crate::config::{AGENDA_HORIZON_MS, AGENDA_LIMIT, DAY_CHIP_LIMIT};
 use crate::error::AppError;
 use crate::handlers::html_with_csrf_cookie;
 use crate::render::{self, esc, layout};
+use crate::rrule::{self, Freq};
 use crate::store::Event;
 use crate::{now_ms, AppState};
 
@@ -56,6 +57,18 @@ pub struct EventForm {
     pub location: String,
     #[serde(default)]
     pub notes: String,
+    /// Recurrence frequency from the compose `<select>`: ``/`daily`/`weekly`/`monthly`/`yearly`.
+    #[serde(default)]
+    pub repeat: String,
+    /// Repeat every N periods (default 1).
+    #[serde(default)]
+    pub repeat_interval: String,
+    /// Optional total-occurrence cap (`COUNT`).
+    #[serde(default)]
+    pub repeat_count: String,
+    /// Optional `YYYY-MM-DD` end date (`UNTIL`).
+    #[serde(default)]
+    pub repeat_until: String,
 }
 
 /// A bare CSRF-only body, used by the delete forms.
@@ -86,8 +99,16 @@ pub async fn index(
         _ => cur_m,
     };
 
-    let events = state.store.list_events(&owner).await?;
+    let stored = state.store.list_events(&owner).await?;
     let view = calendar::build_month_at(year, month, now, off, monday_first);
+
+    // Expand recurring series into concrete occurrences visible in this render: the month grid's
+    // span plus the upcoming-agenda horizon. Non-recurring events pass through unchanged.
+    let (grid_start, grid_end) = grid_bounds(&view);
+    let win_start = grid_start.min(now);
+    let win_end = grid_end.max(now + AGENDA_HORIZON_MS);
+    let events = rrule::expand_events(&stored, win_start, win_end);
+
     let csrf = auth::new_csrf_token();
 
     let content = format!(
@@ -159,6 +180,31 @@ fn render_calendar(
     )
 }
 
+/// The `[earliest, latest]` UTC-ms span covered by the month grid's real (non-padding) cells.
+fn grid_bounds(view: &MonthView) -> (i64, i64) {
+    let mut start = i64::MAX;
+    let mut end = i64::MIN;
+    for cell in view.weeks.iter().flatten().flatten() {
+        start = start.min(cell.start_ms);
+        end = end.max(cell.end_ms);
+    }
+    if start > end {
+        (0, 0)
+    } else {
+        (start, end)
+    }
+}
+
+/// A small "repeats" glyph appended to recurring-series chips/labels (occurrences carry the series
+/// `rrule`). Empty for one-off events.
+fn recur_mark(e: &Event) -> &'static str {
+    if e.rrule.trim().is_empty() {
+        ""
+    } else {
+        " ↻"
+    }
+}
+
 fn render_day_cell(c: &DayCell, events: &[Event], off: i32) -> String {
     let day_events: Vec<&Event> = events
         .iter()
@@ -168,9 +214,14 @@ fn render_day_cell(c: &DayCell, events: &[Event], off: i32) -> String {
     let mut chips = String::new();
     for e in day_events.iter().take(DAY_CHIP_LIMIT) {
         let label = if e.all_day {
-            esc(&e.title)
+            format!("{}{}", esc(&e.title), recur_mark(e))
         } else {
-            format!("{} {}", calendar::human_time_at(e.starts_at, off), esc(&e.title))
+            format!(
+                "{} {}{}",
+                calendar::human_time_at(e.starts_at, off),
+                esc(&e.title),
+                recur_mark(e)
+            )
         };
         let tooltip = esc(&format!(
             "{} — {}",
@@ -234,7 +285,7 @@ fn render_agenda_item(e: &Event, csrf: &str, off: i32) -> String {
         "<div class=\"agenda__item\">\
            <div class=\"agenda__when\">{when}</div>\
            <div class=\"agenda__body\">\
-             <a class=\"agenda__title\" href=\"/edit/{id}\">{title}</a>\
+             <a class=\"agenda__title\" href=\"/edit/{id}\">{title}{recur}</a>\
              {loc}\
            </div>\
            <form class=\"agenda__del\" method=\"post\" action=\"/delete/{id}\" onsubmit=\"return confirm('Delete this event?')\">\
@@ -245,6 +296,7 @@ fn render_agenda_item(e: &Event, csrf: &str, off: i32) -> String {
         when = esc(&calendar::fmt_event_when_at(e.starts_at, e.ends_at, e.all_day, off)),
         id = esc(&e.id),
         title = esc(&e.title),
+        recur = recur_mark(e),
         loc = loc,
         csrf = esc(csrf),
     )
@@ -275,6 +327,7 @@ pub async fn new_form(
         None => (String::new(), String::new()),
     };
 
+    let (repeat, repeat_interval, repeat_count, repeat_until) = FormView::no_recurrence();
     let view = FormView {
         action: "/new".to_string(),
         title: String::new(),
@@ -283,6 +336,10 @@ pub async fn new_form(
         all_day: false,
         location: String::new(),
         notes: String::new(),
+        repeat,
+        repeat_interval,
+        repeat_count,
+        repeat_until,
         csrf: csrf.clone(),
         is_edit: false,
         id: String::new(),
@@ -319,6 +376,7 @@ pub async fn create(
             all_day: parsed.all_day,
             location: parsed.location,
             notes: parsed.notes,
+            rrule: parsed.rrule,
             created_at: now_ms(),
         })
         .await?;
@@ -344,6 +402,8 @@ pub async fn edit_form(
         .ok_or_else(|| AppError::NotFound("That event does not exist.".to_string()))?;
 
     let csrf = auth::new_csrf_token();
+    let (repeat, repeat_interval, repeat_count, repeat_until) =
+        FormView::recurrence_from(&event.rrule);
     let view = FormView {
         action: format!("/edit/{}", event.id),
         title: event.title.clone(),
@@ -352,6 +412,10 @@ pub async fn edit_form(
         all_day: event.all_day,
         location: event.location.clone(),
         notes: event.notes.clone(),
+        repeat,
+        repeat_interval,
+        repeat_count,
+        repeat_until,
         csrf: csrf.clone(),
         is_edit: true,
         id: event.id.clone(),
@@ -395,6 +459,7 @@ pub async fn update(
             all_day: parsed.all_day,
             location: parsed.location,
             notes: parsed.notes,
+            rrule: parsed.rrule,
             created_at: existing.created_at,
         })
         .await?;
@@ -431,9 +496,84 @@ struct FormView {
     all_day: bool,
     location: String,
     notes: String,
+    /// Recurrence frequency keyword (``/`daily`/`weekly`/`monthly`/`yearly`) for the `<select>`.
+    repeat: String,
+    repeat_interval: String,
+    repeat_count: String,
+    repeat_until: String,
     csrf: String,
     is_edit: bool,
     id: String,
+}
+
+impl FormView {
+    /// Recurrence fields for a fresh (non-recurring) form.
+    fn no_recurrence() -> (String, String, String, String) {
+        (String::new(), "1".to_string(), String::new(), String::new())
+    }
+
+    /// Recurrence fields derived from a stored event's RRULE (empty/one-off => `no_recurrence`).
+    fn recurrence_from(rrule_text: &str) -> (String, String, String, String) {
+        match rrule::RRule::parse(rrule_text) {
+            Some(r) => (
+                r.freq.keyword().to_string(),
+                r.interval.to_string(),
+                r.count.map(|c| c.to_string()).unwrap_or_default(),
+                r.until_date_input(),
+            ),
+            None => FormView::no_recurrence(),
+        }
+    }
+}
+
+/// A `<select>` for the recurrence frequency, marking the current choice `selected`.
+fn repeat_select(current: &str) -> String {
+    let opt = |val: &str, label: &str| {
+        let sel = if val == current { " selected" } else { "" };
+        format!("<option value=\"{val}\"{sel}>{label}</option>")
+    };
+    format!(
+        "<select id=\"repeat\" name=\"repeat\">{}{}{}{}{}</select>",
+        opt("", "Does not repeat"),
+        opt("daily", "Daily"),
+        opt("weekly", "Weekly"),
+        opt("monthly", "Monthly"),
+        opt("yearly", "Yearly"),
+    )
+}
+
+/// The compose recurrence block: frequency + interval + optional COUNT/UNTIL.
+fn render_recurrence(v: &FormView) -> String {
+    format!(
+        "<fieldset class=\"editor__field editor__recur\">\
+           <legend>Repeat</legend>\
+           <div class=\"editor__row\">\
+             <div class=\"editor__field\">\
+               <label for=\"repeat\">Frequency</label>\
+               {select}\
+             </div>\
+             <div class=\"editor__field\">\
+               <label for=\"repeat_interval\">Every</label>\
+               <input id=\"repeat_interval\" type=\"number\" name=\"repeat_interval\" min=\"1\" max=\"999\" value=\"{interval}\">\
+             </div>\
+           </div>\
+           <div class=\"editor__row\">\
+             <div class=\"editor__field\">\
+               <label for=\"repeat_count\">For (occurrences)</label>\
+               <input id=\"repeat_count\" type=\"number\" name=\"repeat_count\" min=\"1\" max=\"9999\" value=\"{count}\" placeholder=\"unlimited\">\
+             </div>\
+             <div class=\"editor__field\">\
+               <label for=\"repeat_until\">Until</label>\
+               <input id=\"repeat_until\" type=\"date\" name=\"repeat_until\" value=\"{until}\">\
+             </div>\
+           </div>\
+           <p class=\"editor__hint\">Recurring edits and deletes apply to the whole series.</p>\
+         </fieldset>",
+        select = repeat_select(&v.repeat),
+        interval = esc(&v.repeat_interval),
+        count = esc(&v.repeat_count),
+        until = esc(&v.repeat_until),
+    )
 }
 
 fn render_event_form(v: &FormView) -> String {
@@ -467,6 +607,7 @@ fn render_event_form(v: &FormView) -> String {
              <label for=\"notes\">Notes</label>\
              <textarea id=\"notes\" name=\"notes\" rows=\"5\">{notes}</textarea>\
            </div>\
+           {recurrence}\
            <div class=\"editor__actions\">\
              <a class=\"btn btn-secondary\" href=\"/\">Cancel</a>\
              <button class=\"btn btn-primary\" type=\"submit\">Save event</button>\
@@ -481,6 +622,7 @@ fn render_event_form(v: &FormView) -> String {
         checked = if v.all_day { " checked" } else { "" },
         location = esc(&v.location),
         notes = esc(&v.notes),
+        recurrence = render_recurrence(v),
     );
 
     if !v.is_edit {
@@ -507,6 +649,19 @@ struct ParsedEvent {
     all_day: bool,
     location: String,
     notes: String,
+    /// Canonical RRULE built from the compose recurrence fields (empty for a one-off).
+    rrule: String,
+}
+
+/// Map the compose `repeat` `<select>` keyword to a [`Freq`] (`None` = does not repeat).
+fn parse_repeat_freq(v: &str) -> Option<Freq> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "daily" => Some(Freq::Daily),
+        "weekly" => Some(Freq::Weekly),
+        "monthly" => Some(Freq::Monthly),
+        "yearly" => Some(Freq::Yearly),
+        _ => None,
+    }
 }
 
 /// Validate + normalize an [`EventForm`] into a [`ParsedEvent`]. The `datetime-local` inputs are
@@ -531,6 +686,12 @@ fn parse_event_form(form: &EventForm, off: i32) -> Result<ParsedEvent, AppError>
         ends_at = starts_at;
     }
 
+    let freq = parse_repeat_freq(&form.repeat);
+    let interval = form.repeat_interval.trim().parse::<u32>().unwrap_or(1).max(1);
+    let count = form.repeat_count.trim().parse::<u32>().ok().filter(|c| *c > 0);
+    let until = Some(form.repeat_until.trim()).filter(|u| !u.is_empty());
+    let rrule = rrule::build_rrule(freq, interval, count, until);
+
     Ok(ParsedEvent {
         title,
         starts_at,
@@ -538,6 +699,7 @@ fn parse_event_form(form: &EventForm, off: i32) -> Result<ParsedEvent, AppError>
         all_day,
         location: form.location.trim().to_string(),
         notes: form.notes.trim().to_string(),
+        rrule,
     })
 }
 

@@ -49,6 +49,22 @@ sha2 = "0.10"
 # macros, so the build needs NO database. rustls TLS (ring) — no openssl. The same standard SQL
 # later runs unchanged on FusionDB over pgwire.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+# --- Web Push (RFC8292 VAPID + RFC8291 aes128gcm) + outbound HTTPS webhook delivery ---
+# Pure-Rust crypto backend already resolved estate-wide via rustls: ECDSA P-256 (VAPID ES256 JWT),
+# ECDH P-256 + AES-128-GCM (RFC8291 payload encryption), and the CSPRNG. No OpenSSL.
+ring = "0.17"
+# HKDF-SHA256 key derivation for the RFC8291 content-encryption keys (Sha256 already in-tree).
+hkdf = "0.12"
+# base64url (no-pad) for the VAPID JWT segments, the application-server key, and the browser
+# subscription keys. hex for the webhook HMAC signature digest.
+base64 = "0.22"
+hex = "0.4"
+# Async rustls TLS client (ring provider) so `https://` webhook targets AND the browser push
+# endpoints (fcm.googleapis.com, *.notify.windows.com, updates.push.services.mozilla.com) are
+# delivered for real over TLS — same rustls/ring stack sqlx already links, no OpenSSL.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# Mozilla trust anchors for the push/webhook TLS client (public endpoints, real CA chains).
+webpki-roots = "0.26"
 
 [dev-dependencies]
 # ServiceExt::oneshot drives the Router in-process for the end-to-end tests (no port bind).

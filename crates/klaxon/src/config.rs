@@ -17,6 +17,9 @@ pub const DEFAULT_SMTP_ADDR: &str = "corvid:587";
 /// Default envelope-from used for the optional email channel.
 pub const DEFAULT_SMTP_FROM: &str = "klaxon@w33d.xyz";
 
+/// Default VAPID `sub` contact claim (RFC 8292 requires a `mailto:`/`https:` operator contact).
+pub const DEFAULT_VAPID_SUBJECT: &str = "mailto:klaxon@w33d.xyz";
+
 /// Hard cap on how many notifications the inbox renders / the API returns.
 pub const LIST_LIMIT: usize = 200;
 
@@ -47,6 +50,8 @@ pub struct Config {
     /// VAPID application-server private key (`VAPID_PRIVATE_KEY`). Presence (with the public key)
     /// flips push to `configured: true`.
     pub vapid_private_key: Option<String>,
+    /// VAPID `sub` contact claim (`VAPID_SUBJECT`, default `mailto:klaxon@w33d.xyz`).
+    pub vapid_subject: String,
     /// Optional email channel toggle (`KLAXON_SMTP_ENABLED`).
     pub smtp_enabled: bool,
     /// SMTP submission target (`KLAXON_SMTP_ADDR`, default `corvid:587`).
@@ -65,6 +70,7 @@ impl Config {
             ingest_token: None,
             vapid_public_key: None,
             vapid_private_key: None,
+            vapid_subject: DEFAULT_VAPID_SUBJECT.to_string(),
             smtp_enabled: false,
             smtp_addr: DEFAULT_SMTP_ADDR.to_string(),
             smtp_from: DEFAULT_SMTP_FROM.to_string(),
@@ -83,6 +89,9 @@ impl Config {
         config.ingest_token = env_nonempty("KLAXON_INGEST_TOKEN");
         config.vapid_public_key = env_nonempty("VAPID_PUBLIC_KEY");
         config.vapid_private_key = env_nonempty("VAPID_PRIVATE_KEY");
+        if let Some(v) = env_nonempty("VAPID_SUBJECT") {
+            config.vapid_subject = v;
+        }
         config.smtp_enabled = env_truthy("KLAXON_SMTP_ENABLED");
         if let Some(v) = env_nonempty("KLAXON_SMTP_ADDR") {
             config.smtp_addr = v;

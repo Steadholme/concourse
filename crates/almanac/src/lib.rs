@@ -29,6 +29,7 @@ pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod render;
+pub mod rrule;
 pub mod store;
 
 use std::sync::Arc;

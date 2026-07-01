@@ -40,6 +40,10 @@ pub struct Event {
     pub all_day: bool,
     pub location: String,
     pub notes: String,
+    /// RFC 5545 RRULE for a recurring series (e.g. `FREQ=WEEKLY;BYDAY=MO,WE`); empty = a one-off.
+    /// The row IS the series (its `starts_at`/`ends_at` are DTSTART); occurrences are expanded
+    /// virtually at render time by [`crate::rrule`].
+    pub rrule: String,
     pub created_at: i64,
 }
 
@@ -306,6 +310,11 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Recurrence: an optional RRULE column added idempotently so an existing `events` table
+        // migrates forward with no data loss. Portable standard SQL (TEXT NOT NULL DEFAULT '').
+        sqlx::query("ALTER TABLE events ADD COLUMN IF NOT EXISTS rrule TEXT NOT NULL DEFAULT ''")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_events_owner_start ON events (owner_sub, starts_at)",
         )
@@ -369,6 +378,7 @@ impl PgStore {
             all_day: row.try_get("all_day")?,
             location: row.try_get("location")?,
             notes: row.try_get("notes")?,
+            rrule: row.try_get("rrule")?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -396,7 +406,7 @@ impl PgStore {
 
     async fn list_events_async(&self, owner_sub: &str) -> Result<Vec<Event>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT id, owner_sub, title, starts_at, ends_at, all_day, location, notes, created_at \
+            "SELECT id, owner_sub, title, starts_at, ends_at, all_day, location, notes, rrule, created_at \
              FROM events WHERE owner_sub = $1 ORDER BY starts_at ASC, id ASC LIMIT $2",
         )
         .bind(owner_sub)
@@ -412,7 +422,7 @@ impl PgStore {
         id: &str,
     ) -> Result<Option<Event>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, owner_sub, title, starts_at, ends_at, all_day, location, notes, created_at \
+            "SELECT id, owner_sub, title, starts_at, ends_at, all_day, location, notes, rrule, created_at \
              FROM events WHERE id = $1 AND owner_sub = $2",
         )
         .bind(id)
@@ -425,15 +435,16 @@ impl PgStore {
     async fn upsert_event_async(&self, e: &Event) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO events \
-                 (id, owner_sub, title, starts_at, ends_at, all_day, location, notes, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 (id, owner_sub, title, starts_at, ends_at, all_day, location, notes, rrule, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT (id) DO UPDATE SET \
                  title = EXCLUDED.title, \
                  starts_at = EXCLUDED.starts_at, \
                  ends_at = EXCLUDED.ends_at, \
                  all_day = EXCLUDED.all_day, \
                  location = EXCLUDED.location, \
-                 notes = EXCLUDED.notes \
+                 notes = EXCLUDED.notes, \
+                 rrule = EXCLUDED.rrule \
              WHERE events.owner_sub = EXCLUDED.owner_sub",
         )
         .bind(&e.id)
@@ -444,6 +455,7 @@ impl PgStore {
         .bind(e.all_day)
         .bind(&e.location)
         .bind(&e.notes)
+        .bind(&e.rrule)
         .bind(e.created_at)
         .execute(&self.pool)
         .await?;
@@ -631,6 +643,7 @@ mod tests {
             all_day: false,
             location: String::new(),
             notes: String::new(),
+            rrule: String::new(),
             created_at: starts,
         }
     }

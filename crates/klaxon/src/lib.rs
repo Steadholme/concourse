@@ -33,6 +33,7 @@ pub mod delivery;
 pub mod error;
 pub mod handlers;
 pub mod store;
+pub mod webpush;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

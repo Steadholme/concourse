@@ -59,8 +59,39 @@ pub fn require_user(headers: &HeaderMap) -> Result<(String, String), AppError> {
     Ok((sub, email))
 }
 
-/// Group names that authorize the `/admin` panel. Membership in ANY of these unlocks it.
+/// The GLOBAL admin groups that authorize the `/admin` panel — the ALWAYS-present seed of the
+/// effective set. Membership in ANY resolved admin group (see [`admin_groups`]) unlocks the panel.
+/// These two never change, so anything that works today keeps working.
 pub const ADMIN_GROUPS: &[&str] = &["admins", "infra-admins"];
+
+/// Default PRODUCT-SPECIFIC operator group for Murmur (the "chat" product). Overridable via the
+/// `MURMUR_ADMIN_GROUP` env var (see [`admin_groups`]).
+const PRODUCT_ADMIN_GROUP: &str = "chat-admins";
+
+/// The effective admin group set: the two globals from [`ADMIN_GROUPS`] ALWAYS, PLUS one
+/// product-scoped operator group (`chat-admins` by default, overridable via `MURMUR_ADMIN_GROUP`).
+/// Resolved once from the environment and cached.
+///
+/// # Delegated admin
+/// Chat moderation is DELEGABLE without granting GLOBAL admin: an operator adds a trusted user to
+/// `chat-admins` (via Census) and they gain the SAME `/admin` powers, but ONLY for chat — no other
+/// product trusts that group. This is purely ADDITIVE and safe — the two globals are never removed,
+/// and until someone is actually placed in the product group the gate behaves exactly as before.
+pub fn admin_groups() -> &'static [String] {
+    static GROUPS: OnceLock<Vec<String>> = OnceLock::new();
+    GROUPS.get_or_init(|| {
+        let product = std::env::var("MURMUR_ADMIN_GROUP")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| PRODUCT_ADMIN_GROUP.to_string());
+        let mut groups: Vec<String> = ADMIN_GROUPS.iter().map(|s| s.to_string()).collect();
+        if !groups.iter().any(|g| g == &product) {
+            groups.push(product);
+        }
+        groups
+    })
+}
 
 /// The authenticated user's groups, parsed from the comma-separated `X-Auth-Groups` header
 /// (injected AND HMAC-verified by the gateway, so it is trustworthy). Empty when absent/blank.
@@ -81,10 +112,11 @@ pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
     author_groups(headers).iter().any(|g| g == group)
 }
 
-/// Whether the authenticated user is in ANY [`ADMIN_GROUPS`] entry.
+/// Whether the authenticated user is in ANY [`admin_groups`] entry (the two globals plus the
+/// resolved product group).
 pub fn is_admin(headers: &HeaderMap) -> bool {
     let groups = author_groups(headers);
-    ADMIN_GROUPS.iter().any(|a| groups.iter().any(|g| g == a))
+    admin_groups().iter().any(|a| groups.iter().any(|g| g == a))
 }
 
 /// Require admin group membership for an `/admin` action. `Forbidden` (403) when the
@@ -342,6 +374,30 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(HEADER_SUBJECT, "user-42".parse().unwrap());
         assert!(gateway_identity_ok(&h));
+    }
+
+    #[test]
+    fn admin_gate_accepts_globals_and_product_group() {
+        // Default (no MURMUR_ADMIN_GROUP set): globals PLUS the product group `chat-admins`.
+        let resolved = admin_groups();
+        assert!(resolved.iter().any(|g| g == "admins"));
+        assert!(resolved.iter().any(|g| g == "infra-admins"));
+        assert!(resolved.iter().any(|g| g == "chat-admins"));
+
+        let admin = |g: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(HEADER_GROUPS, g.parse().unwrap());
+            is_admin(&h)
+        };
+        // Both globals still work.
+        assert!(admin("admins"));
+        assert!(admin("infra-admins"));
+        // The delegated product group is accepted too.
+        assert!(admin("chat-admins"));
+        assert!(admin("dev, chat-admins"));
+        // A random group is still denied, and no groups at all is denied.
+        assert!(!admin("readers,writers"));
+        assert!(!is_admin(&HeaderMap::new()));
     }
 
     #[test]

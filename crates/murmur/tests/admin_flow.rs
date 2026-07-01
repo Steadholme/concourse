@@ -1,7 +1,8 @@
 //! Admin panel end-to-end over the in-memory store (NO database).
 //!
 //! Drives the real `app` router via `tower::oneshot`. Covers the admin gate (non-admin -> 403,
-//! admin -> 200 for BOTH admin groups), CSRF on every mutating POST, and each admin mutation:
+//! admin -> 200 for BOTH globals AND the delegated `chat-admins` product group), CSRF on every
+//! mutating POST, and each admin mutation:
 //! room archive + delete, member remove + ban, and message redaction.
 
 use axum::body::Body;
@@ -107,6 +108,12 @@ async fn admin_gate_allows_only_admins() {
     // `infra-admins` (with whitespace) -> 200.
     let (status, _) = call(&state, get_auth("/admin", "u_a", "a@hf", Some("dev, infra-admins"))).await;
     assert_eq!(status, StatusCode::OK, "infra-admins -> 200");
+
+    // Delegated admin: the product group `chat-admins` also unlocks the panel (a scoped operator
+    // gets chat moderation without global admin). Default group; overridable via MURMUR_ADMIN_GROUP.
+    let (status, body) = call(&state, get_auth("/admin", "u_d", "d@hf", Some("chat-admins"))).await;
+    assert_eq!(status, StatusCode::OK, "chat-admins -> 200");
+    assert!(body.contains("Rooms"), "delegated admin sees the panel");
 }
 
 #[tokio::test]

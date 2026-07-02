@@ -46,8 +46,10 @@ pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod hub;
+mod notify;
 pub mod store;
 pub mod text;
+pub use notify::KlaxonNotifier;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,6 +69,7 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     pub hub: Arc<Hub>,
     pub audit: AuditSink,
+    pub klaxon: Option<Arc<KlaxonNotifier>>,
 }
 
 /// Build the router wiring all endpoints onto `state`. Routes are explicit (no fallback): the
@@ -169,6 +172,7 @@ pub fn build_dev_state() -> AppState {
         store: Arc::new(InMemoryStore::new()),
         hub: Arc::new(Hub::new()),
         audit: AuditSink::disabled(),
+        klaxon: None,
     }
 }
 
@@ -213,6 +217,7 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         store,
         hub: Arc::new(Hub::new()),
         audit,
+        klaxon: KlaxonNotifier::from_env().map(Arc::new),
     })
 }
 

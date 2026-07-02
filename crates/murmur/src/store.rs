@@ -183,6 +183,9 @@ pub trait Store: Send + Sync {
     async fn list_user_reactions(&self, message_id: &str, user_sub: &str) -> Vec<String>;
     /// How many messages are threaded replies to `message_id` (their `reply_to_id` equals it).
     async fn count_replies(&self, message_id: &str) -> i64;
+    /// Current non-banned room members who have participated in a thread (the parent message or one
+    /// of its direct replies), oldest participation first. Read-only helper for best-effort notify.
+    async fn list_thread_participants(&self, room_id: &str, parent_message_id: &str) -> Vec<Person>;
 
     // --- admin panel -------------------------------------------------------
     /// ALL rooms in the system, newest-created first (admin room list; includes archived).
@@ -584,6 +587,40 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|m| m.reply_to_id.as_deref() == Some(message_id))
             .count() as i64
+    }
+
+    async fn list_thread_participants(&self, room_id: &str, parent_message_id: &str) -> Vec<Person> {
+        let memberships = self.memberships.lock().expect("memberships lock poisoned");
+        let messages = self.messages.lock().expect("messages lock poisoned");
+        let mut out: Vec<(Person, i64)> = Vec::new();
+        for msg in messages.iter().filter(|m| {
+            m.room_id == room_id
+                && (m.id == parent_message_id
+                    || m.reply_to_id.as_deref() == Some(parent_message_id))
+        }) {
+            let Some(member) = memberships
+                .iter()
+                .find(|m| m.room_id == room_id && m.user_sub == msg.sender_sub && !m.banned)
+            else {
+                continue;
+            };
+            if let Some((_, first_at)) = out
+                .iter_mut()
+                .find(|(p, _)| p.user_sub == member.user_sub)
+            {
+                *first_at = (*first_at).min(msg.created_at);
+                continue;
+            }
+            out.push((
+                Person {
+                    user_sub: member.user_sub.clone(),
+                    user_email: member.user_email.clone(),
+                },
+                msg.created_at,
+            ));
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.user_sub.cmp(&b.0.user_sub)));
+        out.into_iter().map(|(p, _)| p).collect()
     }
 
     async fn list_all_rooms(&self) -> Vec<Room> {
@@ -1396,6 +1433,34 @@ impl PgStore {
         row.try_get("cnt")
     }
 
+    async fn list_thread_participants_async(
+        &self,
+        room_id: &str,
+        parent_message_id: &str,
+    ) -> Result<Vec<Person>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT m.sender_sub AS user_sub, MIN(mem.user_email) AS user_email, \
+             MIN(m.created_at) AS first_at \
+             FROM messages m \
+             JOIN memberships mem ON mem.room_id = m.room_id \
+                AND mem.user_sub = m.sender_sub AND mem.banned = FALSE \
+             WHERE m.room_id = $1 AND (m.id = $2 OR m.reply_to_id = $2) \
+             GROUP BY m.sender_sub ORDER BY MIN(m.created_at) ASC, m.sender_sub ASC",
+        )
+        .bind(room_id)
+        .bind(parent_message_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(Person {
+                    user_sub: r.try_get("user_sub")?,
+                    user_email: r.try_get("user_email")?,
+                })
+            })
+            .collect()
+    }
+
     async fn list_all_rooms_async(&self) -> Result<Vec<Room>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT id, name, kind, created_by, created_at, archived, topic FROM rooms \
@@ -1793,6 +1858,15 @@ impl Store for PgStore {
         })
     }
 
+    async fn list_thread_participants(&self, room_id: &str, parent_message_id: &str) -> Vec<Person> {
+        self.list_thread_participants_async(room_id, parent_message_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_thread_participants failed");
+                Vec::new()
+            })
+    }
+
     async fn list_all_rooms(&self) -> Vec<Room> {
         self.list_all_rooms_async().await.unwrap_or_else(|e| {
             tracing::error!(error = %e, "pg list_all_rooms failed");
@@ -1918,5 +1992,74 @@ impl Store for PgStore {
                 tracing::error!(error = %e, "pg list_user_mentions failed");
                 Vec::new()
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn room(id: &str) -> Room {
+        Room {
+            id: id.to_string(),
+            name: "#test".to_string(),
+            kind: "room".to_string(),
+            created_by: "u_alice".to_string(),
+            created_at: 1,
+            archived: false,
+            topic: String::new(),
+        }
+    }
+
+    fn message(id: &str, sender: &str, email: &str, at: i64, reply_to: Option<&str>) -> Message {
+        Message {
+            id: id.to_string(),
+            room_id: "room_1".to_string(),
+            sender_sub: sender.to_string(),
+            sender_email: email.to_string(),
+            body: "body".to_string(),
+            created_at: at,
+            edited_at: 0,
+            deleted: false,
+            reply_to_id: reply_to.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_participants_are_current_non_banned_members() {
+        let store = InMemoryStore::new();
+        store.ensure_room(&room("room_1")).await.unwrap();
+        store
+            .ensure_membership("room_1", "u_alice", "alice@hf", 1)
+            .await
+            .unwrap();
+        store
+            .ensure_membership("room_1", "u_bob", "bob@hf", 2)
+            .await
+            .unwrap();
+        store
+            .ensure_membership("room_1", "u_carol", "carol@hf", 3)
+            .await
+            .unwrap();
+
+        store
+            .create_message(&message("msg_parent", "u_alice", "alice@hf", 10, None))
+            .await
+            .unwrap();
+        store
+            .create_message(&message("msg_reply_1", "u_bob", "bob@hf", 11, Some("msg_parent")))
+            .await
+            .unwrap();
+        store
+            .create_message(&message("msg_reply_2", "u_carol", "carol@hf", 12, Some("msg_parent")))
+            .await
+            .unwrap();
+        store.ban_member("room_1", "u_carol").await.unwrap();
+
+        let participants = store
+            .list_thread_participants("room_1", "msg_parent")
+            .await;
+        let subs: Vec<String> = participants.into_iter().map(|p| p.user_sub).collect();
+        assert_eq!(subs, vec!["u_alice".to_string(), "u_bob".to_string()]);
     }
 }

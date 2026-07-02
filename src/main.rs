@@ -151,6 +151,7 @@ async fn build_chat() -> Result<Router, String> {
         store: Arc::new(pg),
         hub: Arc::new(murmur::hub::Hub::new()),
         audit,
+        klaxon: murmur::KlaxonNotifier::from_env().map(Arc::new),
     };
     Ok(murmur::app(state))
 }

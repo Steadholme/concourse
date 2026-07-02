@@ -5,6 +5,9 @@
 //! they belong to. A successful send persists the message, fans it out to the live [`Hub`], and
 //! best-effort audits `chat.message.send` to Watchtower.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::http::{HeaderMap, StatusCode};
@@ -19,9 +22,9 @@ use crate::config::{
 };
 use crate::error::AppError;
 use crate::handlers::{message_frame, reaction_frame};
-use crate::store::{Message, Room};
+use crate::store::{Member, Message, Person, Room};
 use crate::text::parse_mentions;
-use crate::{ensure_lobby, now_nanos, now_secs, AppState};
+use crate::{ensure_lobby, now_nanos, now_secs, AppState, KlaxonNotifier};
 
 /// Body for `POST /api/rooms`.
 #[derive(Debug, Deserialize)]
@@ -183,7 +186,7 @@ pub async fn send(
 ) -> Result<Response, AppError> {
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
-    require_membership(&state, &id, &sub).await?;
+    let room = require_membership(&state, &id, &sub).await?;
 
     let body = req.body.trim();
     if body.is_empty() {
@@ -195,7 +198,7 @@ pub async fn send(
 
     // A threaded reply must point at an EXISTING message IN THIS ROOM (a reply can never cross
     // rooms or dangle). An empty/blank id is treated as "no reply".
-    let reply_to_id = match req.reply_to_id.as_deref().map(str::trim) {
+    let reply_parent = match req.reply_to_id.as_deref().map(str::trim) {
         Some(pid) if !pid.is_empty() => {
             let parent = state
                 .store
@@ -203,7 +206,7 @@ pub async fn send(
                 .await
                 .filter(|m| m.room_id == id)
                 .ok_or_else(|| AppError::InvalidRequest("reply target not found".to_string()))?;
-            Some(parent.id)
+            Some(parent)
         }
         _ => None,
     };
@@ -217,14 +220,15 @@ pub async fn send(
         created_at: now_secs(),
         edited_at: 0,
         deleted: false,
-        reply_to_id,
+        reply_to_id: reply_parent.as_ref().map(|m| m.id.clone()),
     };
     state.store.create_message(&message).await?;
 
     // Resolve @mentions in the body to members of THIS room and record one mention per hit. Only
     // current room members can be mentioned (a mention never reaches a non-member), and the author
     // never mentions themselves.
-    record_mentions(&state, &message).await;
+    let mentioned = record_mentions(&state, &message).await;
+    spawn_message_notifications(&state, &room, &message, reply_parent.as_ref(), mentioned);
 
     // Fan out to every WebSocket currently subscribed to this room (single-process; the DB is the
     // source of truth, so a missed live frame is recovered on the next GET).
@@ -543,12 +547,13 @@ pub async fn pinned(
 /// Resolve the `@mentions` in `message` against the room's CURRENT members and record one mention
 /// per matched member (never the author themselves). A token matches a member whose email
 /// local-part OR full email equals it (case-insensitive). Best-effort: a store hiccup only warns.
-async fn record_mentions(state: &AppState, message: &Message) {
+async fn record_mentions(state: &AppState, message: &Message) -> Vec<Member> {
     let tokens = parse_mentions(&message.body);
     if tokens.is_empty() {
-        return;
+        return Vec::new();
     }
     let members = state.store.list_room_members(&message.room_id).await;
+    let mut mentioned = Vec::new();
     for m in members.iter() {
         if m.banned || m.user_sub == message.sender_sub {
             continue;
@@ -559,6 +564,7 @@ async fn record_mentions(state: &AppState, message: &Message) {
             .iter()
             .any(|t| t == &email || (!local.is_empty() && t == local));
         if matched {
+            mentioned.push(m.clone());
             if let Err(e) = state
                 .store
                 .add_mention(&message.id, &message.room_id, &m.user_sub, message.created_at)
@@ -568,18 +574,185 @@ async fn record_mentions(state: &AppState, message: &Message) {
             }
         }
     }
+    mentioned
+}
+
+fn spawn_message_notifications(
+    state: &AppState,
+    room: &Room,
+    message: &Message,
+    reply_parent: Option<&Message>,
+    mentioned: Vec<Member>,
+) {
+    let Some(notifier) = state.klaxon.clone() else {
+        return;
+    };
+    let store = state.store.clone();
+    let room = room.clone();
+    let message = message.clone();
+    let reply_parent_id = reply_parent.map(|m| m.id.clone());
+
+    tokio::spawn(async move {
+        let sender = actor(&message.sender_email, &message.sender_sub);
+        let body = message_summary(&message.body);
+        let url = message_url(&message.room_id, &message.id);
+        let mut notified = HashSet::new();
+
+        for member in mentioned {
+            notify_once(
+                &notifier,
+                &mut notified,
+                &message.sender_sub,
+                &member.user_sub,
+                &mention_title(&sender, &room),
+                &body,
+                &url,
+            );
+        }
+
+        if room.kind == "dm" {
+            let members = store.list_room_members(&room.id).await;
+            for member in members.into_iter().filter(|m| !m.banned) {
+                notify_once(
+                    &notifier,
+                    &mut notified,
+                    &message.sender_sub,
+                    &member.user_sub,
+                    &dm_title(&sender),
+                    &body,
+                    &url,
+                );
+            }
+        }
+
+        if let Some(parent_id) = reply_parent_id {
+            let participants = store.list_thread_participants(&room.id, &parent_id).await;
+            for person in participants {
+                notify_person_once(
+                    &notifier,
+                    &mut notified,
+                    &message.sender_sub,
+                    &person,
+                    &thread_title(&sender, &room),
+                    &body,
+                    &url,
+                );
+            }
+        }
+    });
+}
+
+fn notify_person_once(
+    notifier: &Arc<KlaxonNotifier>,
+    notified: &mut HashSet<String>,
+    sender_sub: &str,
+    person: &Person,
+    title: &str,
+    body: &str,
+    url: &str,
+) {
+    notify_once(
+        notifier,
+        notified,
+        sender_sub,
+        &person.user_sub,
+        title,
+        body,
+        url,
+    );
+}
+
+fn notify_once(
+    notifier: &Arc<KlaxonNotifier>,
+    notified: &mut HashSet<String>,
+    sender_sub: &str,
+    recipient_sub: &str,
+    title: &str,
+    body: &str,
+    url: &str,
+) {
+    if recipient_sub == sender_sub || !notified.insert(recipient_sub.to_string()) {
+        return;
+    }
+    notifier.notify("murmur", recipient_sub, title, body, url);
+}
+
+fn mention_title(sender: &str, room: &Room) -> String {
+    if room.kind == "dm" {
+        format!("{sender} 在私信中提到了你")
+    } else {
+        format!("{sender} 在 {} 提到了你", room_label(room))
+    }
+}
+
+fn dm_title(sender: &str) -> String {
+    format!("{sender} 发来一条私信")
+}
+
+fn thread_title(sender: &str, room: &Room) -> String {
+    if room.kind == "dm" {
+        format!("{sender} 回复了你的私信线程")
+    } else {
+        format!("{sender} 在 {} 回复了你参与的线程", room_label(room))
+    }
+}
+
+fn room_label(room: &Room) -> String {
+    let name = room.name.trim();
+    if name.is_empty() {
+        return room.id.clone();
+    }
+    if name.starts_with('#') {
+        name.to_string()
+    } else {
+        format!("#{name}")
+    }
+}
+
+fn message_summary(body: &str) -> String {
+    const SUMMARY_CHARS: usize = 180;
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = collapsed.chars().count();
+    let mut out = collapsed.chars().take(SUMMARY_CHARS).collect::<String>();
+    if count > SUMMARY_CHARS {
+        out.push_str("...");
+    }
+    out
+}
+
+fn message_url(room_id: &str, message_id: &str) -> String {
+    format!(
+        "https://chat.w33d.xyz/?room={}&message={}",
+        url_query_escape(room_id),
+        url_query_escape(message_id)
+    )
+}
+
+fn url_query_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Enforce that `sub` is a member of `room_id`, else `Forbidden` (or `NotFound` for a missing
 /// room). Defense in depth behind the gateway: SSO authenticates, membership authorizes.
-async fn require_membership(state: &AppState, room_id: &str, sub: &str) -> Result<(), AppError> {
-    if state.store.get_room(room_id).await.is_none() {
-        return Err(AppError::NotFound("no such room".to_string()));
-    }
+async fn require_membership(state: &AppState, room_id: &str, sub: &str) -> Result<Room, AppError> {
+    let room = state
+        .store
+        .get_room(room_id)
+        .await
+        .ok_or_else(|| AppError::NotFound("no such room".to_string()))?;
     if !state.store.is_member(room_id, sub).await {
         return Err(AppError::Forbidden("not a member of this room".to_string()));
     }
-    Ok(())
+    Ok(room)
 }
 
 /// Fetch a message and enforce that it lives in `room_id` AND was authored by `sub`
@@ -609,5 +782,47 @@ fn actor(email: &str, sub: &str) -> String {
         sub.to_string()
     } else {
         email.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn room(id: &str, name: &str, kind: &str) -> Room {
+        Room {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            created_by: "u_alice".to_string(),
+            created_at: 1,
+            archived: false,
+            topic: String::new(),
+        }
+    }
+
+    #[test]
+    fn notification_helper_shapes_are_stable() {
+        let lobby = room("room one/alpha", "#lobby", "room");
+        assert_eq!(room_label(&lobby), "#lobby");
+        assert_eq!(mention_title("alice@hf", &lobby), "alice@hf 在 #lobby 提到了你");
+        assert_eq!(
+            message_url(&lobby.id, "msg 1/2"),
+            "https://chat.w33d.xyz/?room=room%20one%2Falpha&message=msg%201%2F2"
+        );
+
+        let body = format!("hello\n{}\tend", "x".repeat(190));
+        let summary = message_summary(&body);
+        assert!(summary.starts_with("hello "));
+        assert!(summary.ends_with("..."));
+        assert!(summary.chars().count() <= 183);
+    }
+
+    #[test]
+    fn dm_and_thread_titles_use_private_context() {
+        let dm = room("dm_u_alice__u_bob", "alice@hf ↔ bob@hf", "dm");
+        assert_eq!(mention_title("alice@hf", &dm), "alice@hf 在私信中提到了你");
+        assert_eq!(dm_title("alice@hf"), "alice@hf 发来一条私信");
+        assert_eq!(thread_title("alice@hf", &dm), "alice@hf 回复了你的私信线程");
     }
 }

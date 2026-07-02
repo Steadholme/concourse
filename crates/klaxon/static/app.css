@@ -457,6 +457,33 @@ pre { font-family:var(--mono); font-size:12.5px; background:var(--surface-2); bo
 /* Unread filter: hide the read cards (no reflow jank, instant). */
 .note-list.filter-unread .card-note[data-read="1"] { display: none; }
 
+/* Source filter: hide cards whose source isn't the active chip. Combines with the unread
+   filter above — a card is shown only when it clears both (pure client-side DOM filtering). */
+.card-note.is-source-hidden { display: none; }
+
+/* Source filter chips: a wrap-friendly row of pills built by the inbox JS from the sources
+   present in the list. Empty (and so hidden) with JS off or when there's only one source. */
+.source-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+.source-chips:empty { display: none; }
+.source-chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 30px; padding: 0 12px; border-radius: var(--r-pill);
+  background: var(--surface); border: 1px solid var(--border);
+  cursor: pointer; font: inherit; font-size: 12.5px; font-weight: 550; color: var(--ink-2);
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.source-chip:hover { border-color: var(--border-2); color: var(--ink); }
+.source-chip.is-active { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent-ink); }
+.source-chip__dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.source-chip__label { line-height: 1; }
+.source-chip__count {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 17px; height: 17px; padding: 0 5px; border-radius: var(--r-pill);
+  font-size: 10.5px; font-weight: 700; background: var(--surface-3); color: var(--ink-2);
+}
+.source-chip.is-active .source-chip__count { background: var(--accent-soft-2); color: var(--accent-ink); }
+.source-chip__count.is-empty { display: none; }
+
 /* Row actions align right with breathing room; dismiss recedes vs mark-read. */
 .note__actions { display: flex; gap: 8px; align-items: center; }
 .card-note { transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease); }

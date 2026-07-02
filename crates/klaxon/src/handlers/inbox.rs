@@ -177,7 +177,7 @@ fn render_item(n: &crate::store::Notification, csrf: &str) -> String {
         format!(r#"<p class="note__body">{}</p>"#, esc(&n.body))
     };
     format!(
-        r#"<article class="card-note{unread_class}" data-id="{data_id}" data-read="{read}">
+        r#"<article class="card-note{unread_class}" data-id="{data_id}" data-read="{read}" data-source="{source}">
   <div class="note__head">
     <span class="badge badge-source">{source}</span>
     <h2 class="note__title">{dot}{title}</h2>

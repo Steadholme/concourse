@@ -42,13 +42,17 @@
     <button class="tab" type="button" role="tab" aria-selected="false" data-filter="unread">Unread<span class="note-filter__count" id="unread-tab-count">{{UNREAD}}</span></button>
   </div>
 
+  <!-- Source filter chips: built by the inbox JS from the sources present in the list, so a new
+       source appears automatically without any hard-coded list. Empty (and hidden) with JS off. -->
+  <div class="source-chips" id="source-chips" role="tablist" aria-label="Filter by source"></div>
+
   <div class="note-list" id="note-list">
     {{ITEMS}}
   </div>
   <div class="empty" id="filter-empty" hidden>
     <div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></div>
-    <h3>No unread notifications</h3>
-    <p>You've read everything. Switch to <button class="linklike" type="button" data-filter="all">All</button> to see the rest.</p>
+    <h3 id="filter-empty-title">No unread notifications</h3>
+    <p>Nothing matches the current filter. <button class="linklike" type="button" data-filter-reset>Clear filters</button> to see everything.</p>
   </div>
 
   <p class="site-foot">HOLDFAST · Sovereign infrastructure · one sign-on across every service</p>
@@ -98,6 +102,7 @@
     }
     var markAll = document.querySelector('.reader__actions form[action="/api/read"]');
     if (markAll) markAll.style.display = n > 0 ? "" : "none";
+    syncChips();
     applyFilter();
   }
 
@@ -149,7 +154,7 @@
       var next = card.nextElementSibling;
       card.classList.add("is-leaving"); // optimistic fade
       var placeholder = card;
-      setTimeout(function () { if (placeholder.parentNode) placeholder.parentNode.removeChild(placeholder); ensureListEmpty(); applyFilter(); }, 140);
+      setTimeout(function () { if (placeholder.parentNode) placeholder.parentNode.removeChild(placeholder); ensureListEmpty(); setUnread(unreadCards()); }, 140);
       setUnread(card.getAttribute("data-read") === "0" ? unreadCards() - 1 : unreadCards());
       postJson("/api/dismiss.json", id)
         .then(function (d) { setUnread(d.unread); toast("Dismissed"); })
@@ -176,14 +181,114 @@
     });
   }
 
-  // --- All / Unread filter tabs -------------------------------------------
-  var filter = "all";
+  // --- Filters: All/Unread (read state) × source chips, applied together ----
+  var filter = "all";           // read state: "all" | "unread"
+  var sourceFilter = "all";     // source: "all" | a specific data-source value
   var filterEmpty = document.getElementById("filter-empty");
+  var emptyTitle = document.getElementById("filter-empty-title");
+  var chipBar = document.getElementById("source-chips");
+
+  // Deterministic, on-palette accent dot per source (decorative — the same source always
+  // hashes to the same colour). Kept to a small, restrained token set.
+  var DOT_COLORS = ["var(--accent)", "var(--ok)", "var(--info)", "var(--down)"];
+  function dotColor(s) {
+    var h = 0;
+    for (var i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) >>> 0; }
+    return DOT_COLORS[h % DOT_COLORS.length];
+  }
+
+  // Build one chip. The source name is set via textContent (user data → escaped) and stored
+  // as an attribute we set through the DOM API — it is never interpolated into a CSS selector.
+  function makeChip(src) {
+    var b = document.createElement("button");
+    b.className = "source-chip";
+    b.type = "button";
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", "false");
+    b.setAttribute("data-source-filter", src);
+    if (src !== "all") {
+      var dot = document.createElement("span");
+      dot.className = "source-chip__dot";
+      dot.setAttribute("aria-hidden", "true");
+      dot.style.background = dotColor(src);
+      b.appendChild(dot);
+    }
+    var label = document.createElement("span");
+    label.className = "source-chip__label";
+    label.textContent = src === "all" ? "All sources" : src;
+    b.appendChild(label);
+    var count = document.createElement("span");
+    count.className = "source-chip__count";
+    b.appendChild(count);
+    b._count = count;
+    return b;
+  }
+
+  // Rebuild the chip bar from the live DOM: new sources appear automatically, a source whose
+  // last card was dismissed drops out, and each chip's unread badge stays in sync. Idempotent —
+  // safe to call after every mutation. Leaving cards are excluded so optimistic dismiss shows at once.
+  function syncChips() {
+    if (!chipBar) return;
+    var order = [], tally = {}, totalUnread = 0;
+    var cards = list.querySelectorAll('.card-note:not(.is-leaving)');
+    for (var i = 0; i < cards.length; i++) {
+      var s = cards[i].getAttribute("data-source") || "";
+      if (!Object.prototype.hasOwnProperty.call(tally, s)) { tally[s] = 0; order.push(s); }
+      if (cards[i].getAttribute("data-read") === "0") { tally[s]++; totalUnread++; }
+    }
+    // One source (or none) needs no source filter — keep the bar out of the way.
+    if (order.length < 2) { chipBar.textContent = ""; sourceFilter = "all"; return; }
+    if (sourceFilter !== "all" && !Object.prototype.hasOwnProperty.call(tally, sourceFilter)) {
+      sourceFilter = "all";
+    }
+    var have = {}, existing = chipBar.querySelectorAll(".source-chip");
+    for (var j = 0; j < existing.length; j++) {
+      have[existing[j].getAttribute("data-source-filter")] = existing[j];
+    }
+    var wanted = ["all"].concat(order), seen = {};
+    for (var k = 0; k < wanted.length; k++) {
+      var src = wanted[k];
+      seen[src] = true;
+      var chip = have[src] || makeChip(src);
+      var u = src === "all" ? totalUnread : tally[src];
+      chip._count.textContent = String(u);
+      chip._count.classList.toggle("is-empty", u === 0);
+      var on = src === sourceFilter;
+      chip.classList.toggle("is-active", on);
+      chip.setAttribute("aria-selected", on ? "true" : "false");
+      chipBar.appendChild(chip); // append in order → stable left-to-right layout
+    }
+    existing = chipBar.querySelectorAll(".source-chip");
+    for (var m = 0; m < existing.length; m++) {
+      if (!seen[existing[m].getAttribute("data-source-filter")]) { chipBar.removeChild(existing[m]); }
+    }
+  }
+
+  // Apply both filter dimensions to the list. Unread hiding rides a list class (CSS); source
+  // hiding tags each non-matching card. A card shows only when it clears both.
   function applyFilter() {
     var showUnreadOnly = filter === "unread";
     list.classList.toggle("filter-unread", showUnreadOnly);
-    if (filterEmpty) filterEmpty.hidden = !(showUnreadOnly && unreadCards() === 0 && list.querySelector(".card-note"));
+    var cards = list.querySelectorAll(".card-note");
+    var visible = 0, hasCards = false;
+    for (var i = 0; i < cards.length; i++) {
+      var c = cards[i];
+      var srcMatch = sourceFilter === "all" || c.getAttribute("data-source") === sourceFilter;
+      c.classList.toggle("is-source-hidden", !srcMatch);
+      if (c.classList.contains("is-leaving")) continue;
+      hasCards = true;
+      if (srcMatch && (!showUnreadOnly || c.getAttribute("data-read") === "0")) visible++;
+    }
+    if (filterEmpty) {
+      var show = hasCards && visible === 0;
+      filterEmpty.hidden = !show;
+      if (show && emptyTitle) {
+        var scope = sourceFilter === "all" ? "" : sourceFilter + " ";
+        emptyTitle.textContent = (showUnreadOnly ? "No unread " : "No ") + scope + "notifications";
+      }
+    }
   }
+
   function setFilter(next) {
     filter = next;
     var tabs = document.querySelectorAll(".note-filter .tab");
@@ -194,7 +299,22 @@
     }
     applyFilter();
   }
+  function setSource(next) {
+    sourceFilter = next;
+    if (chipBar) {
+      var chips = chipBar.querySelectorAll(".source-chip");
+      for (var i = 0; i < chips.length; i++) {
+        var on = chips[i].getAttribute("data-source-filter") === next;
+        chips[i].classList.toggle("is-active", on);
+        chips[i].setAttribute("aria-selected", on ? "true" : "false");
+      }
+    }
+    applyFilter();
+  }
   document.addEventListener("click", function (ev) {
+    if (ev.target.closest("[data-filter-reset]")) { setFilter("all"); setSource("all"); return; }
+    var chip = ev.target.closest("[data-source-filter]");
+    if (chip) { setSource(chip.getAttribute("data-source-filter")); return; }
     var t = ev.target.closest("[data-filter]");
     if (!t) return;
     setFilter(t.getAttribute("data-filter"));

@@ -37,7 +37,9 @@ async fn pg_store_full_integration() {
     };
 
     // --- connect / migrate (idempotent: run twice) -------------------------
-    let pg = PgStore::connect(&url).await.expect("connect to TEST_DATABASE_URL");
+    let pg = PgStore::connect(&url)
+        .await
+        .expect("connect to TEST_DATABASE_URL");
     pg.migrate().await.expect("migrate");
     pg.migrate().await.expect("migrate is idempotent");
 
@@ -45,12 +47,39 @@ async fn pg_store_full_integration() {
     state.store = Arc::new(pg);
 
     // Raw pool for clean-slate setup, out-of-band asserts, and teardown.
-    let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
-    sqlx::query("DELETE FROM event_attendees").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM event_reminders").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM events").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM contacts").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM settings").execute(&raw).await.unwrap();
+    let raw = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_attendees")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_reminders")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_exceptions")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM events")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM calendars")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM contacts")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM settings")
+        .execute(&raw)
+        .await
+        .unwrap();
 
     // --- create an event through the real HTTP flow ------------------------
     let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "alice@holdfast.local")).await;
@@ -76,28 +105,41 @@ async fn pg_store_full_integration() {
     assert_eq!(save.0, StatusCode::SEE_OTHER);
 
     // The owner's month view renders straight out of Postgres.
-    let (status, _h, month) = call(&state, get_as("/?y=2099&m=7", "u_alice", "alice@holdfast.local")).await;
+    let (status, _h, month) = call(
+        &state,
+        get_as("/?y=2099&m=7", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(month.contains("Launch"));
     assert!(month.contains("Pad 39A"));
     let id = find_between(&month, "/edit/", "\"").expect("event id");
 
     // The row landed with the gateway owner + a created_at.
-    let row = sqlx::query("SELECT owner_sub, title, starts_at, created_at FROM events WHERE id = $1")
-        .bind(&id)
-        .fetch_one(&raw)
-        .await
-        .unwrap();
+    let row =
+        sqlx::query("SELECT owner_sub, title, starts_at, created_at FROM events WHERE id = $1")
+            .bind(&id)
+            .fetch_one(&raw)
+            .await
+            .unwrap();
     let owner: String = row.try_get("owner_sub").unwrap();
     let created_at: i64 = row.try_get("created_at").unwrap();
     assert_eq!(owner, "u_alice", "owner comes from X-Auth-Subject");
 
     // --- another owner cannot read/edit/delete it (DB-scoped) --------------
-    let (status, _h, _b) = call(&state, get_as(&format!("/edit/{id}"), "u_mallory", "m@x.co")).await;
+    let (status, _h, _b) = call(
+        &state,
+        get_as(&format!("/edit/{id}"), "u_mallory", "m@x.co"),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // --- edit: upsert preserves created_at, updates the fields -------------
-    let (_s, h2, _b) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "alice@holdfast.local")).await;
+    let (_s, h2, _b) = call(
+        &state,
+        get_as(&format!("/edit/{id}"), "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     let cookie2 = set_cookie(&h2).unwrap();
     let csrf2 = cookie_value(&cookie2).unwrap();
     let save2 = post_form(
@@ -124,7 +166,10 @@ async fn pg_store_full_integration() {
     let title: String = row.try_get("title").unwrap();
     let created_after: i64 = row.try_get("created_at").unwrap();
     assert_eq!(title, "Launch (scrubbed)");
-    assert_eq!(created_after, created_at, "created_at preserved across the upsert");
+    assert_eq!(
+        created_after, created_at,
+        "created_at preserved across the upsert"
+    );
 
     let event_count: i64 = sqlx::query("SELECT count(*) AS n FROM events")
         .fetch_one(&raw)
@@ -175,7 +220,11 @@ async fn pg_store_full_integration() {
     assert_eq!(after, 0, "event deleted from Postgres");
 
     // --- contacts round-trip through Postgres ------------------------------
-    let (_s, ch, _b) = call(&state, get_as("/contacts", "u_alice", "alice@holdfast.local")).await;
+    let (_s, ch, _b) = call(
+        &state,
+        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     let ccookie = set_cookie(&ch).unwrap();
     let ccsrf = cookie_value(&ccookie).unwrap();
     let add = post_form(
@@ -184,7 +233,11 @@ async fn pg_store_full_integration() {
         &ccookie,
         "u_alice",
         "alice@holdfast.local",
-        &[("csrf_token", &ccsrf), ("name", "Ada Lovelace"), ("email", "ada@analytical.engine")],
+        &[
+            ("csrf_token", &ccsrf),
+            ("name", "Ada Lovelace"),
+            ("email", "ada@analytical.engine"),
+        ],
     )
     .await;
     assert_eq!(add.0, StatusCode::SEE_OTHER);
@@ -196,12 +249,23 @@ async fn pg_store_full_integration() {
         .try_get("n")
         .unwrap();
     assert_eq!(contact_count, 1);
-    let (_s, _h, list) = call(&state, get_as("/contacts", "u_alice", "alice@holdfast.local")).await;
+    let (_s, _h, list) = call(
+        &state,
+        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert!(list.contains("Ada Lovelace"));
 
     // --- settings round-trip through Postgres ------------------------------
-    let (_s, sh, sbody) = call(&state, get_as("/settings", "u_alice", "alice@holdfast.local")).await;
-    assert!(sbody.contains("value=\"UTC\" selected"), "defaults to UTC before any save");
+    let (_s, sh, sbody) = call(
+        &state,
+        get_as("/settings", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
+    assert!(
+        sbody.contains("value=\"UTC\" selected"),
+        "defaults to UTC before any save"
+    );
     let scookie = set_cookie(&sh).unwrap();
     let scsrf = cookie_value(&scookie).unwrap();
     let save_settings = post_form(
@@ -210,7 +274,11 @@ async fn pg_store_full_integration() {
         &scookie,
         "u_alice",
         "alice@holdfast.local",
-        &[("csrf_token", &scsrf), ("timezone", "UTC+08:00"), ("week_start", "monday")],
+        &[
+            ("csrf_token", &scsrf),
+            ("timezone", "UTC+08:00"),
+            ("week_start", "monday"),
+        ],
     )
     .await;
     assert_eq!(save_settings.0, StatusCode::SEE_OTHER);
@@ -224,13 +292,14 @@ async fn pg_store_full_integration() {
     assert_eq!(tz, "UTC+08:00", "timezone persisted to Postgres");
     assert_eq!(ws, "monday", "week_start persisted to Postgres");
     // Re-saving the same owner updates the single row (no duplicate).
-    let settings_count: i64 = sqlx::query("SELECT count(*) AS n FROM settings WHERE owner_sub = $1")
-        .bind("u_alice")
-        .fetch_one(&raw)
-        .await
-        .unwrap()
-        .try_get("n")
-        .unwrap();
+    let settings_count: i64 =
+        sqlx::query("SELECT count(*) AS n FROM settings WHERE owner_sub = $1")
+            .bind("u_alice")
+            .fetch_one(&raw)
+            .await
+            .unwrap()
+            .try_get("n")
+            .unwrap();
     assert_eq!(settings_count, 1, "one settings row per owner");
 
     // --- attendees + reminders + RSVP + due-scan through Postgres ----------
@@ -254,7 +323,11 @@ async fn pg_store_full_integration() {
     )
     .await;
     assert_eq!(ev.0, StatusCode::SEE_OTHER);
-    let (_s, _h, m9) = call(&state, get_as("/?y=2099&m=9", "u_alice", "alice@holdfast.local")).await;
+    let (_s, _h, m9) = call(
+        &state,
+        get_as("/?y=2099&m=9", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     let eid = find_between(&m9, "/edit/", "\"").expect("event id");
 
     let acount: i64 = sqlx::query("SELECT count(*) AS n FROM event_attendees WHERE event_id = $1")
@@ -275,8 +348,11 @@ async fn pg_store_full_integration() {
     assert_eq!(rcount, 1, "reminder persisted to Postgres");
 
     // The public RSVP token round-trips and updates the row.
-    let (_s, _h, detail) =
-        call(&state, get_as(&format!("/event/{eid}"), "u_alice", "alice@holdfast.local")).await;
+    let (_s, _h, detail) = call(
+        &state,
+        get_as(&format!("/event/{eid}"), "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     let token = find_between(&detail, "/rsvp/", "\"").expect("rsvp token");
     let rs = call(
         &state,
@@ -305,6 +381,7 @@ async fn pg_store_full_integration() {
         .upsert_event(StoreEvent {
             id: "pg-soon".into(),
             owner_sub: "u_alice".into(),
+            calendar_id: String::new(),
             title: "Soon".into(),
             starts_at: now + 5 * 60_000,
             ends_at: now + 65 * 60_000,
@@ -312,6 +389,9 @@ async fn pg_store_full_integration() {
             location: String::new(),
             notes: String::new(),
             rrule: String::new(),
+            series_id: String::new(),
+            override_occurrence_date: 0,
+            exception_dates: Vec::new(),
             created_at: now,
         })
         .await
@@ -333,17 +413,50 @@ async fn pg_store_full_integration() {
         .await
         .unwrap();
     let due = state.store.due_reminders(now, 50).await.unwrap();
-    assert!(due.iter().any(|d| d.reminder_id == "pg-rem"), "due reminder surfaces from Postgres JOIN");
-    state.store.mark_reminder_delivered("pg-rem", now).await.unwrap();
+    assert!(
+        due.iter().any(|d| d.reminder_id == "pg-rem"),
+        "due reminder surfaces from Postgres JOIN"
+    );
+    state
+        .store
+        .mark_reminder_delivered("pg-rem", now)
+        .await
+        .unwrap();
     let due2 = state.store.due_reminders(now, 50).await.unwrap();
-    assert!(!due2.iter().any(|d| d.reminder_id == "pg-rem"), "delivered reminder no longer due");
+    assert!(
+        !due2.iter().any(|d| d.reminder_id == "pg-rem"),
+        "delivered reminder no longer due"
+    );
 
     // Teardown.
-    sqlx::query("DELETE FROM event_attendees").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM event_reminders").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM events").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM contacts").execute(&raw).await.unwrap();
-    sqlx::query("DELETE FROM settings").execute(&raw).await.unwrap();
+    sqlx::query("DELETE FROM event_attendees")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_reminders")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_exceptions")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM events")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM calendars")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM contacts")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM settings")
+        .execute(&raw)
+        .await
+        .unwrap();
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + event create/edit upsert + created_at \
          preserved + owner isolation + CSRF enforced + delete + contacts + attendees/RSVP + \
@@ -359,7 +472,9 @@ async fn call(state: &AppState, req: Request<Body>) -> Resp {
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
@@ -410,7 +525,10 @@ fn pct(s: &str) -> String {
 }
 
 fn set_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers.get(header::SET_COOKIE).and_then(|v| v.to_str().ok()).map(str::to_string)
+    headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 fn cookie_value(set_cookie: &str) -> Option<String> {

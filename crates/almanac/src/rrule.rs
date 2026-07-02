@@ -21,6 +21,8 @@
 //!   in a given month/year — e.g. the 31st, or Feb 29 — is skipped, per RFC, and does not count).
 //! All timestamps are UTC epoch milliseconds, matching the rest of the crate (no DST/tz math here).
 
+use std::collections::HashSet;
+
 use time::{Date, Month, OffsetDateTime, Weekday};
 
 use crate::store::Event;
@@ -142,7 +144,13 @@ impl RRule {
     /// Expand the series into concrete `[start, end]` occurrence ranges (UTC epoch ms) that OVERLAP
     /// `[win_start, win_end]`. `dtstart`/`duration` come from the event. COUNT/UNTIL are honoured
     /// against the full series (from DTSTART), not just the window.
-    pub fn expand(&self, dtstart: i64, duration: i64, win_start: i64, win_end: i64) -> Vec<(i64, i64)> {
+    pub fn expand(
+        &self,
+        dtstart: i64,
+        duration: i64,
+        win_start: i64,
+        win_end: i64,
+    ) -> Vec<(i64, i64)> {
         let mut c = Collector {
             count: self.count,
             until: self.until,
@@ -175,7 +183,8 @@ impl RRule {
                 break;
             }
             // BYDAY on DAILY is a weekday filter; filtered-out days do not count toward COUNT.
-            if self.byday.is_empty() || self.byday.iter().any(|bd| bd.weekday == weekday_of(start)) {
+            if self.byday.is_empty() || self.byday.iter().any(|bd| bd.weekday == weekday_of(start))
+            {
                 if !c.push(start) {
                     break;
                 }
@@ -399,11 +408,24 @@ impl Collector {
 /// `id` is preserved, so edit/delete links target the whole series).
 pub fn expand_events(events: &[Event], win_start: i64, win_end: i64) -> Vec<Event> {
     let mut out: Vec<Event> = Vec::new();
+    let overrides: HashSet<(String, i64)> = events
+        .iter()
+        .filter(|e| !e.series_id.is_empty() && e.override_occurrence_date > 0)
+        .map(|e| (e.series_id.clone(), e.override_occurrence_date))
+        .collect();
     for e in events {
+        if !e.series_id.is_empty() {
+            out.push(e.clone());
+            continue;
+        }
         match RRule::parse(&e.rrule) {
             Some(rule) => {
                 let duration = (e.ends_at - e.starts_at).max(0);
+                let exceptions: HashSet<i64> = e.exception_dates.iter().copied().collect();
                 for (start, end) in rule.expand(e.starts_at, duration, win_start, win_end) {
+                    if exceptions.contains(&start) || overrides.contains(&(e.id.clone(), start)) {
+                        continue;
+                    }
                     let mut occ = e.clone();
                     occ.starts_at = start;
                     occ.ends_at = end;
@@ -547,7 +569,12 @@ fn byday_days(year: i32, month: u8, byday: &[ByDay]) -> Vec<u8> {
 
 /// Build an RRULE string from the compose UI's simple fields (empty when `freq` is `None`). Only
 /// non-default parts are emitted, so a plain weekly rule is just `FREQ=WEEKLY`.
-pub fn build_rrule(freq: Option<Freq>, interval: u32, count: Option<u32>, until_yyyymmdd: Option<&str>) -> String {
+pub fn build_rrule(
+    freq: Option<Freq>,
+    interval: u32,
+    count: Option<u32>,
+    until_yyyymmdd: Option<&str>,
+) -> String {
     let freq = match freq {
         Some(f) => f,
         None => return String::new(),
@@ -597,8 +624,14 @@ mod tests {
         assert_eq!(
             r.byday,
             vec![
-                ByDay { ord: None, weekday: Weekday::Monday },
-                ByDay { ord: None, weekday: Weekday::Wednesday },
+                ByDay {
+                    ord: None,
+                    weekday: Weekday::Monday
+                },
+                ByDay {
+                    ord: None,
+                    weekday: Weekday::Wednesday
+                },
             ]
         );
         assert!(r.until.is_none());
@@ -774,9 +807,18 @@ mod tests {
         assert_eq!(
             r.byday,
             vec![
-                ByDay { ord: Some(3), weekday: Weekday::Wednesday },
-                ByDay { ord: Some(-1), weekday: Weekday::Friday },
-                ByDay { ord: None, weekday: Weekday::Sunday },
+                ByDay {
+                    ord: Some(3),
+                    weekday: Weekday::Wednesday
+                },
+                ByDay {
+                    ord: Some(-1),
+                    weekday: Weekday::Friday
+                },
+                ByDay {
+                    ord: None,
+                    weekday: Weekday::Sunday
+                },
             ]
         );
         // Explicit '+' sign and a stray zero ordinal (invalid) degrade to a bare weekday.
@@ -784,8 +826,14 @@ mod tests {
         assert_eq!(
             r2.byday,
             vec![
-                ByDay { ord: Some(2), weekday: Weekday::Monday },
-                ByDay { ord: None, weekday: Weekday::Tuesday },
+                ByDay {
+                    ord: Some(2),
+                    weekday: Weekday::Monday
+                },
+                ByDay {
+                    ord: None,
+                    weekday: Weekday::Tuesday
+                },
             ]
         );
     }
@@ -893,6 +941,7 @@ mod tests {
         let base = Event {
             id: "series1".to_string(),
             owner_sub: "alice".to_string(),
+            calendar_id: String::new(),
             title: "Standup".to_string(),
             starts_at: ms("2026-06-01T09:00"),
             ends_at: ms("2026-06-01T09:15"),
@@ -900,6 +949,9 @@ mod tests {
             location: String::new(),
             notes: String::new(),
             rrule: "FREQ=DAILY;COUNT=3".to_string(),
+            series_id: String::new(),
+            override_occurrence_date: 0,
+            exception_dates: Vec::new(),
             created_at: 0,
         };
         let occ = expand_events(
@@ -908,7 +960,10 @@ mod tests {
             ms("2026-06-30T23:59"),
         );
         assert_eq!(occ.len(), 3);
-        assert!(occ.iter().all(|o| o.id == "series1"), "occurrences share the series id");
+        assert!(
+            occ.iter().all(|o| o.id == "series1"),
+            "occurrences share the series id"
+        );
         assert_eq!(occ[0].starts_at, ms("2026-06-01T09:00"));
         assert_eq!(occ[2].starts_at, ms("2026-06-03T09:00"));
         // Duration (15 min) preserved on every occurrence.
@@ -920,6 +975,7 @@ mod tests {
         let one_off = Event {
             id: "e1".to_string(),
             owner_sub: "alice".to_string(),
+            calendar_id: String::new(),
             title: "One-off".to_string(),
             starts_at: ms("2026-06-10T09:00"),
             ends_at: ms("2026-06-10T10:00"),
@@ -927,11 +983,72 @@ mod tests {
             location: String::new(),
             notes: String::new(),
             rrule: String::new(),
+            series_id: String::new(),
+            override_occurrence_date: 0,
+            exception_dates: Vec::new(),
             created_at: 0,
         };
         let out = expand_events(std::slice::from_ref(&one_off), 0, i64::MAX);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], one_off);
+    }
+
+    #[test]
+    fn expand_events_skips_exceptions_and_series_overrides() {
+        let mut base = Event {
+            id: "series1".to_string(),
+            owner_sub: "alice".to_string(),
+            calendar_id: "default".to_string(),
+            title: "Standup".to_string(),
+            starts_at: ms("2026-06-01T09:00"),
+            ends_at: ms("2026-06-01T09:15"),
+            all_day: false,
+            location: String::new(),
+            notes: String::new(),
+            rrule: "FREQ=DAILY;COUNT=3".to_string(),
+            series_id: String::new(),
+            override_occurrence_date: 0,
+            exception_dates: vec![ms("2026-06-02T09:00")],
+            created_at: 0,
+        };
+        let override_event = Event {
+            id: "override1".to_string(),
+            owner_sub: "alice".to_string(),
+            calendar_id: "default".to_string(),
+            title: "Moved standup".to_string(),
+            starts_at: ms("2026-06-03T12:00"),
+            ends_at: ms("2026-06-03T12:15"),
+            all_day: false,
+            location: String::new(),
+            notes: String::new(),
+            rrule: String::new(),
+            series_id: base.id.clone(),
+            override_occurrence_date: ms("2026-06-03T09:00"),
+            exception_dates: Vec::new(),
+            created_at: 0,
+        };
+        let out = expand_events(
+            &[base.clone(), override_event.clone()],
+            ms("2026-06-01T00:00"),
+            ms("2026-06-04T00:00"),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "series1");
+        assert_eq!(out[0].starts_at, ms("2026-06-01T09:00"));
+        assert_eq!(out[1].id, "override1");
+        assert_eq!(out[1].starts_at, ms("2026-06-03T12:00"));
+
+        base.exception_dates.clear();
+        let without_exception = expand_events(
+            &[base, override_event],
+            ms("2026-06-01T00:00"),
+            ms("2026-06-04T00:00"),
+        );
+        assert_eq!(
+            without_exception.len(),
+            3,
+            "only the overridden third occurrence is skipped"
+        );
     }
 
     #[test]

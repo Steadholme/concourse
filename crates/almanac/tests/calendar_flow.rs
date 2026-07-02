@@ -10,6 +10,8 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
+use almanac::calendar;
+use almanac::store::default_calendar_id;
 use almanac::{app, build_dev_state, AppState};
 
 #[tokio::test]
@@ -31,11 +33,15 @@ async fn full_event_lifecycle_scoped_to_owner() {
     assert!(body.contains("No upcoming events"));
 
     // Open the new-event form; capture the minted CSRF token (cookie == hidden field).
-    let (status, headers, body) = call(&state, get_as("/new", "u_alice", "alice@holdfast.local")).await;
+    let (status, headers, body) =
+        call(&state, get_as("/new", "u_alice", "alice@holdfast.local")).await;
     assert_eq!(status, StatusCode::OK);
     let cookie = set_cookie(&headers).expect("form sets a CSRF cookie");
     let csrf = cookie_value(&cookie).expect("csrf cookie value");
-    assert!(body.contains(&format!("value=\"{csrf}\"")), "hidden field matches cookie");
+    assert!(
+        body.contains(&format!("value=\"{csrf}\"")),
+        "hidden field matches cookie"
+    );
 
     // Create a far-future event so it is always "upcoming" in the agenda.
     let save = post_form(
@@ -53,10 +59,18 @@ async fn full_event_lifecycle_scoped_to_owner() {
         ],
     );
     let (status, _h, _b) = call(&state, save).await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "create redirects (POST->GET)");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "create redirects (POST->GET)"
+    );
 
     // The event's month shows it in the grid AND the agenda.
-    let (status, _h, month) = call(&state, get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local")).await;
+    let (status, _h, month) = call(
+        &state,
+        get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(month.contains("June 2099"));
     assert!(month.contains("Quarterly review"));
@@ -64,13 +78,32 @@ async fn full_event_lifecycle_scoped_to_owner() {
     let id = find_between(&month, "/edit/", "\"").expect("an event id link");
 
     // Bob sees none of alice's events and cannot open her event.
-    let (_s, _h, bob_view) = call(&state, get_as("/?y=2099&m=6", "u_bob", "bob@holdfast.local")).await;
-    assert!(!bob_view.contains("Quarterly review"), "events are owner-scoped");
-    let (status, _h, _b) = call(&state, get_as(&format!("/edit/{id}"), "u_bob", "bob@holdfast.local")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "bob cannot open alice's event");
+    let (_s, _h, bob_view) = call(
+        &state,
+        get_as("/?y=2099&m=6", "u_bob", "bob@holdfast.local"),
+    )
+    .await;
+    assert!(
+        !bob_view.contains("Quarterly review"),
+        "events are owner-scoped"
+    );
+    let (status, _h, _b) = call(
+        &state,
+        get_as(&format!("/edit/{id}"), "u_bob", "bob@holdfast.local"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "bob cannot open alice's event"
+    );
 
     // Alice edits the event (new CSRF from the edit form).
-    let (_s, h2, _b) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "alice@holdfast.local")).await;
+    let (_s, h2, _b) = call(
+        &state,
+        get_as(&format!("/edit/{id}"), "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     let cookie2 = set_cookie(&h2).unwrap();
     let csrf2 = cookie_value(&cookie2).unwrap();
     let save2 = post_form(
@@ -87,7 +120,11 @@ async fn full_event_lifecycle_scoped_to_owner() {
     );
     let (status, _h, _b) = call(&state, save2).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (_s, _h, month) = call(&state, get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local")).await;
+    let (_s, _h, month) = call(
+        &state,
+        get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert!(month.contains("Quarterly review (rescheduled)"));
 
     // Bob cannot delete alice's event (it survives); alice can.
@@ -100,8 +137,15 @@ async fn full_event_lifecycle_scoped_to_owner() {
     );
     let (status, _h, _b) = call(&state, bad_del).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "delete always redirects");
-    let (_s, _h, still) = call(&state, get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local")).await;
-    assert!(still.contains("Quarterly review"), "bob's delete affected nothing");
+    let (_s, _h, still) = call(
+        &state,
+        get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
+    assert!(
+        still.contains("Quarterly review"),
+        "bob's delete affected nothing"
+    );
 
     let del = post_form(
         &format!("/delete/{id}"),
@@ -112,7 +156,11 @@ async fn full_event_lifecycle_scoped_to_owner() {
     );
     let (status, _h, _b) = call(&state, del).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (_s, _h, gone) = call(&state, get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local")).await;
+    let (_s, _h, gone) = call(
+        &state,
+        get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert!(!gone.contains("Quarterly review"), "event deleted");
 }
 
@@ -139,8 +187,152 @@ async fn all_day_event_spans_the_day() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_s, _h, month) = call(&state, get_as("/?y=2099&m=3", "u_alice", "a@x.co")).await;
     assert!(month.contains("Conference"));
-    assert!(month.contains("cal-event--allday"), "rendered as an all-day chip");
+    assert!(
+        month.contains("cal-event--allday"),
+        "rendered as an all-day chip"
+    );
     assert!(month.contains("All day"), "agenda labels it all-day");
+}
+
+#[tokio::test]
+async fn multiple_calendars_filter_and_block_nonempty_delete() {
+    let state = build_dev_state();
+    let (_s, headers, body) = call(&state, get_as("/", "u_alice", "a@x.co")).await;
+    assert!(
+        body.contains("Default"),
+        "default calendar is created lazily"
+    );
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+
+    let create_cal = post_form(
+        "/calendars/new",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf),
+            ("name", "Work"),
+            ("color", "#22c55e"),
+        ],
+    );
+    assert_eq!(call(&state, create_cal).await.0, StatusCode::SEE_OTHER);
+    let (_s, headers, home) = call(&state, get_as("/", "u_alice", "a@x.co")).await;
+    assert!(home.contains("Work"));
+    let work_id = find_calendar_update_id_by_name(&home, "Work").expect("calendar update id");
+
+    let cookie2 = set_cookie(&headers).unwrap();
+    let csrf2 = cookie_value(&cookie2).unwrap();
+    let save = post_form(
+        "/new",
+        &cookie2,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf2),
+            ("calendar_id", &work_id),
+            ("title", "Work planning"),
+            ("starts_at", "2099-08-05T10:00"),
+            ("ends_at", "2099-08-05T11:00"),
+        ],
+    );
+    assert_eq!(call(&state, save).await.0, StatusCode::SEE_OTHER);
+    let (_s, _h, month) = call(&state, get_as("/?y=2099&m=8", "u_alice", "a@x.co")).await;
+    assert!(month.contains("Work planning"));
+    assert!(
+        month.contains("--cal-color:#22c55e"),
+        "event renders in calendar color"
+    );
+    let event_id = find_between(&month, "/edit/", "\"").expect("event id");
+
+    let default_id = default_calendar_id("u_alice");
+    let (_s, _h, default_only) = call(
+        &state,
+        get_as(
+            &format!("/?y=2099&m=8&cal={default_id}"),
+            "u_alice",
+            "a@x.co",
+        ),
+    )
+    .await;
+    assert!(
+        !default_only.contains("Work planning"),
+        "calendar filter hides other calendars"
+    );
+    let (_s, _h, work_only) = call(
+        &state,
+        get_as(&format!("/?y=2099&m=8&cal={work_id}"), "u_alice", "a@x.co"),
+    )
+    .await;
+    assert!(
+        work_only.contains("Work planning"),
+        "calendar filter shows selected calendar"
+    );
+
+    let blocked = post_form(
+        &format!("/calendars/delete/{work_id}"),
+        &cookie2,
+        "u_alice",
+        "a@x.co",
+        &[("csrf_token", &csrf2)],
+    );
+    assert_eq!(call(&state, blocked).await.0, StatusCode::SEE_OTHER);
+    let (_s, _h, still) = call(&state, get_as("/", "u_alice", "a@x.co")).await;
+    assert!(
+        still.contains("Work"),
+        "non-empty calendar delete is blocked"
+    );
+
+    let del_event = post_form(
+        &format!("/delete/{event_id}"),
+        &cookie2,
+        "u_alice",
+        "a@x.co",
+        &[("csrf_token", &csrf2)],
+    );
+    assert_eq!(call(&state, del_event).await.0, StatusCode::SEE_OTHER);
+    let del_cal = post_form(
+        &format!("/calendars/delete/{work_id}"),
+        &cookie2,
+        "u_alice",
+        "a@x.co",
+        &[("csrf_token", &csrf2)],
+    );
+    assert_eq!(call(&state, del_cal).await.0, StatusCode::SEE_OTHER);
+    let (_s, _h, gone) = call(&state, get_as("/", "u_alice", "a@x.co")).await;
+    assert!(
+        !gone.contains("Work"),
+        "empty non-default calendar can be deleted"
+    );
+}
+
+#[tokio::test]
+async fn agenda_view_groups_next_days() {
+    let state = build_dev_state();
+    let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "a@x.co")).await;
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+    let tomorrow = calendar::start_of_day(almanac::now_ms()) + 86_400_000;
+    let starts = calendar::fmt_datetime_local(tomorrow + 9 * 3_600_000);
+    let ends = calendar::fmt_datetime_local(tomorrow + 10 * 3_600_000);
+    let save = post_form(
+        "/new",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf),
+            ("title", "Agenda review"),
+            ("starts_at", &starts),
+            ("ends_at", &ends),
+        ],
+    );
+    assert_eq!(call(&state, save).await.0, StatusCode::SEE_OTHER);
+    let (status, _h, agenda) = call(&state, get_as("/?view=agenda", "u_alice", "a@x.co")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(agenda.contains("<h1>Agenda</h1>"));
+    assert!(agenda.contains("agenda__day"), "events are grouped by day");
+    assert!(agenda.contains("Agenda review"));
 }
 
 #[tokio::test]
@@ -172,14 +364,26 @@ async fn recurring_event_expands_in_month_and_agenda() {
     // June 2099: the four Wednesdays (3, 10, 17, 24) each render an occurrence chip.
     let (_s, _h, month) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
     let occurrences = month.matches("Weekly sync").count();
-    assert!(occurrences >= 4, "each weekly occurrence renders (got {occurrences})");
-    assert!(month.contains("↻"), "recurring occurrences carry a repeat marker");
+    assert!(
+        occurrences >= 4,
+        "each weekly occurrence renders (got {occurrences})"
+    );
+    assert!(
+        month.contains("↻"),
+        "recurring occurrences carry a repeat marker"
+    );
 
     // The edit form pre-fills the recurrence controls from the stored RRULE.
     let id = find_between(&month, "/edit/", "\"").expect("event id");
     let (_s, _h, edit) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
-    assert!(edit.contains("value=\"weekly\" selected"), "frequency pre-selected");
-    assert!(edit.contains("name=\"repeat_count\" min=\"1\" max=\"9999\" value=\"4\""), "count pre-filled");
+    assert!(
+        edit.contains("value=\"weekly\" selected"),
+        "frequency pre-selected"
+    );
+    assert!(
+        edit.contains("name=\"repeat_count\" min=\"1\" max=\"9999\" value=\"4\""),
+        "count pre-filled"
+    );
 
     // Editing the series (change the title) applies to every occurrence (v1 series semantics).
     let (_s, h2, _b) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
@@ -203,7 +407,10 @@ async fn recurring_event_expands_in_month_and_agenda() {
     let (status, _h, _b) = call(&state, save2).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_s, _h, month2) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
-    assert!(month2.matches("Weekly sync (renamed)").count() >= 4, "rename hits the whole series");
+    assert!(
+        month2.matches("Weekly sync (renamed)").count() >= 4,
+        "rename hits the whole series"
+    );
 
     // Deleting the series removes ALL occurrences.
     let del = post_form(
@@ -216,7 +423,101 @@ async fn recurring_event_expands_in_month_and_agenda() {
     let (status, _h, _b) = call(&state, del).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_s, _h, gone) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
-    assert!(!gone.contains("Weekly sync"), "deleting the series clears every occurrence");
+    assert!(
+        !gone.contains("Weekly sync"),
+        "deleting the series clears every occurrence"
+    );
+}
+
+#[tokio::test]
+async fn recurring_single_occurrence_delete_and_edit() {
+    let state = build_dev_state();
+    let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "a@x.co")).await;
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+
+    let save = post_form(
+        "/new",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf),
+            ("title", "Weekly sync"),
+            ("starts_at", "2099-06-03T09:00"),
+            ("ends_at", "2099-06-03T09:30"),
+            ("repeat", "weekly"),
+            ("repeat_interval", "1"),
+            ("repeat_count", "3"),
+        ],
+    );
+    assert_eq!(call(&state, save).await.0, StatusCode::SEE_OTHER);
+    let (_s, h2, month) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
+    assert!(month.matches("Weekly sync").count() >= 3);
+    let id = find_between(&month, "/edit/", "\"").expect("series id");
+    let cookie2 = set_cookie(&h2).unwrap();
+    let csrf2 = cookie_value(&cookie2).unwrap();
+
+    let occ2 = calendar::parse_datetime_local("2099-06-10T09:00").unwrap();
+    let del_one = post_form(
+        &format!("/delete/{id}?occurrence={occ2}"),
+        &cookie2,
+        "u_alice",
+        "a@x.co",
+        &[("csrf_token", &csrf2)],
+    );
+    assert_eq!(call(&state, del_one).await.0, StatusCode::SEE_OTHER);
+    let (_s, _h, after_delete) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
+    assert!(
+        after_delete.matches("Weekly sync").count() >= 2,
+        "the other occurrences remain"
+    );
+
+    let occ3 = calendar::parse_datetime_local("2099-06-17T09:00").unwrap();
+    let (_s, h3, edit_occ) = call(
+        &state,
+        get_as(
+            &format!("/edit/{id}?occurrence={occ3}"),
+            "u_alice",
+            "a@x.co",
+        ),
+    )
+    .await;
+    assert!(
+        edit_occ.contains("Edit series"),
+        "occurrence form links back to whole-series edit"
+    );
+    let cookie3 = set_cookie(&h3).unwrap();
+    let csrf3 = cookie_value(&cookie3).unwrap();
+    let save_occ = post_form(
+        &format!("/edit/{id}?occurrence={occ3}"),
+        &cookie3,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf3),
+            ("title", "Special sync"),
+            ("starts_at", "2099-06-18T12:00"),
+            ("ends_at", "2099-06-18T12:30"),
+        ],
+    );
+    assert_eq!(call(&state, save_occ).await.0, StatusCode::SEE_OTHER);
+    let (_s, _h, after_edit) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
+    assert!(
+        after_edit.contains("Special sync"),
+        "override occurrence renders"
+    );
+    assert!(
+        after_edit.contains("Weekly sync"),
+        "whole series remains editable"
+    );
+
+    let (_s, _h, series_edit) =
+        call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
+    assert!(
+        series_edit.contains("value=\"weekly\" selected"),
+        "whole-series edit still works"
+    );
 }
 
 #[tokio::test]
@@ -224,7 +525,11 @@ async fn contacts_crud_scoped_to_owner() {
     let state = build_dev_state();
 
     // Empty address book.
-    let (status, headers, body) = call(&state, get_as("/contacts", "u_alice", "alice@holdfast.local")).await;
+    let (status, headers, body) = call(
+        &state,
+        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("No contacts yet"));
     let cookie = set_cookie(&headers).unwrap();
@@ -247,7 +552,11 @@ async fn contacts_crud_scoped_to_owner() {
     let (status, _h, _b) = call(&state, add).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
-    let (_s, _h, list) = call(&state, get_as("/contacts", "u_alice", "alice@holdfast.local")).await;
+    let (_s, _h, list) = call(
+        &state,
+        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert!(list.contains("Grace Hopper"));
     assert!(list.contains("grace@navy.mil"));
     assert!(list.contains("1 contact"));
@@ -256,11 +565,27 @@ async fn contacts_crud_scoped_to_owner() {
     // Bob's address book is empty + he can't open alice's contact.
     let (_s, _h, bob) = call(&state, get_as("/contacts", "u_bob", "bob@holdfast.local")).await;
     assert!(!bob.contains("Grace Hopper"));
-    let (status, _h, _b) = call(&state, get_as(&format!("/contacts/edit/{id}"), "u_bob", "bob@holdfast.local")).await;
+    let (status, _h, _b) = call(
+        &state,
+        get_as(
+            &format!("/contacts/edit/{id}"),
+            "u_bob",
+            "bob@holdfast.local",
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Edit then delete.
-    let (_s, h2, _b) = call(&state, get_as(&format!("/contacts/edit/{id}"), "u_alice", "alice@holdfast.local")).await;
+    let (_s, h2, _b) = call(
+        &state,
+        get_as(
+            &format!("/contacts/edit/{id}"),
+            "u_alice",
+            "alice@holdfast.local",
+        ),
+    )
+    .await;
     let cookie2 = set_cookie(&h2).unwrap();
     let csrf2 = cookie_value(&cookie2).unwrap();
     let upd = post_form(
@@ -268,11 +593,19 @@ async fn contacts_crud_scoped_to_owner() {
         &cookie2,
         "u_alice",
         "alice@holdfast.local",
-        &[("csrf_token", &csrf2), ("name", "Rear Admiral Grace Hopper"), ("email", "grace@navy.mil")],
+        &[
+            ("csrf_token", &csrf2),
+            ("name", "Rear Admiral Grace Hopper"),
+            ("email", "grace@navy.mil"),
+        ],
     );
     let (status, _h, _b) = call(&state, upd).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (_s, _h, list) = call(&state, get_as("/contacts", "u_alice", "alice@holdfast.local")).await;
+    let (_s, _h, list) = call(
+        &state,
+        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert!(list.contains("Rear Admiral Grace Hopper"));
 
     let del = post_form(
@@ -284,7 +617,11 @@ async fn contacts_crud_scoped_to_owner() {
     );
     let (status, _h, _b) = call(&state, del).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (_s, _h, list) = call(&state, get_as("/contacts", "u_alice", "alice@holdfast.local")).await;
+    let (_s, _h, list) = call(
+        &state,
+        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert!(list.contains("No contacts yet"), "contact deleted");
 }
 
@@ -307,7 +644,11 @@ async fn csrf_required_on_post() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(body.contains("CSRF"));
     // Nothing was written.
-    let (_s, _h, idx) = call(&state, get_as("/?y=2099&m=1", "u_alice", "alice@holdfast.local")).await;
+    let (_s, _h, idx) = call(
+        &state,
+        get_as("/?y=2099&m=1", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
     assert!(idx.contains("No upcoming events"));
 }
 
@@ -332,7 +673,10 @@ async fn stored_text_is_escaped() {
     let (status, _h, _b) = call(&state, save).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_s, _h, month) = call(&state, get_as("/?y=2099&m=5", "u_alice", "a@x.co")).await;
-    assert!(!month.contains("<script>alert(1)</script>"), "title must be escaped");
+    assert!(
+        !month.contains("<script>alert(1)</script>"),
+        "title must be escaped"
+    );
     assert!(month.contains("&lt;script&gt;"));
 }
 
@@ -344,8 +688,14 @@ async fn settings_timezone_shifts_rendering_and_persists() {
     let (status, headers, body) = call(&state, get_as("/settings", "u_alice", "a@x.co")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Settings"));
-    assert!(body.contains("value=\"UTC\" selected"), "UTC is the default timezone");
-    assert!(body.contains("value=\"sunday\" selected"), "Sunday-first is the default");
+    assert!(
+        body.contains("value=\"UTC\" selected"),
+        "UTC is the default timezone"
+    );
+    assert!(
+        body.contains("value=\"sunday\" selected"),
+        "Sunday-first is the default"
+    );
     let cookie = set_cookie(&headers).unwrap();
     let csrf = cookie_value(&cookie).unwrap();
 
@@ -355,7 +705,11 @@ async fn settings_timezone_shifts_rendering_and_persists() {
         "",
         "u_alice",
         "a@x.co",
-        &[("csrf_token", "x"), ("timezone", "UTC+08:00"), ("week_start", "monday")],
+        &[
+            ("csrf_token", "x"),
+            ("timezone", "UTC+08:00"),
+            ("week_start", "monday"),
+        ],
     );
     let (status, _h, _b) = call(&state, forged).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -366,7 +720,11 @@ async fn settings_timezone_shifts_rendering_and_persists() {
         &cookie,
         "u_alice",
         "a@x.co",
-        &[("csrf_token", &csrf), ("timezone", "UTC+08:00"), ("week_start", "monday")],
+        &[
+            ("csrf_token", &csrf),
+            ("timezone", "UTC+08:00"),
+            ("week_start", "monday"),
+        ],
     );
     let (status, _h, _b) = call(&state, save).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
@@ -397,8 +755,14 @@ async fn settings_timezone_shifts_rendering_and_persists() {
 
     let (_s, _h, month) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
     assert!(month.contains("Tokyo sync"));
-    assert!(month.contains("10:00 Tokyo sync"), "chip time shown in the owner's timezone");
-    assert!(month.contains("times shown in UTC+08:00"), "footer names the timezone");
+    assert!(
+        month.contains("10:00 Tokyo sync"),
+        "chip time shown in the owner's timezone"
+    );
+    assert!(
+        month.contains("times shown in UTC+08:00"),
+        "footer names the timezone"
+    );
     // Monday-first grid puts Monday in the first column.
     let mon_idx = month.find(">Mon<").unwrap();
     let sun_idx = month.find(">Sun<").unwrap();
@@ -407,7 +771,10 @@ async fn settings_timezone_shifts_rendering_and_persists() {
     // The edit form pre-fills the LOCAL wall-clock value.
     let id = find_between(&month, "/edit/", "\"").expect("event id");
     let (_s, _h, edit) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
-    assert!(edit.contains("value=\"2099-06-15T10:00\""), "edit shows local start time");
+    assert!(
+        edit.contains("value=\"2099-06-15T10:00\""),
+        "edit shows local start time"
+    );
 
     // Bob (still on UTC defaults) sees the same instant as 02:00, Sunday-first.
     let (_s, _h, bob) = call(&state, get_as("/?y=2099&m=6", "u_bob", "b@x.co")).await;
@@ -457,34 +824,67 @@ async fn week_and_day_views_render_events_on_the_time_grid() {
 
     // Week view anchored inside that week: the time-grid shows the one-off AND every daily
     // occurrence, plus the hour gutter and the Month/Week/Day switch.
-    let (status, _h, week) =
-        call(&state, get_as("/?view=week&date=2099-06-17", "u_alice", "a@x.co")).await;
+    let (status, _h, week) = call(
+        &state,
+        get_as("/?view=week&date=2099-06-17", "u_alice", "a@x.co"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(week.contains("tgrid__body"), "renders the time-grid");
     assert!(week.contains("09:00"), "hour gutter present");
     assert!(week.contains("tgrid__event"), "timed events are placed");
     assert!(week.contains("Design review"));
     // Mon–Fri daily standup => 5 occurrences visible in the week.
-    assert!(week.matches("Standup").count() >= 5, "recurring series expands in the week grid");
-    assert!(week.contains("href=\"/?view=day&amp;date=2099-06-15\""), "day headers link to the day view");
+    assert!(
+        week.matches("Standup").count() >= 5,
+        "recurring series expands in the week grid"
+    );
+    assert!(
+        week.contains("href=\"/?view=day&amp;date=2099-06-15\""),
+        "day headers link to the day view"
+    );
     // Sunday-first week containing Jun 17 runs Jun 14 (Sun)..Jun 20 (Sat); nav steps a whole week.
-    assert!(week.contains("href=\"/?view=week&amp;date=2099-06-07\""), "prev week");
-    assert!(week.contains("href=\"/?view=week&amp;date=2099-06-21\""), "next week");
+    assert!(
+        week.contains("href=\"/?view=week&amp;date=2099-06-07\""),
+        "prev week"
+    );
+    assert!(
+        week.contains("href=\"/?view=week&amp;date=2099-06-21\""),
+        "next week"
+    );
 
     // Day view for Mon Jun 15: the one-off + that day's standup occurrence, stepping day-by-day.
-    let (status, _h, day) =
-        call(&state, get_as("/?view=day&date=2099-06-15", "u_alice", "a@x.co")).await;
+    let (status, _h, day) = call(
+        &state,
+        get_as("/?view=day&date=2099-06-15", "u_alice", "a@x.co"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(day.contains("Jun 15, 2099"));
     assert!(day.contains("Design review"));
-    assert!(day.contains("Standup"), "the day's recurring occurrence shows");
-    assert!(day.contains("href=\"/?view=day&amp;date=2099-06-14\""), "prev day");
-    assert!(day.contains("href=\"/?view=day&amp;date=2099-06-16\""), "next day");
+    assert!(
+        day.contains("Standup"),
+        "the day's recurring occurrence shows"
+    );
+    assert!(
+        day.contains("href=\"/?view=day&amp;date=2099-06-14\""),
+        "prev day"
+    );
+    assert!(
+        day.contains("href=\"/?view=day&amp;date=2099-06-16\""),
+        "next day"
+    );
 
     // Sat Jun 20 is outside the 5-occurrence (Mon–Fri) run and holds no one-off => empty grid.
-    let (_s, _h, sat) =
-        call(&state, get_as("/?view=day&date=2099-06-20", "u_alice", "a@x.co")).await;
-    assert!(!sat.contains("Standup"), "day view is scoped to its own day");
+    let (_s, _h, sat) = call(
+        &state,
+        get_as("/?view=day&date=2099-06-20", "u_alice", "a@x.co"),
+    )
+    .await;
+    assert!(
+        !sat.contains("Standup"),
+        "day view is scoped to its own day"
+    );
     assert!(!sat.contains("Design review"));
 }
 
@@ -507,9 +907,15 @@ async fn week_view_escapes_event_titles() {
         ],
     );
     assert_eq!(call(&state, save).await.0, StatusCode::SEE_OTHER);
-    let (_s, _h, week) =
-        call(&state, get_as("/?view=week&date=2099-07-06", "u_alice", "a@x.co")).await;
-    assert!(!week.contains("<script>alert(2)</script>"), "title must be escaped in the grid");
+    let (_s, _h, week) = call(
+        &state,
+        get_as("/?view=week&date=2099-07-06", "u_alice", "a@x.co"),
+    )
+    .await;
+    assert!(
+        !week.contains("<script>alert(2)</script>"),
+        "title must be escaped in the grid"
+    );
     assert!(week.contains("&lt;script&gt;"));
 }
 
@@ -527,7 +933,9 @@ async fn call(state: &AppState, req: Request<Body>) -> (StatusCode, axum::http::
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
@@ -603,5 +1011,16 @@ fn find_between(s: &str, start: &str, end: &str) -> Option<String> {
     let i = s.find(start)? + start.len();
     let rest = &s[i..];
     let j = rest.find(end)?;
+    Some(rest[..j].to_string())
+}
+
+fn find_calendar_update_id_by_name(s: &str, name: &str) -> Option<String> {
+    let marker = format!("value=\"{name}\"");
+    let pos = s.find(&marker)?;
+    let before = &s[..pos];
+    let start_token = "/calendars/update/";
+    let i = before.rfind(start_token)? + start_token.len();
+    let rest = &before[i..];
+    let j = rest.find('"')?;
     Some(rest[..j].to_string())
 }

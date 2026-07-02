@@ -69,6 +69,15 @@ pub fn app(state: AppState) -> Router {
         .route("/delete/{id}", post(handlers::events::delete))
         // Natural-language quick-add ("Lunch tomorrow 12pm"); unparseable falls back to the editor.
         .route("/quick-add", post(handlers::events::quick_add))
+        .route("/calendars/new", post(handlers::events::create_calendar))
+        .route(
+            "/calendars/update/{id}",
+            post(handlers::events::update_calendar),
+        )
+        .route(
+            "/calendars/delete/{id}",
+            post(handlers::events::delete_calendar),
+        )
         // Per-event detail: attendees + their RSVP status + reminders + the .ics download.
         .route("/event/{id}", get(handlers::detail::show))
         // Read-only iCalendar: the whole subscription feed + a single-event download.
@@ -147,7 +156,11 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
             Arc::new(pg)
         }
         "memory" => Arc::new(InMemoryStore::new()),
-        other => return Err(format!("unknown ALMANAC_STORE={other} (use memory|postgres)")),
+        other => {
+            return Err(format!(
+                "unknown ALMANAC_STORE={other} (use memory|postgres)"
+            ))
+        }
     };
 
     // Reminder delivery hook (standalone only): when Klaxon's ingest is configured, spawn the

@@ -29,7 +29,10 @@ pub fn appnav(page_title: &str) -> String {
     let contacts_ic = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
     let set_ic = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="2" y1="14" x2="6" y2="14"/><line x1="10" y1="8" x2="14" y2="8"/><line x1="18" y1="16" x2="22" y2="16"/></svg>"#;
     let on = |b: bool| if b { " is-active" } else { "" };
-    let cal = matches!(page_title, "Calendar" | "Week" | "Day" | "New event" | "Edit event");
+    let cal = matches!(
+        page_title,
+        "Calendar" | "Week" | "Day" | "Agenda" | "New event" | "Edit event"
+    );
     let contacts = matches!(page_title, "Contacts" | "Edit contact");
     let settings = page_title == "Settings";
     format!(

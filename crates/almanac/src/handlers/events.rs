@@ -10,7 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Form;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::auth;
 use crate::calendar::{self, DayCell, GridDay, MonthView, TimeGridView};
@@ -19,7 +19,10 @@ use crate::error::AppError;
 use crate::handlers::html_with_csrf_cookie;
 use crate::render::{self, esc, layout};
 use crate::rrule::{self, Freq};
-use crate::store::{Attendee, Event, Reminder};
+use crate::store::{
+    default_calendar_id, Attendee, Calendar, Event, EventException, Reminder,
+    DEFAULT_CALENDAR_COLOR,
+};
 use crate::{now_ms, quickadd, AppState};
 
 /// Reminder presets offered as checkboxes: `(form field suffix, minutes_before, label)`.
@@ -35,6 +38,9 @@ const REMINDER_PRESETS: &[(&str, i64, &str)] = &[
 ];
 /// Hard cap on attendees parsed from one submission.
 const MAX_ATTENDEES: usize = 100;
+const AGENDA_DEFAULT_DAYS: i64 = 30;
+const AGENDA_MAX_DAYS: i64 = 366;
+const DAY_MS: i64 = 86_400_000;
 
 /// Pixel height of one hour row in the week/day time-grid (matches the `.tgrid` CSS).
 const HOUR_PX: f64 = 48.0;
@@ -53,6 +59,30 @@ pub struct IndexQuery {
     pub y: Option<i32>,
     #[serde(default)]
     pub m: Option<u8>,
+    /// Repeated `?cal=id` filters visible calendars. Empty means all calendars.
+    #[serde(default, deserialize_with = "deserialize_cal_filter")]
+    pub cal: Vec<String>,
+    /// Agenda/list horizon in days (`?view=agenda&days=N`), clamped to a bounded range.
+    #[serde(default)]
+    pub days: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CalFilter {
+    One(String),
+    Many(Vec<String>),
+}
+
+fn deserialize_cal_filter<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<CalFilter>::deserialize(deserializer)? {
+        Some(CalFilter::One(one)) => vec![one],
+        Some(CalFilter::Many(many)) => many,
+        None => Vec::new(),
+    })
 }
 
 /// Which calendar view the index renders.
@@ -61,6 +91,7 @@ enum ViewKind {
     Month,
     Week,
     Day,
+    Agenda,
 }
 
 impl ViewKind {
@@ -69,6 +100,7 @@ impl ViewKind {
         match v.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
             Some("week") => ViewKind::Week,
             Some("day") => ViewKind::Day,
+            Some("agenda") => ViewKind::Agenda,
             _ => ViewKind::Month,
         }
     }
@@ -79,8 +111,15 @@ impl ViewKind {
             ViewKind::Month => "month",
             ViewKind::Week => "week",
             ViewKind::Day => "day",
+            ViewKind::Agenda => "agenda",
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OccurrenceQuery {
+    #[serde(default)]
+    pub occurrence: Option<i64>,
 }
 
 /// `GET /new?date=YYYY-MM-DD` — the day the operator clicked to add an event.
@@ -97,6 +136,8 @@ pub struct EventForm {
     pub csrf_token: String,
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub calendar_id: String,
     /// `datetime-local` value (`YYYY-MM-DDTHH:MM`).
     #[serde(default)]
     pub starts_at: String,
@@ -144,6 +185,16 @@ pub struct EventForm {
     pub rem_1440: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CalendarForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub color: String,
+}
+
 /// A bare CSRF-only body, used by the delete forms.
 #[derive(Debug, Deserialize)]
 pub struct DeleteForm {
@@ -174,6 +225,8 @@ pub async fn index(
     let off = calendar::tz_offset_minutes(&settings.timezone);
     let monday_first = settings.week_start.eq_ignore_ascii_case("monday");
     let now = now_ms();
+    let calendars = state.store.list_calendars(&owner).await?;
+    let selected_calendars = selected_calendar_ids(&calendars, &q.cal);
     let stored = state.store.list_events(&owner).await?;
     let csrf = auth::new_csrf_token();
     let kind = ViewKind::parse(q.view.as_deref());
@@ -192,8 +245,18 @@ pub async fn index(
             let (grid_start, grid_end) = grid_bounds(&view);
             let win_start = grid_start.min(now);
             let win_end = grid_end.max(now + AGENDA_HORIZON_MS);
-            let events = rrule::expand_events(&stored, win_start, win_end);
-            render_calendar(&view, &events, now, &csrf, off, monday_first, &settings.timezone)
+            let expanded = rrule::expand_events(&stored, win_start, win_end);
+            let events = filter_events_by_calendar(expanded, &selected_calendars);
+            render_calendar(
+                &view,
+                &events,
+                &calendars,
+                now,
+                &csrf,
+                off,
+                monday_first,
+                &settings.timezone,
+            )
         }
         ViewKind::Week | ViewKind::Day => {
             // Anchor on `?date=` (owner-local), else today.
@@ -207,20 +270,49 @@ pub async fn index(
                 _ => calendar::build_day_at(anchor, now, off),
             };
             // Expand only across the grid's own span — the same reused event fetch + RRULE expander.
-            let events = rrule::expand_events(&stored, grid.win_start, grid.win_end);
-            render_time_grid(&grid, &events, now, off, kind, &settings.timezone)
+            let expanded = rrule::expand_events(&stored, grid.win_start, grid.win_end);
+            let events = filter_events_by_calendar(expanded, &selected_calendars);
+            render_time_grid(
+                &grid,
+                &events,
+                &calendars,
+                now,
+                off,
+                kind,
+                &settings.timezone,
+            )
+        }
+        ViewKind::Agenda => {
+            let days = q
+                .days
+                .unwrap_or(AGENDA_DEFAULT_DAYS)
+                .clamp(1, AGENDA_MAX_DAYS);
+            let win_end = now + days * DAY_MS;
+            let expanded = rrule::expand_events(&stored, now, win_end);
+            let events = filter_events_by_calendar(expanded, &selected_calendars);
+            render_agenda_view(
+                &events,
+                &calendars,
+                now,
+                &csrf,
+                off,
+                &settings.timezone,
+                days,
+            )
         }
     };
 
     let content = format!(
-        "{}{}{}",
+        "{}<div class=\"cal-layout\">{}<div class=\"cal-main\">{}{}</div></div>",
         render::subnav("calendar"),
+        render_calendar_sidebar(&calendars, &selected_calendars, &q, kind, &csrf),
         render_quick_add(&csrf),
-        inner
+        inner,
     );
     let title = match kind {
         ViewKind::Week => "Week",
         ViewKind::Day => "Day",
+        ViewKind::Agenda => "Agenda",
         ViewKind::Month => "Calendar",
     };
     let html = layout(title, &headers, &content);
@@ -242,7 +334,7 @@ fn render_quick_add(csrf: &str) -> String {
     )
 }
 
-/// The Month / Week / Day switch pills, threading `anchor` (an owner-local `YYYY-MM-DD`) so
+/// The Month / Week / Day / Agenda switch pills, threading `anchor` (an owner-local `YYYY-MM-DD`) so
 /// switching views keeps the reader on the same date. `active` is the currently-rendered view.
 fn view_switch(active: ViewKind, anchor: &str) -> String {
     let pill = |kind: ViewKind, label: &str, href: &str| {
@@ -254,11 +346,166 @@ fn view_switch(active: ViewKind, anchor: &str) -> String {
         format!("<a class=\"{cls}\" href=\"{}\">{label}</a>", esc(href))
     };
     format!(
-        "<span class=\"cal-viewswitch\">{}{}{}</span>",
+        "<span class=\"cal-viewswitch\">{}{}{}{}</span>",
         pill(ViewKind::Month, "Month", "/"),
-        pill(ViewKind::Week, "Week", &format!("/?view=week&date={anchor}")),
+        pill(
+            ViewKind::Week,
+            "Week",
+            &format!("/?view=week&date={anchor}")
+        ),
         pill(ViewKind::Day, "Day", &format!("/?view=day&date={anchor}")),
+        pill(ViewKind::Agenda, "Agenda", "/?view=agenda"),
     )
+}
+
+fn selected_calendar_ids(calendars: &[Calendar], requested: &[String]) -> Vec<String> {
+    let valid: Vec<String> = if requested.is_empty() {
+        calendars.iter().map(|c| c.id.clone()).collect()
+    } else {
+        requested
+            .iter()
+            .filter(|id| calendars.iter().any(|c| c.id == **id))
+            .cloned()
+            .collect()
+    };
+    if valid.is_empty() {
+        calendars.iter().map(|c| c.id.clone()).collect()
+    } else {
+        valid
+    }
+}
+
+fn filter_events_by_calendar(events: Vec<Event>, selected: &[String]) -> Vec<Event> {
+    events
+        .into_iter()
+        .filter(|e| selected.iter().any(|id| id == &e.calendar_id))
+        .collect()
+}
+
+fn render_calendar_sidebar(
+    calendars: &[Calendar],
+    selected: &[String],
+    q: &IndexQuery,
+    kind: ViewKind,
+    csrf: &str,
+) -> String {
+    let hidden = calendar_filter_hidden(q, kind);
+    let filter_rows: String = calendars
+        .iter()
+        .map(|c| {
+            let checked = if selected.iter().any(|id| id == &c.id) {
+                " checked"
+            } else {
+                ""
+            };
+            let swatch = calendar_swatch(&c.color);
+            let default_note = if c.id == default_calendar_id(&c.owner_sub) {
+                "<span class=\"calendar-panel__meta\">Default</span>"
+            } else {
+                ""
+            };
+            format!(
+                "<label class=\"calendar-panel__toggle\">\
+                   <input type=\"checkbox\" name=\"cal\" value=\"{id}\"{checked}>\
+                   <span class=\"calendar-swatch\" style=\"--cal-color:{color}\"></span>\
+                   <span>{name}</span>{default_note}\
+                 </label>",
+                id = esc(&c.id),
+                checked = checked,
+                color = swatch,
+                name = esc(&c.name),
+                default_note = default_note,
+            )
+        })
+        .collect();
+    let manage_rows: String = calendars
+        .iter()
+        .map(|c| {
+            let swatch = calendar_swatch(&c.color);
+            let delete = if c.id == default_calendar_id(&c.owner_sub) {
+                String::new()
+            } else {
+                format!(
+                    "<form method=\"post\" action=\"/calendars/delete/{id}\" class=\"calendar-panel__delete\">\
+                       <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                       <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Delete</button>\
+                     </form>",
+                    id = esc(&c.id),
+                    csrf = esc(csrf),
+                )
+            };
+            format!(
+                "<div class=\"calendar-panel__row\">\
+                   <form method=\"post\" action=\"/calendars/update/{id}\" class=\"calendar-panel__edit\">\
+                     <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                     <input class=\"calendar-panel__name\" type=\"text\" name=\"name\" value=\"{name}\" maxlength=\"80\" aria-label=\"Calendar name\">\
+                     <input class=\"calendar-panel__color\" type=\"color\" name=\"color\" value=\"{color}\" aria-label=\"Calendar color\">\
+                     <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Save</button>\
+                   </form>\
+                   {delete}\
+                 </div>",
+                id = esc(&c.id),
+                color = swatch,
+                name = esc(&c.name),
+                csrf = esc(csrf),
+                delete = delete,
+            )
+        })
+        .collect();
+    format!(
+        "<aside class=\"card calendar-panel\">\
+           <div class=\"calendar-panel__head\"><h2>Calendars</h2></div>\
+           <form method=\"get\" action=\"/\" class=\"calendar-panel__filter\">{hidden}{filter_rows}\
+             <button class=\"btn btn-primary btn-sm\" type=\"submit\">Apply</button>\
+           </form>\
+           <div class=\"calendar-panel__manage\">{manage_rows}</div>\
+           <form method=\"post\" action=\"/calendars/new\" class=\"calendar-panel__new\">\
+             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+             <input type=\"text\" name=\"name\" maxlength=\"80\" placeholder=\"New calendar\" aria-label=\"New calendar name\">\
+             <input type=\"color\" name=\"color\" value=\"{default_color}\" aria-label=\"New calendar color\">\
+             <button class=\"btn btn-secondary btn-sm\" type=\"submit\">Create</button>\
+           </form>\
+        </aside>",
+        hidden = hidden,
+        filter_rows = filter_rows,
+        manage_rows = manage_rows,
+        csrf = esc(csrf),
+        default_color = DEFAULT_CALENDAR_COLOR,
+    )
+}
+
+fn calendar_filter_hidden(q: &IndexQuery, kind: ViewKind) -> String {
+    let mut out = String::new();
+    if kind != ViewKind::Month {
+        out.push_str(&format!(
+            "<input type=\"hidden\" name=\"view\" value=\"{}\">",
+            kind.key()
+        ));
+    }
+    if matches!(kind, ViewKind::Week | ViewKind::Day) {
+        if let Some(date) = q.date.as_deref() {
+            out.push_str(&format!(
+                "<input type=\"hidden\" name=\"date\" value=\"{}\">",
+                esc(date)
+            ));
+        }
+    }
+    if kind == ViewKind::Month {
+        if let Some(y) = q.y {
+            out.push_str(&format!("<input type=\"hidden\" name=\"y\" value=\"{y}\">"));
+        }
+        if let Some(m) = q.m {
+            out.push_str(&format!("<input type=\"hidden\" name=\"m\" value=\"{m}\">"));
+        }
+    }
+    if kind == ViewKind::Agenda {
+        if let Some(days) = q.days {
+            out.push_str(&format!(
+                "<input type=\"hidden\" name=\"days\" value=\"{days}\">"
+            ));
+        }
+    }
+    out
 }
 
 /// A week/day time-grid: a header + nav, an all-day strip, and an hour grid with events placed by
@@ -266,6 +513,7 @@ fn view_switch(active: ViewKind, anchor: &str) -> String {
 fn render_time_grid(
     g: &TimeGridView,
     events: &[Event],
+    calendars: &[Calendar],
     now: i64,
     off: i32,
     kind: ViewKind,
@@ -312,7 +560,11 @@ fn render_time_grid(
                <span class=\"tgrid__dow\">{dow}</span>\
                <span class=\"tgrid__dnum\">{mon} {day}</span>\
              </a>",
-            today = if d.is_today { " tgrid__dayhead--today" } else { "" },
+            today = if d.is_today {
+                " tgrid__dayhead--today"
+            } else {
+                ""
+            },
             href = day_href,
             dow = d.weekday,
             mon = d.month_abbr,
@@ -320,7 +572,7 @@ fn render_time_grid(
         ));
         alldays.push_str(&format!(
             "<div class=\"tgrid__allday-cell\">{}</div>",
-            render_allday_chips(d, events, off)
+            render_allday_chips(d, events, calendars, off)
         ));
     }
 
@@ -337,7 +589,7 @@ fn render_time_grid(
             "<div class=\"tgrid__col{today}\">{now_line}{events}</div>",
             today = if d.is_today { " tgrid__col--today" } else { "" },
             now_line = render_now_line(d, now),
-            events = render_day_column(d, events, off),
+            events = render_day_column(d, events, calendars, off),
         ));
     }
 
@@ -364,7 +616,7 @@ fn render_time_grid(
 }
 
 /// The all-day chips overlapping one day column.
-fn render_allday_chips(d: &GridDay, events: &[Event], off: i32) -> String {
+fn render_allday_chips(d: &GridDay, events: &[Event], calendars: &[Calendar], off: i32) -> String {
     events
         .iter()
         .filter(|e| e.all_day && e.starts_at <= d.end_ms && e.ends_at >= d.start_ms)
@@ -375,9 +627,10 @@ fn render_allday_chips(d: &GridDay, events: &[Event], off: i32) -> String {
                 e.title
             ));
             format!(
-                "<a class=\"tgrid__allday-event\" href=\"/edit/{id}\" title=\"{tip}\">{title}{recur}</a>",
+                "<a class=\"tgrid__allday-event\" href=\"/edit/{id}\" title=\"{tip}\"{style}>{title}{recur}</a>",
                 id = esc(&e.id),
                 tip = tooltip,
+                style = event_style(e, calendars),
                 title = esc(&e.title),
                 recur = recur_mark(e),
             )
@@ -403,7 +656,7 @@ fn render_now_line(d: &GridDay, now: i64) -> String {
 /// Place a day column's timed events on the hour grid. Events are absolutely positioned by their
 /// minute-of-day (clamped to the visible day) and packed into side-by-side lanes so overlapping
 /// events never hide one another. `events` is pre-sorted by `starts_at` (see `expand_events`).
-fn render_day_column(d: &GridDay, events: &[Event], off: i32) -> String {
+fn render_day_column(d: &GridDay, events: &[Event], calendars: &[Calendar], off: i32) -> String {
     let timed: Vec<&Event> = events
         .iter()
         .filter(|e| !e.all_day && e.starts_at <= d.end_ms && e.ends_at >= d.start_ms)
@@ -462,7 +715,7 @@ fn render_day_column(d: &GridDay, events: &[Event], off: i32) -> String {
             ));
             out.push_str(&format!(
                 "<a class=\"tgrid__event\" href=\"/edit/{id}\" \
-                   style=\"top:{top:.1}px;height:{height:.1}px;left:{left:.4}%;width:{width:.4}%\" \
+                   style=\"top:{top:.1}px;height:{height:.1}px;left:{left:.4}%;width:{width:.4}%;--cal-color:{color}\" \
                    title=\"{tip}\">\
                    <span class=\"tgrid__event-time\">{start}</span> {title}{recur}\
                  </a>",
@@ -471,6 +724,7 @@ fn render_day_column(d: &GridDay, events: &[Event], off: i32) -> String {
                 height = height,
                 left = left,
                 width = width,
+                color = event_color(e, calendars),
                 tip = tooltip,
                 start = calendar::human_time_at(e.starts_at, off),
                 title = esc(&e.title),
@@ -485,6 +739,7 @@ fn render_day_column(d: &GridDay, events: &[Event], off: i32) -> String {
 fn render_calendar(
     view: &MonthView,
     events: &[Event],
+    calendars: &[Calendar],
     now: i64,
     csrf: &str,
     off: i32,
@@ -522,7 +777,7 @@ fn render_calendar(
         for cell in week {
             match cell {
                 None => weeks.push_str("<div class=\"cal-day cal-day--pad\"></div>"),
-                Some(c) => weeks.push_str(&render_day_cell(c, events, off)),
+                Some(c) => weeks.push_str(&render_day_cell(c, events, calendars, off)),
             }
         }
         weeks.push_str("</div>");
@@ -539,7 +794,7 @@ fn render_calendar(
         head = head,
         weekdays = weekdays,
         weeks = weeks,
-        agenda = render_agenda(events, now, csrf, off),
+        agenda = render_agenda(events, calendars, now, csrf, off),
         tz = esc(tz_label),
     )
 }
@@ -569,7 +824,7 @@ fn recur_mark(e: &Event) -> &'static str {
     }
 }
 
-fn render_day_cell(c: &DayCell, events: &[Event], off: i32) -> String {
+fn render_day_cell(c: &DayCell, events: &[Event], calendars: &[Calendar], off: i32) -> String {
     let day_events: Vec<&Event> = events
         .iter()
         .filter(|e| e.starts_at <= c.end_ms && e.ends_at >= c.start_ms)
@@ -593,10 +848,11 @@ fn render_day_cell(c: &DayCell, events: &[Event], off: i32) -> String {
             e.title
         ));
         chips.push_str(&format!(
-            "<a class=\"cal-event{ad}\" href=\"/edit/{id}\" title=\"{tooltip}\">{label}</a>",
+            "<a class=\"cal-event{ad}\" href=\"/edit/{id}\" title=\"{tooltip}\"{style}>{label}</a>",
             ad = if e.all_day { " cal-event--allday" } else { "" },
             id = esc(&e.id),
             tooltip = tooltip,
+            style = event_style(e, calendars),
             label = label,
         ));
     }
@@ -619,7 +875,13 @@ fn render_day_cell(c: &DayCell, events: &[Event], off: i32) -> String {
     )
 }
 
-fn render_agenda(events: &[Event], now: i64, csrf: &str, off: i32) -> String {
+fn render_agenda(
+    events: &[Event],
+    calendars: &[Calendar],
+    now: i64,
+    csrf: &str,
+    off: i32,
+) -> String {
     // `events` is already sorted by starts_at ascending; keep only those that haven't ended.
     let upcoming: Vec<&Event> = events
         .iter()
@@ -628,9 +890,13 @@ fn render_agenda(events: &[Event], now: i64, csrf: &str, off: i32) -> String {
         .collect();
 
     let body = if upcoming.is_empty() {
-        "<p class=\"agenda-empty\">No upcoming events. <a href=\"/new\">Add one.</a></p>".to_string()
+        "<p class=\"agenda-empty\">No upcoming events. <a href=\"/new\">Add one.</a></p>"
+            .to_string()
     } else {
-        upcoming.iter().map(|e| render_agenda_item(e, csrf, off)).collect()
+        upcoming
+            .iter()
+            .map(|e| render_agenda_item(e, calendars, csrf, off))
+            .collect()
     };
 
     format!(
@@ -639,31 +905,160 @@ fn render_agenda(events: &[Event], now: i64, csrf: &str, off: i32) -> String {
     )
 }
 
-fn render_agenda_item(e: &Event, csrf: &str, off: i32) -> String {
+fn render_agenda_view(
+    events: &[Event],
+    calendars: &[Calendar],
+    now: i64,
+    csrf: &str,
+    off: i32,
+    tz_label: &str,
+    days: i64,
+) -> String {
+    let upcoming: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.ends_at >= now)
+        .take(AGENDA_LIMIT)
+        .collect();
+    let body = if upcoming.is_empty() {
+        "<p class=\"agenda-empty\">No events in this range. <a href=\"/new\">Add one.</a></p>"
+            .to_string()
+    } else {
+        let mut out = String::new();
+        let mut current_day: Option<i64> = None;
+        for e in upcoming {
+            let day = calendar::start_of_day_at(e.starts_at, off);
+            if current_day != Some(day) {
+                current_day = Some(day);
+                out.push_str(&format!(
+                    "<h2 class=\"agenda__day\">{}</h2>",
+                    esc(&calendar::human_date_at(day, off))
+                ));
+            }
+            out.push_str(&render_agenda_item(e, calendars, csrf, off));
+        }
+        out
+    };
+    format!(
+        "<div class=\"cal-head\">\
+           <h1>Agenda</h1>\
+           <div class=\"cal-nav\">\
+             {switch}\
+             <a class=\"btn btn-primary btn-sm\" href=\"/new\">New event</a>\
+           </div>\
+         </div>\
+         <section class=\"agenda agenda--list\" aria-label=\"Next {days} days\">{body}</section>\
+         <p class=\"site-foot\">HOLDFAST Almanac · personal calendar &amp; contacts · times shown in {tz}</p>",
+        switch = view_switch(ViewKind::Agenda, &calendar::fmt_date_input(now)),
+        days = days,
+        body = body,
+        tz = esc(tz_label),
+    )
+}
+
+fn render_agenda_item(e: &Event, calendars: &[Calendar], csrf: &str, off: i32) -> String {
     let loc = if e.location.trim().is_empty() {
         String::new()
     } else {
         format!("<span class=\"agenda__loc\">{}</span>", esc(&e.location))
     };
+    let cal = event_calendar(e, calendars)
+        .map(|c| {
+            format!(
+                "<span class=\"agenda__cal\"><span class=\"calendar-swatch\" style=\"--cal-color:{color}\"></span>{name}</span>",
+                color = calendar_swatch(&c.color),
+                name = esc(&c.name),
+            )
+        })
+        .unwrap_or_default();
+    let occurrence_actions = occurrence_actions(e, csrf);
     format!(
-        "<div class=\"agenda__item\">\
+        "<div class=\"agenda__item\"{style}>\
            <div class=\"agenda__when\">{when}</div>\
            <div class=\"agenda__body\">\
              <a class=\"agenda__title\" href=\"/edit/{id}\">{title}{recur}</a>\
+             {cal}\
              {loc}\
            </div>\
+           {occurrence_actions}\
            <form class=\"agenda__del\" method=\"post\" action=\"/delete/{id}\" onsubmit=\"return confirm('Delete this event?')\">\
              <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
              <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Delete</button>\
            </form>\
          </div>",
+        style = event_style(e, calendars),
         when = esc(&calendar::fmt_event_when_at(e.starts_at, e.ends_at, e.all_day, off)),
         id = esc(&e.id),
         title = esc(&e.title),
         recur = recur_mark(e),
+        cal = cal,
         loc = loc,
+        occurrence_actions = occurrence_actions,
         csrf = esc(csrf),
     )
+}
+
+fn occurrence_actions(e: &Event, csrf: &str) -> String {
+    let (series_id, occurrence_date) = if !e.series_id.trim().is_empty() {
+        (e.series_id.as_str(), e.override_occurrence_date)
+    } else if !e.rrule.trim().is_empty() {
+        (e.id.as_str(), e.starts_at)
+    } else {
+        return String::new();
+    };
+    if occurrence_date <= 0 {
+        return String::new();
+    }
+    format!(
+        "<div class=\"agenda__occ\">\
+           <a class=\"btn btn-secondary btn-sm\" href=\"/edit/{id}?occurrence={occ}\">Edit this</a>\
+           <form method=\"post\" action=\"/delete/{id}?occurrence={occ}\" onsubmit=\"return confirm('Delete this occurrence?')\">\
+             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+             <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Delete this</button>\
+           </form>\
+         </div>",
+        id = esc(series_id),
+        occ = occurrence_date,
+        csrf = esc(csrf),
+    )
+}
+
+fn event_calendar<'a>(e: &Event, calendars: &'a [Calendar]) -> Option<&'a Calendar> {
+    calendars.iter().find(|c| c.id == e.calendar_id)
+}
+
+fn is_hex_color(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 7 && b[0] == b'#' && b[1..].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn calendar_swatch(color: &str) -> String {
+    if is_hex_color(color) {
+        color.to_string()
+    } else {
+        DEFAULT_CALENDAR_COLOR.to_string()
+    }
+}
+
+fn event_color(e: &Event, calendars: &[Calendar]) -> String {
+    event_calendar(e, calendars)
+        .map(|c| calendar_swatch(&c.color))
+        .unwrap_or_else(|| DEFAULT_CALENDAR_COLOR.to_string())
+}
+
+fn event_style(e: &Event, calendars: &[Calendar]) -> String {
+    format!(" style=\"--cal-color:{}\"", event_color(e, calendars))
+}
+
+fn occurrence_event(series: &Event, occurrence_date: i64) -> Event {
+    let mut event = series.clone();
+    let duration = (series.ends_at - series.starts_at).max(0);
+    event.starts_at = occurrence_date;
+    event.ends_at = occurrence_date + duration;
+    event.rrule.clear();
+    event.series_id = series.id.clone();
+    event.override_occurrence_date = occurrence_date;
+    event.exception_dates.clear();
+    event
 }
 
 // ---------------------------------------------------------------------------
@@ -677,10 +1072,15 @@ pub async fn new_form(
 ) -> Result<Response, AppError> {
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
+    let calendars = state.store.list_calendars(&owner).await?;
     let csrf = auth::new_csrf_token();
 
     // If a day was clicked, default to a 09:00–10:00 LOCAL slot on that day; else leave blank.
-    let (starts_local, ends_local) = match q.date.as_deref().and_then(|d| calendar::parse_date_at(d, off)) {
+    let (starts_local, ends_local) = match q
+        .date
+        .as_deref()
+        .and_then(|d| calendar::parse_date_at(d, off))
+    {
         Some(day) => {
             let s = day + 9 * 3_600_000;
             (
@@ -695,6 +1095,8 @@ pub async fn new_form(
     let view = FormView {
         action: "/new".to_string(),
         title: String::new(),
+        calendar_id: calendars.first().map(|c| c.id.clone()).unwrap_or_default(),
+        calendars,
         starts_local,
         ends_local,
         all_day: false,
@@ -708,6 +1110,9 @@ pub async fn new_form(
         reminders: Vec::new(),
         csrf: csrf.clone(),
         is_edit: false,
+        is_occurrence: false,
+        series_id: String::new(),
+        occurrence_date: 0,
         id: String::new(),
     };
     let content = format!("{}{}", render::subnav("calendar"), render_event_form(&view));
@@ -738,6 +1143,7 @@ pub async fn create(
         .upsert_event(Event {
             id: id.clone(),
             owner_sub: owner.clone(),
+            calendar_id: parsed.calendar_id,
             title: parsed.title,
             starts_at: parsed.starts_at,
             ends_at: parsed.ends_at,
@@ -745,6 +1151,9 @@ pub async fn create(
             location: parsed.location,
             notes: parsed.notes,
             rrule: parsed.rrule,
+            series_id: String::new(),
+            override_occurrence_date: 0,
+            exception_dates: Vec::new(),
             created_at: now,
         })
         .await?;
@@ -762,29 +1171,63 @@ pub async fn edit_form(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<OccurrenceQuery>,
 ) -> Result<Response, AppError> {
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
-    let event = state
+    let calendars = state.store.list_calendars(&owner).await?;
+    let series = state
         .store
         .get_event(&owner, &id)
         .await?
         .ok_or_else(|| AppError::NotFound("That event does not exist.".to_string()))?;
 
     let csrf = auth::new_csrf_token();
+    let occurrence = q.occurrence.filter(|_| !series.rrule.trim().is_empty());
+    let (event, action, is_occurrence, attendee_source_id) = match occurrence {
+        Some(occ) => {
+            let override_event = state
+                .store
+                .get_event_override(&owner, &series.id, occ)
+                .await?;
+            let event = override_event.unwrap_or_else(|| occurrence_event(&series, occ));
+            let source = if event.id == series.id {
+                series.id.clone()
+            } else {
+                event.id.clone()
+            };
+            (
+                event,
+                format!("/edit/{}?occurrence={}", series.id, occ),
+                true,
+                source,
+            )
+        }
+        None => (
+            series.clone(),
+            format!("/edit/{}", series.id),
+            false,
+            series.id.clone(),
+        ),
+    };
     let (repeat, repeat_interval, repeat_count, repeat_until) =
         FormView::recurrence_from(&event.rrule);
-    let attendees = state.store.list_attendees(&owner, &id).await?;
+    let attendees = state
+        .store
+        .list_attendees(&owner, &attendee_source_id)
+        .await?;
     let reminders: Vec<i64> = state
         .store
-        .list_reminders(&owner, &id)
+        .list_reminders(&owner, &attendee_source_id)
         .await?
         .iter()
         .map(|r| r.minutes_before)
         .collect();
     let view = FormView {
-        action: format!("/edit/{}", event.id),
+        action,
         title: event.title.clone(),
+        calendar_id: event.calendar_id.clone(),
+        calendars,
         starts_local: calendar::fmt_datetime_local_at(event.starts_at, off),
         ends_local: calendar::fmt_datetime_local_at(event.ends_at, off),
         all_day: event.all_day,
@@ -798,7 +1241,14 @@ pub async fn edit_form(
         reminders,
         csrf: csrf.clone(),
         is_edit: true,
-        id: event.id.clone(),
+        is_occurrence,
+        series_id: series.id.clone(),
+        occurrence_date: occurrence.unwrap_or(0),
+        id: if is_occurrence {
+            series.id.clone()
+        } else {
+            event.id.clone()
+        },
     };
     let content = format!("{}{}", render::subnav("calendar"), render_event_form(&view));
     Ok(html_with_csrf_cookie(
@@ -815,6 +1265,7 @@ pub async fn update(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<OccurrenceQuery>,
     Form(form): Form<EventForm>,
 ) -> Result<Response, AppError> {
     require_csrf(&headers, &form.csrf_token)?;
@@ -829,11 +1280,46 @@ pub async fn update(
     let parsed = parse_event_form(&form, off)?;
     let now = now_ms();
 
+    if let Some(occ) = q.occurrence.filter(|_| !existing.rrule.trim().is_empty()) {
+        let prior = state
+            .store
+            .get_event_override(&owner, &existing.id, occ)
+            .await?;
+        let override_id = prior
+            .as_ref()
+            .map(|e| e.id.clone())
+            .unwrap_or_else(auth::random_hex);
+        let created_at = prior.as_ref().map(|e| e.created_at).unwrap_or(now);
+        state
+            .store
+            .upsert_event(Event {
+                id: override_id.clone(),
+                owner_sub: owner.clone(),
+                calendar_id: parsed.calendar_id,
+                title: parsed.title,
+                starts_at: parsed.starts_at,
+                ends_at: parsed.ends_at,
+                all_day: parsed.all_day,
+                location: parsed.location,
+                notes: parsed.notes,
+                rrule: String::new(),
+                series_id: existing.id.clone(),
+                override_occurrence_date: occ,
+                exception_dates: Vec::new(),
+                created_at,
+            })
+            .await?;
+        save_attendees_and_reminders(&state, &owner, &override_id, &form, now).await?;
+        tracing::info!(target: "audit", event = "event.occurrence.updated", "event occurrence updated");
+        return Ok(redirect_to_month(parsed.starts_at, off));
+    }
+
     state
         .store
         .upsert_event(Event {
             id: existing.id,
             owner_sub: owner.clone(),
+            calendar_id: parsed.calendar_id,
             title: parsed.title,
             starts_at: parsed.starts_at,
             ends_at: parsed.ends_at,
@@ -841,6 +1327,9 @@ pub async fn update(
             location: parsed.location,
             notes: parsed.notes,
             rrule: parsed.rrule,
+            series_id: existing.series_id,
+            override_occurrence_date: existing.override_occurrence_date,
+            exception_dates: Vec::new(),
             created_at: existing.created_at,
         })
         .await?;
@@ -858,10 +1347,60 @@ pub async fn delete(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<OccurrenceQuery>,
     Form(form): Form<DeleteForm>,
 ) -> Result<Response, AppError> {
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
+    let existing = state.store.get_event(&owner, &id).await?;
+    if let Some(series) = existing.as_ref() {
+        if let Some(occ) = q.occurrence.filter(|_| !series.rrule.trim().is_empty()) {
+            state
+                .store
+                .upsert_event_exception(EventException {
+                    id: format!("ex:{}:{occ}", series.id),
+                    event_id: series.id.clone(),
+                    owner_sub: owner.clone(),
+                    occurrence_date: occ,
+                    created_at: now_ms(),
+                })
+                .await?;
+            if let Some(override_event) = state
+                .store
+                .delete_event_override(&owner, &series.id, occ)
+                .await?
+            {
+                state
+                    .store
+                    .delete_event_attendees(&owner, &override_event.id)
+                    .await?;
+                state
+                    .store
+                    .delete_event_reminders(&owner, &override_event.id)
+                    .await?;
+            }
+            tracing::info!(target: "audit", event = "event.occurrence.deleted", "event occurrence deleted");
+            return Ok(Redirect::to("/").into_response());
+        }
+        for override_event in state
+            .store
+            .delete_event_overrides(&owner, &series.id)
+            .await?
+        {
+            state
+                .store
+                .delete_event_attendees(&owner, &override_event.id)
+                .await?;
+            state
+                .store
+                .delete_event_reminders(&owner, &override_event.id)
+                .await?;
+        }
+        state
+            .store
+            .delete_event_exceptions(&owner, &series.id)
+            .await?;
+    }
     state.store.delete_event(&owner, &id).await?;
     // Cascade: an event's attendees + reminders go with it (both ownership-scoped).
     state.store.delete_event_attendees(&owner, &id).await?;
@@ -901,7 +1440,8 @@ pub async fn quick_add(
                 .store
                 .upsert_event(Event {
                     id,
-                    owner_sub: owner,
+                    owner_sub: owner.clone(),
+                    calendar_id: String::new(),
                     title: qa.title,
                     starts_at,
                     ends_at: starts_at + 3_600_000,
@@ -909,6 +1449,9 @@ pub async fn quick_add(
                     location: String::new(),
                     notes: String::new(),
                     rrule: String::new(),
+                    series_id: String::new(),
+                    override_occurrence_date: 0,
+                    exception_dates: Vec::new(),
                     created_at: now,
                 })
                 .await?;
@@ -918,13 +1461,102 @@ pub async fn quick_add(
         None => {
             // Unparseable: fall back to the normal editor, prefilled with the raw text as the title.
             let csrf = auth::new_csrf_token();
-            let view = blank_form_view(&csrf, raw);
+            let calendars = state.store.list_calendars(&owner).await?;
+            let view = blank_form_view(&csrf, raw, &calendars);
             let content = format!("{}{}", render::subnav("calendar"), render_event_form(&view));
             Ok(html_with_csrf_cookie(
                 layout("New event", &headers, &content),
                 &csrf,
             ))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Calendar management
+// ---------------------------------------------------------------------------
+
+pub async fn create_calendar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CalendarForm>,
+) -> Result<Response, AppError> {
+    require_csrf(&headers, &form.csrf_token)?;
+    let owner = auth::owner_subject(&headers);
+    let calendars = state.store.list_calendars(&owner).await?;
+    let position = calendars.iter().map(|c| c.position).max().unwrap_or(0) + 1;
+    state
+        .store
+        .upsert_calendar(Calendar {
+            id: auth::random_hex(),
+            owner_sub: owner,
+            name: normalize_calendar_name(&form.name),
+            color: normalize_calendar_color(&form.color),
+            position,
+        })
+        .await?;
+    tracing::info!(target: "audit", event = "calendar.created", "calendar created");
+    Ok(Redirect::to("/").into_response())
+}
+
+pub async fn update_calendar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<CalendarForm>,
+) -> Result<Response, AppError> {
+    require_csrf(&headers, &form.csrf_token)?;
+    let owner = auth::owner_subject(&headers);
+    let existing = state
+        .store
+        .get_calendar(&owner, &id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("That calendar does not exist.".to_string()))?;
+    state
+        .store
+        .upsert_calendar(Calendar {
+            id: existing.id,
+            owner_sub: owner,
+            name: normalize_calendar_name(&form.name),
+            color: normalize_calendar_color(&form.color),
+            position: existing.position,
+        })
+        .await?;
+    tracing::info!(target: "audit", event = "calendar.updated", "calendar updated");
+    Ok(Redirect::to("/").into_response())
+}
+
+pub async fn delete_calendar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<DeleteForm>,
+) -> Result<Response, AppError> {
+    require_csrf(&headers, &form.csrf_token)?;
+    let owner = auth::owner_subject(&headers);
+    if state.store.delete_calendar(&owner, &id).await? {
+        tracing::info!(target: "audit", event = "calendar.deleted", "calendar deleted");
+    } else {
+        tracing::info!(target: "audit", event = "calendar.delete_blocked", "calendar delete blocked");
+    }
+    Ok(Redirect::to("/").into_response())
+}
+
+fn normalize_calendar_name(raw: &str) -> String {
+    let name = raw.trim();
+    if name.is_empty() {
+        "Untitled".to_string()
+    } else {
+        name.chars().take(80).collect()
+    }
+}
+
+fn normalize_calendar_color(raw: &str) -> String {
+    let color = raw.trim();
+    if is_hex_color(color) {
+        color.to_ascii_lowercase()
+    } else {
+        DEFAULT_CALENDAR_COLOR.to_string()
     }
 }
 
@@ -936,6 +1568,8 @@ pub async fn quick_add(
 struct FormView {
     action: String,
     title: String,
+    calendar_id: String,
+    calendars: Vec<Calendar>,
     starts_local: String,
     ends_local: String,
     all_day: bool,
@@ -952,16 +1586,21 @@ struct FormView {
     reminders: Vec<i64>,
     csrf: String,
     is_edit: bool,
+    is_occurrence: bool,
+    series_id: String,
+    occurrence_date: i64,
     id: String,
 }
 
 /// A blank (non-recurring) create-form view, optionally prefilled with a `title` — used by the
 /// quick-add fallback when a phrase could not be parsed.
-fn blank_form_view(csrf: &str, title: &str) -> FormView {
+fn blank_form_view(csrf: &str, title: &str, calendars: &[Calendar]) -> FormView {
     let (repeat, repeat_interval, repeat_count, repeat_until) = FormView::no_recurrence();
     FormView {
         action: "/new".to_string(),
         title: title.to_string(),
+        calendar_id: calendars.first().map(|c| c.id.clone()).unwrap_or_default(),
+        calendars: calendars.to_vec(),
         starts_local: String::new(),
         ends_local: String::new(),
         all_day: false,
@@ -975,6 +1614,9 @@ fn blank_form_view(csrf: &str, title: &str) -> FormView {
         reminders: Vec::new(),
         csrf: csrf.to_string(),
         is_edit: false,
+        is_occurrence: false,
+        series_id: String::new(),
+        occurrence_date: 0,
         id: String::new(),
     }
 }
@@ -1059,6 +1701,33 @@ fn render_attendees_field(v: &FormView) -> String {
            <p class=\"editor__hint\">Each attendee gets a private RSVP link — open the event page after saving to copy it.</p>\
          </div>",
         attendees = esc(&v.attendees),
+    )
+}
+
+fn render_calendar_select(v: &FormView) -> String {
+    let options: String = v
+        .calendars
+        .iter()
+        .map(|c| {
+            let selected = if c.id == v.calendar_id {
+                " selected"
+            } else {
+                ""
+            };
+            format!(
+                "<option value=\"{id}\"{selected}>{name}</option>",
+                id = esc(&c.id),
+                selected = selected,
+                name = esc(&c.name),
+            )
+        })
+        .collect();
+    format!(
+        "<div class=\"editor__field\">\
+           <label for=\"calendar_id\">Calendar</label>\
+           <select id=\"calendar_id\" name=\"calendar_id\">{options}</select>\
+         </div>",
+        options = options,
     )
 }
 
@@ -1230,7 +1899,10 @@ async fn save_attendees_and_reminders(
     let submitted = parse_attendees(&form.attendees);
     let existing_att = state.store.list_attendees(owner, event_id).await?;
     let attendees = reconcile_attendees(owner, event_id, &submitted, &existing_att, now);
-    state.store.replace_attendees(owner, event_id, attendees).await?;
+    state
+        .store
+        .replace_attendees(owner, event_id, attendees)
+        .await?;
 
     let minutes = reminder_minutes_from_form(form);
     let existing_rem = state.store.list_reminders(owner, event_id).await?;
@@ -1248,11 +1920,19 @@ async fn save_attendees_and_reminders(
             }
         })
         .collect();
-    state.store.replace_reminders(owner, event_id, reminders).await?;
+    state
+        .store
+        .replace_reminders(owner, event_id, reminders)
+        .await?;
     Ok(())
 }
 
 fn render_event_form(v: &FormView) -> String {
+    let recurrence = if v.is_occurrence {
+        String::new()
+    } else {
+        render_recurrence(v)
+    };
     let main = format!(
         "<form class=\"card editor\" method=\"post\" action=\"{action}\">\
            <div class=\"editor__head\"><h1>{verb} event</h1></div>\
@@ -1261,6 +1941,7 @@ fn render_event_form(v: &FormView) -> String {
              <label for=\"title\">Title</label>\
              <input id=\"title\" type=\"text\" name=\"title\" value=\"{title}\" autocomplete=\"off\" maxlength=\"200\" required>\
            </div>\
+           {calendar_select}\
            <div class=\"editor__row\">\
              <div class=\"editor__field\">\
                <label for=\"starts_at\">Starts</label>\
@@ -1289,6 +1970,7 @@ fn render_event_form(v: &FormView) -> String {
            <div class=\"editor__actions\">\
              <a class=\"btn btn-secondary\" href=\"/\">Cancel</a>\
              {detail_link}\
+             {series_link}\
              <button class=\"btn btn-primary\" type=\"submit\">Save event</button>\
            </div>\
          </form>",
@@ -1296,6 +1978,7 @@ fn render_event_form(v: &FormView) -> String {
         verb = if v.is_edit { "Edit" } else { "New" },
         csrf = esc(&v.csrf),
         title = esc(&v.title),
+        calendar_select = render_calendar_select(v),
         starts = esc(&v.starts_local),
         ends = esc(&v.ends_local),
         checked = if v.all_day { " checked" } else { "" },
@@ -1303,11 +1986,19 @@ fn render_event_form(v: &FormView) -> String {
         notes = esc(&v.notes),
         attendees = render_attendees_field(v),
         reminders = render_reminders(v),
-        recurrence = render_recurrence(v),
+        recurrence = recurrence,
         detail_link = if v.is_edit {
             format!(
                 "<a class=\"btn btn-secondary\" href=\"/event/{id}\">Event page</a>",
                 id = esc(&v.id)
+            )
+        } else {
+            String::new()
+        },
+        series_link = if v.is_occurrence {
+            format!(
+                "<a class=\"btn btn-secondary\" href=\"/edit/{id}\">Edit series</a>",
+                id = esc(&v.series_id)
             )
         } else {
             String::new()
@@ -1318,20 +2009,39 @@ fn render_event_form(v: &FormView) -> String {
         return main;
     }
 
+    let (delete_action, delete_label, delete_copy, confirm) = if v.is_occurrence {
+        (
+            format!("/delete/{}?occurrence={}", v.series_id, v.occurrence_date),
+            "Delete occurrence",
+            "This removes only this occurrence from the series.",
+            "Delete this occurrence?",
+        )
+    } else {
+        (
+            format!("/delete/{}", v.id),
+            "Delete event",
+            "This permanently removes the event.",
+            "Delete this event?",
+        )
+    };
     let danger = format!(
-        "<form class=\"card danger-zone\" method=\"post\" action=\"/delete/{id}\" onsubmit=\"return confirm('Delete this event?')\">\
-           <div class=\"danger-zone__text\"><strong>Delete event</strong><p class=\"muted\">This permanently removes the event.</p></div>\
+        "<form class=\"card danger-zone\" method=\"post\" action=\"{action}\" onsubmit=\"return confirm('{confirm}')\">\
+           <div class=\"danger-zone__text\"><strong>{label}</strong><p class=\"muted\">{copy}</p></div>\
            <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
            <button class=\"btn btn-danger\" type=\"submit\">Delete</button>\
          </form>",
-        id = esc(&v.id),
+        action = esc(&delete_action),
+        confirm = confirm,
+        label = delete_label,
         csrf = esc(&v.csrf),
+        copy = esc(delete_copy),
     );
     format!("{main}{danger}")
 }
 
 /// The validated, normalized fields of a submitted event form.
 struct ParsedEvent {
+    calendar_id: String,
     title: String,
     starts_at: i64,
     ends_at: i64,
@@ -1364,8 +2074,10 @@ fn parse_event_form(form: &EventForm, off: i32) -> Result<ParsedEvent, AppError>
     }
 
     let all_day = checkbox_on(form.all_day.as_deref());
-    let mut starts_at = calendar::parse_datetime_local_at(&form.starts_at, off)
-        .ok_or_else(|| AppError::BadRequest("A valid start date and time is required.".to_string()))?;
+    let mut starts_at =
+        calendar::parse_datetime_local_at(&form.starts_at, off).ok_or_else(|| {
+            AppError::BadRequest("A valid start date and time is required.".to_string())
+        })?;
     let mut ends_at = calendar::parse_datetime_local_at(&form.ends_at, off).unwrap_or(starts_at);
 
     if all_day {
@@ -1376,12 +2088,23 @@ fn parse_event_form(form: &EventForm, off: i32) -> Result<ParsedEvent, AppError>
     }
 
     let freq = parse_repeat_freq(&form.repeat);
-    let interval = form.repeat_interval.trim().parse::<u32>().unwrap_or(1).max(1);
-    let count = form.repeat_count.trim().parse::<u32>().ok().filter(|c| *c > 0);
+    let interval = form
+        .repeat_interval
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(1)
+        .max(1);
+    let count = form
+        .repeat_count
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|c| *c > 0);
     let until = Some(form.repeat_until.trim()).filter(|u| !u.is_empty());
     let rrule = rrule::build_rrule(freq, interval, count, until);
 
     Ok(ParsedEvent {
+        calendar_id: form.calendar_id.trim().to_string(),
         title,
         starts_at,
         ends_at,
@@ -1454,7 +2177,10 @@ mod tests {
         ];
         let out = reconcile_attendees("alice", "e1", &submitted, &existing, 200);
         assert_eq!(out.len(), 2);
-        let retained = out.iter().find(|a| a.email.eq_ignore_ascii_case("guest@x.co")).unwrap();
+        let retained = out
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case("guest@x.co"))
+            .unwrap();
         assert_eq!(retained.token, "keep-tok", "RSVP link survives the edit");
         assert_eq!(retained.status, "accepted", "status survives the edit");
         assert_eq!(retained.name, "Guest Renamed", "display name updates");
@@ -1470,6 +2196,7 @@ mod tests {
         let mut f = EventForm {
             csrf_token: String::new(),
             title: String::new(),
+            calendar_id: String::new(),
             starts_at: String::new(),
             ends_at: String::new(),
             all_day: None,

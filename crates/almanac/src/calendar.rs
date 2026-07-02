@@ -47,8 +47,18 @@ pub struct MonthView {
 }
 
 const MONTH_NAMES: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September",
-    "October", "November", "December",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ];
 const MONTH_ABBR: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -144,8 +154,16 @@ pub fn build_month_at(
     }
     let weeks = cells.chunks(7).map(<[Option<DayCell>]>::to_vec).collect();
 
-    let prev = if month == 1 { (year - 1, 12) } else { (year, month - 1) };
-    let next = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let prev = if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, month - 1)
+    };
+    let next = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
 
     MonthView {
         year,
@@ -234,7 +252,12 @@ fn local_today_ymd(today_ms: i64, off_min: i32) -> (i32, u8, u8) {
 
 /// Build the 7-day week time-grid containing `anchor_ms`, in the owner's timezone. `monday_first`
 /// selects whether the week starts on Monday or Sunday; `today_ms` marks the live "today" column.
-pub fn build_week_at(anchor_ms: i64, today_ms: i64, off_min: i32, monday_first: bool) -> TimeGridView {
+pub fn build_week_at(
+    anchor_ms: i64,
+    today_ms: i64,
+    off_min: i32,
+    monday_first: bool,
+) -> TimeGridView {
     let local_mid = start_of_day(shift(anchor_ms, off_min));
     let lead = match to_dt(local_mid) {
         Some(dt) => {
@@ -298,7 +321,10 @@ pub fn tz_offset_minutes(tz: &str) -> i32 {
         return 0;
     }
     // Accept "UTC+HH:MM" / "UTC-HH:MM" and the bare "+HH:MM" / "-HH:MM" forms.
-    let rest = t.strip_prefix("UTC").or_else(|| t.strip_prefix("utc")).unwrap_or(t);
+    let rest = t
+        .strip_prefix("UTC")
+        .or_else(|| t.strip_prefix("utc"))
+        .unwrap_or(t);
     let (sign, hm) = match rest.as_bytes().first() {
         Some(b'+') => (1, &rest[1..]),
         Some(b'-') => (-1, &rest[1..]),
@@ -459,7 +485,11 @@ pub fn fmt_event_when(starts_at: i64, ends_at: i64, all_day: bool) -> String {
         if same_day {
             format!("All day · {}", human_date(starts_at))
         } else {
-            format!("All day · {} – {}", human_date(starts_at), human_date(ends_at))
+            format!(
+                "All day · {} – {}",
+                human_date(starts_at),
+                human_date(ends_at)
+            )
         }
     } else if same_day {
         format!(
@@ -503,6 +533,11 @@ pub fn parse_date_at(s: &str, off_min: i32) -> Option<i64> {
 /// Human time label in the owner's local wall clock, e.g. `14:30`.
 pub fn human_time_at(ms: i64, off_min: i32) -> String {
     human_time(shift(ms, off_min))
+}
+
+/// Human day label in the owner's local wall clock.
+pub fn human_date_at(ms: i64, off_min: i32) -> String {
+    human_date(shift(ms, off_min))
 }
 
 /// A friendly "when" label rendered in the owner's local wall clock (see [`fmt_event_when`]).
@@ -579,7 +614,10 @@ mod tests {
         let e = parse_datetime_local("2026-06-29T15:30").unwrap();
         assert_eq!(fmt_event_when(s, e, false), "Jun 29, 2026 · 14:30 – 15:30");
         let day = parse_date("2026-06-29").unwrap();
-        assert_eq!(fmt_event_when(day, end_of_day(day), true), "All day · Jun 29, 2026");
+        assert_eq!(
+            fmt_event_when(day, end_of_day(day), true),
+            "All day · Jun 29, 2026"
+        );
     }
 
     #[test]
@@ -684,6 +722,10 @@ mod tests {
         assert_eq!(weekday_headers(true)[0], "Mon");
         // June 2026: the 1st is a Monday => Monday-first has zero leading pads.
         let view = build_month_at(2026, 6, 0, 0, true);
-        assert_eq!(view.weeks[0][0].as_ref().unwrap().day, 1, "Monday column holds the 1st");
+        assert_eq!(
+            view.weeks[0][0].as_ref().unwrap().day,
+            1,
+            "Monday column holds the 1st"
+        );
     }
 }

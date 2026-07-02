@@ -134,7 +134,9 @@ pub async fn deliver_due_reminders(
                 // Audit: value-free notice of a delivered reminder (no recipient payload).
                 tracing::info!(target: "audit", event = "reminder.delivered", "reminder delivered");
             }
-            Err(e) => tracing::warn!(error = %e, id = %d.reminder_id, "reminder delivery failed — will retry"),
+            Err(e) => {
+                tracing::warn!(error = %e, id = %d.reminder_id, "reminder delivery failed — will retry")
+            }
         }
     }
     delivered
@@ -159,7 +161,10 @@ impl HttpKlaxonSink {
 impl ReminderSink for HttpKlaxonSink {
     async fn deliver(&self, note: &ReminderNote) -> Result<(), String> {
         let (host, port, path) = parse_http_url(&self.url).ok_or_else(|| {
-            format!("ALMANAC_KLAXON_NOTIFY_URL is not a plain http:// URL: {}", self.url)
+            format!(
+                "ALMANAC_KLAXON_NOTIFY_URL is not a plain http:// URL: {}",
+                self.url
+            )
         })?;
         let body = note.to_klaxon_json();
         let req = format!(
@@ -172,10 +177,18 @@ impl ReminderSink for HttpKlaxonSink {
             body = body,
         );
         let fut = async {
-            let mut stream = TcpStream::connect((host.as_str(), port)).await.map_err(|e| e.to_string())?;
-            stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+            let mut stream = TcpStream::connect((host.as_str(), port))
+                .await
+                .map_err(|e| e.to_string())?;
+            stream
+                .write_all(req.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
             let mut buf = Vec::with_capacity(256);
-            stream.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+            stream
+                .read_to_end(&mut buf)
+                .await
+                .map_err(|e| e.to_string())?;
             Ok::<Vec<u8>, String>(buf)
         };
         let buf = tokio::time::timeout(Duration::from_secs(5), fut)
@@ -221,7 +234,9 @@ pub fn spawn_reminder_scanner(
         let mut ticker = tokio::time::interval(period);
         loop {
             ticker.tick().await;
-            let n = deliver_due_reminders(store.as_ref(), sink.as_ref(), crate::now_ms(), SCAN_BATCH).await;
+            let n =
+                deliver_due_reminders(store.as_ref(), sink.as_ref(), crate::now_ms(), SCAN_BATCH)
+                    .await;
             if n > 0 {
                 tracing::info!(count = n, "reminder scan delivered notifications");
             }
@@ -253,14 +268,23 @@ mod tests {
         assert_eq!(n.title, "Reminder: Q1 review");
         assert_eq!(n.body, "Starts in 10 minutes · War room");
         assert_eq!(n.url, "https://cal.w33d.xyz/event/e1");
-        assert_eq!(ReminderNote::from_due(&due("r", "u", "x", "", 0, 0)).body, "Starting now");
-        assert_eq!(ReminderNote::from_due(&due("r", "u", "x", "", 60, 0)).body, "Starts in 1 hour");
+        assert_eq!(
+            ReminderNote::from_due(&due("r", "u", "x", "", 0, 0)).body,
+            "Starting now"
+        );
+        assert_eq!(
+            ReminderNote::from_due(&due("r", "u", "x", "", 60, 0)).body,
+            "Starts in 1 hour"
+        );
 
         // JSON is escaped: quotes/backslashes/newlines cannot break out of the envelope.
         let evil = ReminderNote::from_due(&due("r", "u\"x", "a\"b\\c\nd", "", 5, 0));
         let json = evil.to_klaxon_json();
         assert!(json.contains("\\\"x"), "user_sub quote escaped: {json}");
-        assert!(json.contains("Reminder: a\\\"b\\\\c\\nd"), "title escaped: {json}");
+        assert!(
+            json.contains("Reminder: a\\\"b\\\\c\\nd"),
+            "title escaped: {json}"
+        );
         assert!(json.contains("\"source\":\"almanac\""));
         // It parses as a single flat object shape (balanced braces, one leading {).
         assert!(json.starts_with('{') && json.ends_with('}'));
@@ -276,7 +300,10 @@ mod tests {
             parse_http_url("http://klaxon"),
             Some(("klaxon".to_string(), 80, "/".to_string()))
         );
-        assert!(parse_http_url("https://klaxon/api").is_none(), "https not supported here");
+        assert!(
+            parse_http_url("https://klaxon/api").is_none(),
+            "https not supported here"
+        );
     }
 
     /// Records deliveries; can be told to fail for a specific reminder to test retry semantics.
@@ -303,6 +330,7 @@ mod tests {
             .upsert_event(Event {
                 id: "e1".into(),
                 owner_sub: "u_alice".into(),
+                calendar_id: String::new(),
                 title: "Standup".into(),
                 starts_at: start,
                 ends_at: start + 900_000,
@@ -310,6 +338,9 @@ mod tests {
                 location: String::new(),
                 notes: String::new(),
                 rrule: String::new(),
+                series_id: String::new(),
+                override_occurrence_date: 0,
+                exception_dates: Vec::new(),
                 created_at: 0,
             })
             .await
@@ -318,12 +349,22 @@ mod tests {
             .replace_reminders(
                 "u_alice",
                 "e1",
-                vec![Reminder { id: "r10".into(), event_id: "e1".into(), owner_sub: "u_alice".into(), minutes_before: 10, delivered_at: 0, created_at: 0 }],
+                vec![Reminder {
+                    id: "r10".into(),
+                    event_id: "e1".into(),
+                    owner_sub: "u_alice".into(),
+                    minutes_before: 10,
+                    delivered_at: 0,
+                    created_at: 0,
+                }],
             )
             .await
             .unwrap();
 
-        let sink = FakeSink { seen: Mutex::new(Vec::new()), fail_for: None };
+        let sink = FakeSink {
+            seen: Mutex::new(Vec::new()),
+            fail_for: None,
+        };
         // First scan (after the fire time, before start): delivers once.
         let n = deliver_due_reminders(&store, &sink, start - 300_000, SCAN_BATCH).await;
         assert_eq!(n, 1);
@@ -343,6 +384,7 @@ mod tests {
             .upsert_event(Event {
                 id: "e1".into(),
                 owner_sub: "u_alice".into(),
+                calendar_id: String::new(),
                 title: "Standup".into(),
                 starts_at: start,
                 ends_at: start + 1,
@@ -350,6 +392,9 @@ mod tests {
                 location: String::new(),
                 notes: String::new(),
                 rrule: String::new(),
+                series_id: String::new(),
+                override_occurrence_date: 0,
+                exception_dates: Vec::new(),
                 created_at: 0,
             })
             .await
@@ -358,15 +403,34 @@ mod tests {
             .replace_reminders(
                 "u_alice",
                 "e1",
-                vec![Reminder { id: "r".into(), event_id: "e1".into(), owner_sub: "u_alice".into(), minutes_before: 10, delivered_at: 0, created_at: 0 }],
+                vec![Reminder {
+                    id: "r".into(),
+                    event_id: "e1".into(),
+                    owner_sub: "u_alice".into(),
+                    minutes_before: 10,
+                    delivered_at: 0,
+                    created_at: 0,
+                }],
             )
             .await
             .unwrap();
 
-        let failing = FakeSink { seen: Mutex::new(Vec::new()), fail_for: Some("u_alice".to_string()) };
-        assert_eq!(deliver_due_reminders(&store, &failing, start - 100_000, SCAN_BATCH).await, 0);
+        let failing = FakeSink {
+            seen: Mutex::new(Vec::new()),
+            fail_for: Some("u_alice".to_string()),
+        };
+        assert_eq!(
+            deliver_due_reminders(&store, &failing, start - 100_000, SCAN_BATCH).await,
+            0
+        );
         // Still pending -> a working sink later delivers it.
-        let ok = FakeSink { seen: Mutex::new(Vec::new()), fail_for: None };
-        assert_eq!(deliver_due_reminders(&store, &ok, start - 100_000, SCAN_BATCH).await, 1);
+        let ok = FakeSink {
+            seen: Mutex::new(Vec::new()),
+            fail_for: None,
+        };
+        assert_eq!(
+            deliver_due_reminders(&store, &ok, start - 100_000, SCAN_BATCH).await,
+            1
+        );
     }
 }

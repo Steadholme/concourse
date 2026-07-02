@@ -170,7 +170,10 @@ fn vevent(e: &Event, off_min: i32, now_ms: i64, host: &str) -> Vec<String> {
         // DTEND is EXCLUSIVE: the day after the local last day.
         let end_local = e.ends_at + off_min as i64 * 60_000;
         let end_excl = calendar::start_of_day(end_local) + DAY_MS;
-        out.push(format!("DTSTART;VALUE=DATE:{}", fmt_local_date(start_local)));
+        out.push(format!(
+            "DTSTART;VALUE=DATE:{}",
+            fmt_local_date(start_local)
+        ));
         out.push(format!("DTEND;VALUE=DATE:{}", fmt_local_date(end_excl)));
     } else {
         let start_local = e.starts_at + off_min as i64 * 60_000;
@@ -244,6 +247,7 @@ mod tests {
         Event {
             id: "evt123".to_string(),
             owner_sub: "alice".to_string(),
+            calendar_id: String::new(),
             title: title.to_string(),
             starts_at: parse_datetime_local("2026-06-15T14:30").unwrap(),
             ends_at: parse_datetime_local("2026-06-15T15:30").unwrap(),
@@ -251,6 +255,9 @@ mod tests {
             location: "War, room".to_string(),
             notes: "Bring; the deck\nrow2".to_string(),
             rrule: rrule.to_string(),
+            series_id: String::new(),
+            override_occurrence_date: 0,
+            exception_dates: Vec::new(),
             created_at: 0,
         }
     }
@@ -265,7 +272,11 @@ mod tests {
         let line = format!("SUMMARY:{}", "x".repeat(200));
         let folded = fold(&line);
         for physical in folded.split("\r\n") {
-            assert!(physical.len() <= 75, "physical line <=75 octets: {}", physical.len());
+            assert!(
+                physical.len() <= 75,
+                "physical line <=75 octets: {}",
+                physical.len()
+            );
         }
         // Unfolding (drop CRLF + leading space) restores the original.
         let restored = folded.replace("\r\n ", "");
@@ -291,7 +302,10 @@ mod tests {
         assert!(ics.contains("UID:evt123@cal.w33d.xyz"));
         assert!(ics.contains("DTSTAMP:"));
         // 14:30 UTC + 8h offset => 22:30 local wall clock, TZID-qualified.
-        assert!(ics.contains("DTSTART;TZID=UTC+0800:20260615T223000"), "local DTSTART: {ics}");
+        assert!(
+            ics.contains("DTSTART;TZID=UTC+0800:20260615T223000"),
+            "local DTSTART: {ics}"
+        );
         assert!(ics.contains("DTEND;TZID=UTC+0800:20260615T233000"));
         // Escaping in SUMMARY/LOCATION/DESCRIPTION.
         assert!(ics.contains("LOCATION:War\\, room"));
@@ -306,10 +320,18 @@ mod tests {
     fn timed_rrule_until_becomes_utc_datetime() {
         let off = 480; // UTC+08:00
         let now = 0;
-        let ics = event_ics(&timed_event("R", "FREQ=WEEKLY;COUNT=3;UNTIL=20260630"), off, now, "h");
+        let ics = event_ics(
+            &timed_event("R", "FREQ=WEEKLY;COUNT=3;UNTIL=20260630"),
+            off,
+            now,
+            "h",
+        );
         // COUNT passes through; UNTIL date -> UTC instant of local end-of-day.
         // Local 2026-06-30 end-of-day (23:59:59) in UTC+8 == 2026-06-30 15:59:59 UTC.
-        assert!(ics.contains("RRULE:FREQ=WEEKLY;COUNT=3;UNTIL=20260630T155959Z"), "{ics}");
+        assert!(
+            ics.contains("RRULE:FREQ=WEEKLY;COUNT=3;UNTIL=20260630T155959Z"),
+            "{ics}"
+        );
     }
 
     #[test]

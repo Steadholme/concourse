@@ -12,6 +12,7 @@ pub mod dashboard;
 pub mod dms;
 pub mod health;
 pub mod rooms;
+pub mod search;
 pub mod ws;
 
 use serde_json::json;

@@ -33,22 +33,27 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
     // First-visit: provision + join the lobby so the dashboard is never empty.
     ensure_lobby(&state, &sub, &email).await;
 
+    // Moderation affordances (edit topic, pin) are gated to admins/mods — the same gate the
+    // endpoints enforce; the flag only controls whether the UI OFFERS the controls.
+    let is_mod = auth::is_admin(&headers);
+
     let rooms = state.store.list_user_rooms(&sub).await;
     let selected = rooms
         .first()
         .map(|r| r.room.id.clone())
         .unwrap_or_else(|| LOBBY_ID.to_string());
-    let selected_name = rooms
-        .iter()
-        .find(|r| r.room.id == selected)
+    let selected_room = rooms.iter().find(|r| r.room.id == selected);
+    let selected_name = selected_room
         .map(|r| r.room.name.clone())
         .unwrap_or_else(|| selected.clone());
+    let selected_topic = selected_room.map(|r| r.room.topic.clone()).unwrap_or_default();
 
     let messages = state
         .store
         .list_messages(&selected, None, MESSAGE_PAGE_LIMIT)
         .await;
-    let timeline = render_timeline(&state, &sub, &messages).await;
+    let timeline = render_timeline(&state, &sub, &messages, is_mod).await;
+    let pinned = state.store.list_pinned(&selected).await;
 
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
@@ -57,10 +62,13 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
         .replace("{{TOPBAR}}", &topbar("Chat", &email))
         .replace("{{ROOMS}}", &render_room_list(&rooms, &selected))
         .replace("{{ROOM_TITLE}}", &esc(&selected_name))
+        .replace("{{TOPIC}}", &esc(&selected_topic))
+        .replace("{{PINNED}}", &render_pinned(&pinned, is_mod))
         .replace("{{MESSAGES}}", &timeline)
         .replace("{{CSRF}}", &esc(&csrf))
         .replace("{{ME}}", &esc(&email))
         .replace("{{SELECTED}}", &esc(&selected))
+        .replace("{{IS_MOD}}", if is_mod { "true" } else { "false" })
         // {{JS}} is applied last so a stray `{{...}}` token inside the script can never be
         // mistaken for a template slot.
         .replace("{{JS}}", APP_JS);
@@ -68,30 +76,58 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
     html_with_cookie(page, set_cookie)
 }
 
-/// Render the sidebar room list, marking the selected room active.
+/// Render the sidebar room list, marking the selected room active. Each room carries an unread
+/// badge (count of messages past the read cursor not authored by the caller) and a mention dot when
+/// the caller has an unread @mention there. Both are `data-*`-backed so the live client can update
+/// them in place. The selected room renders with a cleared badge (opening a room marks it read).
 fn render_room_list(rooms: &[UserRoom], selected: &str) -> String {
     if rooms.is_empty() {
         return r#"<li class="room-list__empty">No rooms yet</li>"#.to_string();
     }
     let mut out = String::new();
     for r in rooms {
-        let active = if r.room.id == selected { " is-active" } else { "" };
+        let is_selected = r.room.id == selected;
+        let active = if is_selected { " is-active" } else { "" };
+        // The open room is read: never show a badge on it even if the stored cursor lags.
+        let unread = if is_selected { 0 } else { r.unread.max(0) };
+        let mentioned = !is_selected && r.mentioned;
         out.push_str(&format!(
-            r#"<li class="room{active}" data-room-id="{id}" data-room-name="{name}">
+            r#"<li class="room{active}" data-room-id="{id}" data-room-name="{name}" data-room-topic="{topic}">
   <button class="room__btn" type="button">{name}</button>
+  {badge}
 </li>"#,
             active = active,
             id = esc(&r.room.id),
             name = esc(&r.room.name),
+            topic = esc(&r.room.topic),
+            badge = room_badge_html(unread, mentioned),
         ));
     }
     out
 }
 
+/// The unread badge for a room-list row: a mention dot (when the caller has an unread @mention) and
+/// an unread count pill. Hidden (but present in the DOM) when there is nothing unread, so the live
+/// client can reveal/update it without rebuilding the row.
+fn room_badge_html(unread: i64, mentioned: bool) -> String {
+    let dot = if mentioned {
+        r#"<span class="room__mention" title="You were mentioned" aria-label="You were mentioned"></span>"#
+    } else {
+        ""
+    };
+    let hidden = if unread > 0 { "" } else { " hidden" };
+    format!(
+        r#"<span class="room__badge">{dot}<span class="room__unread"{hidden}>{count}</span></span>"#,
+        dot = dot,
+        hidden = hidden,
+        count = unread,
+    )
+}
+
 /// Render the timeline (oldest-first). The store returns newest-first, so we reverse for reading.
 /// Each row is enriched with its threaded-reply context (quoted parent + reply count) and its
 /// reaction tallies (with the caller's own reactions highlighted) — all fetched from the store.
-async fn render_timeline(state: &AppState, sub: &str, messages: &[Message]) -> String {
+async fn render_timeline(state: &AppState, sub: &str, messages: &[Message], is_mod: bool) -> String {
     if messages.is_empty() {
         return r#"<div class="timeline__empty">No messages yet — say hello.</div>"#.to_string();
     }
@@ -111,6 +147,7 @@ async fn render_timeline(state: &AppState, sub: &str, messages: &[Message]) -> S
             reply_count,
             &reactions,
             &mine,
+            is_mod,
         ));
     }
     out
@@ -165,10 +202,11 @@ fn render_message_row(
     reply_count: i64,
     reactions: &[ReactionCount],
     mine: &[String],
+    is_mod: bool,
 ) -> String {
     format!(
         r#"<div class="msg" data-id="{id}" data-author="{author}">
-  {quote}<div class="msg__head"><span class="msg__author">{author}</span><span class="msg__time">{time}</span>{edited}{replies}<span class="msg__tools"><button type="button" class="msg__tool" data-act="react">React</button><button type="button" class="msg__tool" data-act="reply">Reply</button></span></div>
+  {quote}<div class="msg__head"><span class="msg__author">{author}</span><span class="msg__time">{time}</span>{edited}{replies}<span class="msg__tools"><button type="button" class="msg__tool" data-act="react">React</button><button type="button" class="msg__tool" data-act="reply">Reply</button>{pin_tool}</span></div>
   <div class="msg__body">{body}</div>
   {reactions}
 </div>"#,
@@ -180,6 +218,61 @@ fn render_message_row(
         quote = quote_html(parent),
         body = message_body_html(m),
         reactions = reactions_html(reactions, mine),
+        pin_tool = if is_mod {
+            r#"<button type="button" class="msg__tool" data-act="pin">Pin</button>"#
+        } else {
+            ""
+        },
+    )
+}
+
+/// Render the pinned-message panel body: one row per pinned message (author + escaped snippet), an
+/// "Unpin" control for mods, and a jump link back to the message. Empty state when none are pinned.
+fn render_pinned(messages: &[Message], is_mod: bool) -> String {
+    if messages.is_empty() {
+        return r#"<div class="pinned-panel__empty">No pinned messages.</div>"#.to_string();
+    }
+    let mut out = String::new();
+    for m in messages {
+        out.push_str(&pinned_item_html(m, is_mod));
+    }
+    out
+}
+
+/// One pinned-panel row. The body is shown as an escaped one-line snippet (never live markup); a
+/// deleted/redacted pinned message shows its tombstone.
+fn pinned_item_html(m: &Message, is_mod: bool) -> String {
+    let snippet = if m.deleted {
+        if m.body.is_empty() {
+            "[deleted]".to_string()
+        } else {
+            m.body.clone()
+        }
+    } else {
+        m.body.clone()
+    };
+    let mut oneline: String = snippet.chars().take(140).collect();
+    if snippet.chars().count() > 140 {
+        oneline.push('…');
+    }
+    let oneline = oneline.replace(['\n', '\r'], " ");
+    let unpin = if is_mod {
+        format!(
+            r#"<button type="button" class="pinned-item__unpin" data-unpin="{id}">Unpin</button>"#,
+            id = esc(&m.id),
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<div class="pinned-item" data-jump-id="{id}">
+  <button type="button" class="pinned-item__jump"><span class="pinned-item__author">{author}</span><span class="pinned-item__body">{body}</span></button>
+  {unpin}
+</div>"#,
+        id = esc(&m.id),
+        author = esc(&m.sender_email),
+        body = esc(&oneline),
+        unpin = unpin,
     )
 }
 

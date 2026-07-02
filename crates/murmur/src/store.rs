@@ -31,6 +31,10 @@ pub struct Room {
     /// but its row/history is retained. Distinct from a hard `delete_room`.
     #[serde(default)]
     pub archived: bool,
+    /// Free-text room topic / description / purpose shown in the room header. Empty by default;
+    /// editable by room admins/mods. Stored as PLAIN TEXT and escaped by every render layer.
+    #[serde(default)]
+    pub topic: String,
 }
 
 /// A room member as surfaced to the admin membership panel (one `memberships` row).
@@ -52,12 +56,31 @@ pub struct Person {
     pub user_email: String,
 }
 
-/// A room the requesting user is a member of, with that membership's read cursor.
+/// A room the requesting user is a member of, with that membership's read cursor plus the derived
+/// unread state that drives the room-list badge.
 #[derive(Clone, Debug, Serialize)]
 pub struct UserRoom {
     #[serde(flatten)]
     pub room: Room,
     pub last_read_at: i64,
+    /// Count of messages in the room newer than `last_read_at` and NOT authored by the requesting
+    /// user (own posts never mark a room unread). Drives the unread count badge.
+    #[serde(default)]
+    pub unread: i64,
+    /// Whether the requesting user has an unread @mention in this room (a mention on a message
+    /// newer than `last_read_at`). Drives the mention dot on the room-list badge.
+    #[serde(default)]
+    pub mentioned: bool,
+}
+
+/// A message matched by search / carrying an @mention, tagged with its room's display name so the
+/// result can link back to the room. Flattens the full [`Message`] (which already carries `room_id`).
+#[derive(Clone, Debug, Serialize)]
+pub struct MessageHit {
+    /// The display name of the room the matched message lives in (escaped by the render layer).
+    pub room_name: String,
+    #[serde(flatten)]
+    pub message: Message,
 }
 
 /// A chat message (maps 1:1 to a `messages` row).
@@ -178,6 +201,60 @@ pub trait Store: Send + Sync {
     /// Redact ANY message (admin overrides ownership): soft-delete it and replace the body with
     /// the fixed [`crate::config::REDACTED_BODY`] tombstone. No-op on a missing message. Idempotent.
     async fn redact_message(&self, id: &str) -> Result<(), StoreError>;
+
+    // --- room topic --------------------------------------------------------
+    /// Set a room's free-text topic (idempotent overwrite). No-op on a missing room.
+    async fn set_room_topic(&self, room_id: &str, topic: &str) -> Result<(), StoreError>;
+
+    // --- pinned messages ---------------------------------------------------
+    /// Pin `message_id` in `room_id` (idempotent per `(room, message)`). Records who pinned it and
+    /// when.
+    async fn pin_message(
+        &self,
+        room_id: &str,
+        message_id: &str,
+        pinned_by: &str,
+        pinned_at: i64,
+    ) -> Result<(), StoreError>;
+    /// Unpin `message_id` from `room_id`. No-op when it was not pinned. Idempotent.
+    async fn unpin_message(&self, room_id: &str, message_id: &str) -> Result<(), StoreError>;
+    /// The pinned messages of a room, most-recently-pinned first. Capped at
+    /// [`crate::config::PINNED_LIMIT`].
+    async fn list_pinned(&self, room_id: &str) -> Vec<Message>;
+    /// Whether `message_id` is currently pinned in `room_id`.
+    async fn is_pinned(&self, room_id: &str, message_id: &str) -> bool;
+
+    // --- search ------------------------------------------------------------
+    /// Full-body substring search (case-insensitive) across ONLY the rooms `user_sub` is a
+    /// non-banned member of — never leaks a non-member room's content. `query_lower` is the
+    /// already-lowercased needle; deleted messages are excluded. NEWEST-first, keyset-paginated by
+    /// `before` (messages strictly older than that `created_at`). Capped at `limit`.
+    async fn search_user_messages(
+        &self,
+        user_sub: &str,
+        query_lower: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Vec<MessageHit>;
+
+    // --- @mentions ---------------------------------------------------------
+    /// Record that `mentioned_sub` was @mentioned by `message_id` in `room_id`. Idempotent per
+    /// `(message, mentioned_sub)`.
+    async fn add_mention(
+        &self,
+        message_id: &str,
+        room_id: &str,
+        mentioned_sub: &str,
+        created_at: i64,
+    ) -> Result<(), StoreError>;
+    /// The messages that @mention `user_sub`, across every room (the global "mentions" view).
+    /// Deleted messages are excluded. NEWEST-first, keyset-paginated by `before`. Capped at `limit`.
+    async fn list_user_mentions(
+        &self,
+        user_sub: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Vec<MessageHit>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -190,6 +267,8 @@ pub struct InMemoryStore {
     memberships: Mutex<Vec<MembershipRow>>,
     messages: Mutex<Vec<Message>>,
     reactions: Mutex<Vec<ReactionRow>>,
+    pinned: Mutex<Vec<PinnedRow>>,
+    mentions: Mutex<Vec<MentionRow>>,
 }
 
 /// In-memory reaction row (the PK is the whole `(message_id, user_sub, emoji)` triple).
@@ -198,6 +277,25 @@ struct ReactionRow {
     message_id: String,
     user_sub: String,
     emoji: String,
+}
+
+/// In-memory pinned-message row (the PK is `(room_id, message_id)`).
+#[derive(Clone, Debug)]
+struct PinnedRow {
+    room_id: String,
+    message_id: String,
+    #[allow(dead_code)]
+    pinned_by: String,
+    pinned_at: i64,
+}
+
+/// In-memory @mention row (the PK is `(message_id, mentioned_sub)`).
+#[derive(Clone, Debug)]
+struct MentionRow {
+    message_id: String,
+    room_id: String,
+    mentioned_sub: String,
+    created_at: i64,
 }
 
 /// In-memory membership row (the PK is `(room_id, user_sub)`).
@@ -242,6 +340,8 @@ impl Store for InMemoryStore {
     async fn list_user_rooms(&self, user_sub: &str) -> Vec<UserRoom> {
         let memberships = self.memberships.lock().expect("memberships lock poisoned");
         let rooms = self.rooms.lock().expect("rooms lock poisoned");
+        let messages = self.messages.lock().expect("messages lock poisoned");
+        let mentions = self.mentions.lock().expect("mentions lock poisoned");
         let mut out: Vec<UserRoom> = memberships
             .iter()
             // A banned membership is inert — the room disappears from that user's list.
@@ -251,9 +351,29 @@ impl Store for InMemoryStore {
                 rooms
                     .iter()
                     .find(|r| r.id == m.room_id && !r.archived)
-                    .map(|r| UserRoom {
-                        room: r.clone(),
-                        last_read_at: m.last_read_at,
+                    .map(|r| {
+                        // Unread = messages newer than the read cursor NOT authored by this user.
+                        let unread = messages
+                            .iter()
+                            .filter(|msg| {
+                                msg.room_id == r.id
+                                    && msg.created_at > m.last_read_at
+                                    && msg.sender_sub != user_sub
+                                    && !msg.deleted
+                            })
+                            .count() as i64;
+                        // Mentioned = an @mention of this user on a message newer than the cursor.
+                        let mentioned = mentions.iter().any(|mn| {
+                            mn.room_id == r.id
+                                && mn.mentioned_sub == user_sub
+                                && mn.created_at > m.last_read_at
+                        });
+                        UserRoom {
+                            room: r.clone(),
+                            last_read_at: m.last_read_at,
+                            unread,
+                            mentioned,
+                        }
                     })
             })
             .collect();
@@ -511,6 +631,15 @@ impl Store for InMemoryStore {
             .lock()
             .expect("reactions lock poisoned")
             .retain(|r| !doomed.contains(&r.message_id));
+        // Purge pins + mentions for the room (both keyed by room / the room's messages).
+        self.pinned
+            .lock()
+            .expect("pinned lock poisoned")
+            .retain(|p| p.room_id != room_id);
+        self.mentions
+            .lock()
+            .expect("mentions lock poisoned")
+            .retain(|mn| mn.room_id != room_id);
         Ok(())
     }
 
@@ -562,6 +691,165 @@ impl Store for InMemoryStore {
             m.body = crate::config::REDACTED_BODY.to_string();
         }
         Ok(())
+    }
+
+    async fn set_room_topic(&self, room_id: &str, topic: &str) -> Result<(), StoreError> {
+        let mut rooms = self.rooms.lock().expect("rooms lock poisoned");
+        if let Some(r) = rooms.iter_mut().find(|r| r.id == room_id) {
+            r.topic = topic.to_string();
+        }
+        Ok(())
+    }
+
+    async fn pin_message(
+        &self,
+        room_id: &str,
+        message_id: &str,
+        pinned_by: &str,
+        pinned_at: i64,
+    ) -> Result<(), StoreError> {
+        let mut pinned = self.pinned.lock().expect("pinned lock poisoned");
+        if !pinned
+            .iter()
+            .any(|p| p.room_id == room_id && p.message_id == message_id)
+        {
+            pinned.push(PinnedRow {
+                room_id: room_id.to_string(),
+                message_id: message_id.to_string(),
+                pinned_by: pinned_by.to_string(),
+                pinned_at,
+            });
+        }
+        Ok(())
+    }
+
+    async fn unpin_message(&self, room_id: &str, message_id: &str) -> Result<(), StoreError> {
+        self.pinned
+            .lock()
+            .expect("pinned lock poisoned")
+            .retain(|p| !(p.room_id == room_id && p.message_id == message_id));
+        Ok(())
+    }
+
+    async fn list_pinned(&self, room_id: &str) -> Vec<Message> {
+        let pinned = self.pinned.lock().expect("pinned lock poisoned");
+        let messages = self.messages.lock().expect("messages lock poisoned");
+        // Most-recently-pinned first, ties broken by message id for stability.
+        let mut rows: Vec<&PinnedRow> = pinned.iter().filter(|p| p.room_id == room_id).collect();
+        rows.sort_by(|a, b| {
+            b.pinned_at
+                .cmp(&a.pinned_at)
+                .then_with(|| b.message_id.cmp(&a.message_id))
+        });
+        rows.into_iter()
+            .filter_map(|p| messages.iter().find(|m| m.id == p.message_id).cloned())
+            .take(crate::config::PINNED_LIMIT as usize)
+            .collect()
+    }
+
+    async fn is_pinned(&self, room_id: &str, message_id: &str) -> bool {
+        self.pinned
+            .lock()
+            .expect("pinned lock poisoned")
+            .iter()
+            .any(|p| p.room_id == room_id && p.message_id == message_id)
+    }
+
+    async fn search_user_messages(
+        &self,
+        user_sub: &str,
+        query_lower: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Vec<MessageHit> {
+        let memberships = self.memberships.lock().expect("memberships lock poisoned");
+        let rooms = self.rooms.lock().expect("rooms lock poisoned");
+        let messages = self.messages.lock().expect("messages lock poisoned");
+        // The rooms this user can see (member + not banned) — the ONLY rooms search may touch.
+        let member_rooms: Vec<&str> = memberships
+            .iter()
+            .filter(|m| m.user_sub == user_sub && !m.banned)
+            .map(|m| m.room_id.as_str())
+            .collect();
+        let mut hits: Vec<&Message> = messages
+            .iter()
+            .filter(|m| member_rooms.contains(&m.room_id.as_str()))
+            .filter(|m| !m.deleted)
+            .filter(|m| before.is_none_or(|b| m.created_at < b))
+            .filter(|m| m.body.to_lowercase().contains(query_lower))
+            .collect();
+        hits.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        hits.truncate(limit.max(0) as usize);
+        hits.into_iter()
+            .map(|m| MessageHit {
+                room_name: rooms
+                    .iter()
+                    .find(|r| r.id == m.room_id)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default(),
+                message: m.clone(),
+            })
+            .collect()
+    }
+
+    async fn add_mention(
+        &self,
+        message_id: &str,
+        room_id: &str,
+        mentioned_sub: &str,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        let mut mentions = self.mentions.lock().expect("mentions lock poisoned");
+        if !mentions
+            .iter()
+            .any(|mn| mn.message_id == message_id && mn.mentioned_sub == mentioned_sub)
+        {
+            mentions.push(MentionRow {
+                message_id: message_id.to_string(),
+                room_id: room_id.to_string(),
+                mentioned_sub: mentioned_sub.to_string(),
+                created_at,
+            });
+        }
+        Ok(())
+    }
+
+    async fn list_user_mentions(
+        &self,
+        user_sub: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Vec<MessageHit> {
+        let mentions = self.mentions.lock().expect("mentions lock poisoned");
+        let messages = self.messages.lock().expect("messages lock poisoned");
+        let rooms = self.rooms.lock().expect("rooms lock poisoned");
+        let mut hits: Vec<&Message> = mentions
+            .iter()
+            .filter(|mn| mn.mentioned_sub == user_sub)
+            .filter_map(|mn| messages.iter().find(|m| m.id == mn.message_id))
+            .filter(|m| !m.deleted)
+            .filter(|m| before.is_none_or(|b| m.created_at < b))
+            .collect();
+        hits.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        hits.truncate(limit.max(0) as usize);
+        hits.into_iter()
+            .map(|m| MessageHit {
+                room_name: rooms
+                    .iter()
+                    .find(|r| r.id == m.room_id)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default(),
+                message: m.clone(),
+            })
+            .collect()
     }
 }
 
@@ -684,6 +972,41 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
 
+        // Room topic / description / purpose. Added idempotently so an existing `rooms` table
+        // upgrades in place (portable ALTER — the default backfills old rows).
+        sqlx::query("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS topic TEXT NOT NULL DEFAULT ''")
+            .execute(&self.pool)
+            .await?;
+
+        // Pinned messages: one row per (room, message). The composite PRIMARY KEY IS the
+        // idempotency guard, so a repeat pin is a no-op via ON CONFLICT.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pinned_messages (\
+                 room_id TEXT NOT NULL, \
+                 message_id TEXT NOT NULL, \
+                 pinned_by TEXT NOT NULL DEFAULT '', \
+                 pinned_at BIGINT NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (room_id, message_id)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // @mentions: one row per (message, mentioned user). `room_id` + `created_at` are copied off
+        // the message so the room-list mention indicator + global mentions view scan without a join
+        // to `messages`. The composite PRIMARY KEY guards idempotency.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mentions (\
+                 message_id TEXT NOT NULL, \
+                 room_id TEXT NOT NULL, \
+                 mentioned_sub TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (message_id, mentioned_sub)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Backs the per-room newest-first timeline scan + keyset pagination.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_messages_room_created \
@@ -710,6 +1033,18 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Backs the per-room pinned panel lookup.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pinned_room ON pinned_messages (room_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Backs the global mentions view + the per-room mention indicator.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mentions_user ON mentions (mentioned_sub)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -721,6 +1056,7 @@ impl PgStore {
             created_by: row.try_get("created_by")?,
             created_at: row.try_get("created_at")?,
             archived: row.try_get("archived")?,
+            topic: row.try_get("topic")?,
         })
     }
 
@@ -747,10 +1083,18 @@ impl PgStore {
         })
     }
 
+    /// Build a [`MessageHit`] from a joined row: the message columns plus the `room_name` alias.
+    fn message_hit_from_row(row: &sqlx::postgres::PgRow) -> Result<MessageHit, sqlx::Error> {
+        Ok(MessageHit {
+            room_name: row.try_get("room_name")?,
+            message: Self::message_from_row(row)?,
+        })
+    }
+
     async fn ensure_room_async(&self, room: &Room) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO rooms (id, name, kind, created_by, created_at, archived) \
-             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO rooms (id, name, kind, created_by, created_at, archived, topic) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING",
         )
         .bind(&room.id)
         .bind(&room.name)
@@ -758,6 +1102,7 @@ impl PgStore {
         .bind(&room.created_by)
         .bind(room.created_at)
         .bind(room.archived)
+        .bind(&room.topic)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -765,7 +1110,7 @@ impl PgStore {
 
     async fn get_room_async(&self, id: &str) -> Result<Option<Room>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, name, kind, created_by, created_at, archived FROM rooms WHERE id = $1",
+            "SELECT id, name, kind, created_by, created_at, archived, topic FROM rooms WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -777,8 +1122,18 @@ impl PgStore {
     }
 
     async fn list_user_rooms_async(&self, user_sub: &str) -> Result<Vec<UserRoom>, sqlx::Error> {
+        // Two correlated subqueries derive the unread state per row: `unread` counts messages newer
+        // than the read cursor that this user did NOT author; `mention_unread` counts unread
+        // @mentions of this user. Both stay standard SQL (no window functions / lateral joins).
         let rows = sqlx::query(
-            "SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.archived, m.last_read_at \
+            "SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.archived, r.topic, \
+             m.last_read_at, \
+             (SELECT COUNT(*) FROM messages msg WHERE msg.room_id = r.id \
+                AND msg.created_at > m.last_read_at AND msg.sender_sub <> $1 \
+                AND msg.deleted = FALSE) AS unread, \
+             (SELECT COUNT(*) FROM mentions mn JOIN messages mm ON mm.id = mn.message_id \
+                WHERE mn.room_id = r.id AND mn.mentioned_sub = $1 \
+                AND mm.created_at > m.last_read_at AND mm.deleted = FALSE) AS mention_unread \
              FROM rooms r JOIN memberships m ON m.room_id = r.id \
              WHERE m.user_sub = $1 AND m.banned = FALSE AND r.archived = FALSE \
              ORDER BY r.created_at ASC, r.id ASC LIMIT $2",
@@ -789,9 +1144,12 @@ impl PgStore {
         .await?;
         rows.iter()
             .map(|r| {
+                let mention_unread: i64 = r.try_get("mention_unread")?;
                 Ok(UserRoom {
                     room: Self::room_from_row(r)?,
                     last_read_at: r.try_get("last_read_at")?,
+                    unread: r.try_get("unread")?,
+                    mentioned: mention_unread > 0,
                 })
             })
             .collect()
@@ -1040,7 +1398,7 @@ impl PgStore {
 
     async fn list_all_rooms_async(&self) -> Result<Vec<Room>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT id, name, kind, created_by, created_at, archived FROM rooms \
+            "SELECT id, name, kind, created_by, created_at, archived, topic FROM rooms \
              ORDER BY created_at DESC, id DESC",
         )
         .fetch_all(&self.pool)
@@ -1072,6 +1430,14 @@ impl PgStore {
         .bind(room_id)
         .execute(&self.pool)
         .await?;
+        sqlx::query("DELETE FROM pinned_messages WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM mentions WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM messages WHERE room_id = $1")
             .bind(room_id)
             .execute(&self.pool)
@@ -1129,6 +1495,167 @@ impl PgStore {
             .await?;
         Ok(())
     }
+
+    async fn set_room_topic_async(&self, room_id: &str, topic: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE rooms SET topic = $1 WHERE id = $2")
+            .bind(topic)
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn pin_message_async(
+        &self,
+        room_id: &str,
+        message_id: &str,
+        pinned_by: &str,
+        pinned_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO pinned_messages (room_id, message_id, pinned_by, pinned_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (room_id, message_id) DO NOTHING",
+        )
+        .bind(room_id)
+        .bind(message_id)
+        .bind(pinned_by)
+        .bind(pinned_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn unpin_message_async(
+        &self,
+        room_id: &str,
+        message_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM pinned_messages WHERE room_id = $1 AND message_id = $2")
+            .bind(room_id)
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_pinned_async(&self, room_id: &str) -> Result<Vec<Message>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT m.id, m.room_id, m.sender_sub, m.sender_email, m.body, m.created_at, \
+             m.edited_at, m.deleted, m.reply_to_id \
+             FROM pinned_messages p JOIN messages m ON m.id = p.message_id \
+             WHERE p.room_id = $1 \
+             ORDER BY p.pinned_at DESC, m.id DESC LIMIT $2",
+        )
+        .bind(room_id)
+        .bind(crate::config::PINNED_LIMIT)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::message_from_row).collect()
+    }
+
+    async fn is_pinned_async(
+        &self,
+        room_id: &str,
+        message_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT 1 AS one FROM pinned_messages WHERE room_id = $1 AND message_id = $2",
+        )
+        .bind(room_id)
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    async fn search_user_messages_async(
+        &self,
+        user_sub: &str,
+        query_lower: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<MessageHit>, sqlx::Error> {
+        // Membership JOIN is the scope guard: a message only surfaces when the caller is a
+        // non-banned member of its room — a non-member room can NEVER leak. LIKE wildcards in the
+        // needle are escaped so the query is a pure case-insensitive substring match.
+        let needle = format!("%{}%", like_escape(query_lower));
+        let cursor = before.unwrap_or(i64::MAX);
+        let rows = sqlx::query(
+            "SELECT m.id, m.room_id, m.sender_sub, m.sender_email, m.body, m.created_at, \
+             m.edited_at, m.deleted, m.reply_to_id, r.name AS room_name \
+             FROM messages m \
+             JOIN memberships mem ON mem.room_id = m.room_id \
+                AND mem.user_sub = $1 AND mem.banned = FALSE \
+             JOIN rooms r ON r.id = m.room_id \
+             WHERE m.deleted = FALSE AND LOWER(m.body) LIKE $2 ESCAPE '\\' \
+             AND m.created_at < $3 \
+             ORDER BY m.created_at DESC, m.id DESC LIMIT $4",
+        )
+        .bind(user_sub)
+        .bind(&needle)
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::message_hit_from_row).collect()
+    }
+
+    async fn add_mention_async(
+        &self,
+        message_id: &str,
+        room_id: &str,
+        mentioned_sub: &str,
+        created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO mentions (message_id, room_id, mentioned_sub, created_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (message_id, mentioned_sub) DO NOTHING",
+        )
+        .bind(message_id)
+        .bind(room_id)
+        .bind(mentioned_sub)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_user_mentions_async(
+        &self,
+        user_sub: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<MessageHit>, sqlx::Error> {
+        let cursor = before.unwrap_or(i64::MAX);
+        let rows = sqlx::query(
+            "SELECT m.id, m.room_id, m.sender_sub, m.sender_email, m.body, m.created_at, \
+             m.edited_at, m.deleted, m.reply_to_id, r.name AS room_name \
+             FROM mentions mn \
+             JOIN messages m ON m.id = mn.message_id \
+             JOIN rooms r ON r.id = mn.room_id \
+             WHERE mn.mentioned_sub = $1 AND m.deleted = FALSE AND m.created_at < $2 \
+             ORDER BY m.created_at DESC, m.id DESC LIMIT $3",
+        )
+        .bind(user_sub)
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::message_hit_from_row).collect()
+    }
+}
+
+/// Escape LIKE metacharacters (`\`, `%`, `_`) in a search needle so they match literally under an
+/// `ESCAPE '\'` clause.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[async_trait]
@@ -1310,5 +1837,86 @@ impl Store for PgStore {
         self.redact_message_async(id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn set_room_topic(&self, room_id: &str, topic: &str) -> Result<(), StoreError> {
+        self.set_room_topic_async(room_id, topic)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn pin_message(
+        &self,
+        room_id: &str,
+        message_id: &str,
+        pinned_by: &str,
+        pinned_at: i64,
+    ) -> Result<(), StoreError> {
+        self.pin_message_async(room_id, message_id, pinned_by, pinned_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn unpin_message(&self, room_id: &str, message_id: &str) -> Result<(), StoreError> {
+        self.unpin_message_async(room_id, message_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_pinned(&self, room_id: &str) -> Vec<Message> {
+        self.list_pinned_async(room_id).await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "pg list_pinned failed");
+            Vec::new()
+        })
+    }
+
+    async fn is_pinned(&self, room_id: &str, message_id: &str) -> bool {
+        self.is_pinned_async(room_id, message_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg is_pinned failed");
+                false
+            })
+    }
+
+    async fn search_user_messages(
+        &self,
+        user_sub: &str,
+        query_lower: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Vec<MessageHit> {
+        self.search_user_messages_async(user_sub, query_lower, before, limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg search_user_messages failed");
+                Vec::new()
+            })
+    }
+
+    async fn add_mention(
+        &self,
+        message_id: &str,
+        room_id: &str,
+        mentioned_sub: &str,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        self.add_mention_async(message_id, room_id, mentioned_sub, created_at)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_user_mentions(
+        &self,
+        user_sub: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Vec<MessageHit> {
+        self.list_user_mentions_async(user_sub, before, limit)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_user_mentions failed");
+                Vec::new()
+            })
     }
 }

@@ -17,6 +17,49 @@ pub fn esc(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+/// Parse the distinct `@username` mentions out of a message body.
+///
+/// A mention is an `@` that begins a token — i.e. `@` at the START of the body or immediately
+/// after a NON-alphanumeric, non-(`.`/`_`/`-`/`@`) character — followed by a run of
+/// `[A-Za-z0-9._-]`. Requiring the preceding character to be a boundary means an email like
+/// `alice@example.com` never yields a bogus `@example` mention (the `@` there is preceded by the
+/// alphanumeric `e`). Tokens are lowercased and de-duplicated, preserving first-seen order.
+pub fn parse_mentions(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '@' {
+            // The char before the '@' must be a token boundary (start-of-body counts).
+            let boundary = match i.checked_sub(1).map(|p| chars[p]) {
+                None => true,
+                Some(prev) => !is_mention_char(prev) && prev != '@',
+            };
+            if boundary {
+                let mut j = i + 1;
+                while j < chars.len() && is_mention_char(chars[j]) {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    let token: String = chars[i + 1..j].iter().collect::<String>().to_lowercase();
+                    if !out.contains(&token) {
+                        out.push(token);
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Characters permitted inside an `@mention` token (matches a username / email local-part shape).
+fn is_mention_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
 /// Render a message body to SAFE HTML: escape everything, then turn bare http/https URLs into
 /// links. Newlines become `<br>`. The result is safe to interpolate directly into the page.
 pub fn render_body(body: &str) -> String {
@@ -166,5 +209,28 @@ mod tests {
         let r = render_body("你好 https://例え.test world");
         assert!(r.contains("你好"));
         assert!(r.contains("world"));
+    }
+
+    #[test]
+    fn parses_at_mentions_distinct_and_lowercased() {
+        let m = parse_mentions("hi @alice and @Bob_1, cc @alice again");
+        assert_eq!(m, vec!["alice".to_string(), "bob_1".to_string()]);
+    }
+
+    #[test]
+    fn mention_at_start_of_body() {
+        assert_eq!(parse_mentions("@carol ping"), vec!["carol".to_string()]);
+    }
+
+    #[test]
+    fn email_is_not_a_mention() {
+        // The '@' in an email is preceded by an alphanumeric, so it is NOT a mention boundary.
+        assert!(parse_mentions("mail bob@example.com now").is_empty());
+    }
+
+    #[test]
+    fn bare_at_and_double_at_are_not_mentions() {
+        assert!(parse_mentions("look @ this").is_empty());
+        assert!(parse_mentions("email me @@ home").is_empty());
     }
 }

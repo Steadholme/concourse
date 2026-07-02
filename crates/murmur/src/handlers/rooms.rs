@@ -14,10 +14,13 @@ use serde_json::json;
 
 use crate::audit::AuditEvent;
 use crate::auth;
-use crate::config::{MAX_BODY_CHARS, MAX_EMOJI_CHARS, MAX_ROOM_NAME_CHARS, MESSAGE_PAGE_LIMIT};
+use crate::config::{
+    MAX_BODY_CHARS, MAX_EMOJI_CHARS, MAX_ROOM_NAME_CHARS, MAX_TOPIC_CHARS, MESSAGE_PAGE_LIMIT,
+};
 use crate::error::AppError;
 use crate::handlers::{message_frame, reaction_frame};
 use crate::store::{Message, Room};
+use crate::text::parse_mentions;
 use crate::{ensure_lobby, now_nanos, now_secs, AppState};
 
 /// Body for `POST /api/rooms`.
@@ -51,6 +54,13 @@ pub struct ReactReq {
 pub struct EditReq {
     #[serde(default)]
     pub body: String,
+}
+
+/// Body for `POST /api/rooms/{id}/topic` — the new room topic (empty clears it).
+#[derive(Debug, Deserialize)]
+pub struct SetTopicReq {
+    #[serde(default)]
+    pub topic: String,
 }
 
 /// Query for `GET /api/rooms/{id}/messages` — keyset cursor (messages strictly older than this).
@@ -105,6 +115,7 @@ pub async fn create(
         created_by: sub.clone(),
         created_at: now,
         archived: false,
+        topic: String::new(),
     };
     state.store.ensure_room(&room).await?;
     state
@@ -209,6 +220,11 @@ pub async fn send(
         reply_to_id,
     };
     state.store.create_message(&message).await?;
+
+    // Resolve @mentions in the body to members of THIS room and record one mention per hit. Only
+    // current room members can be mentioned (a mention never reaches a non-member), and the author
+    // never mentions themselves.
+    record_mentions(&state, &message).await;
 
     // Fan out to every WebSocket currently subscribed to this room (single-process; the DB is the
     // source of truth, so a missed live frame is recovered on the next GET).
@@ -405,9 +421,154 @@ pub async fn read(
     Ok(Json(json!({ "room_id": id, "last_read_at": at })).into_response())
 }
 
+/// `POST /api/rooms/{id}/topic` — set the room's topic. Gated to room admins/mods (reuse the
+/// moderation gate); CSRF-checked. The room must exist. Persists + audits + returns the room.
+pub async fn set_topic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetTopicReq>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_user(&headers)?;
+    auth::verify_csrf(&headers)?;
+    // Moderation gate: only admins/mods may edit a room topic (reuses admin_groups()).
+    auth::require_admin(&headers)?;
+
+    let room = state
+        .store
+        .get_room(&id)
+        .await
+        .ok_or_else(|| AppError::NotFound("no such room".to_string()))?;
+
+    let topic = req.topic.trim();
+    if topic.chars().count() > MAX_TOPIC_CHARS {
+        return Err(AppError::InvalidRequest("topic too long".to_string()));
+    }
+    state.store.set_room_topic(&id, topic).await?;
+
+    state.audit.emit(AuditEvent::info(
+        "chat.room.topic",
+        &actor(&email, &sub),
+        &id,
+        &format!("len={}", topic.chars().count()),
+    ));
+    tracing::info!(room_id = %id, "room topic set");
+
+    // Re-read so the response reflects the persisted row exactly.
+    let updated = state.store.get_room(&id).await.unwrap_or(Room {
+        topic: topic.to_string(),
+        ..room
+    });
+    Ok(Json(json!({ "room": updated })).into_response())
+}
+
+/// `POST /api/rooms/{id}/messages/{msg_id}/pin` — pin a message in the room. Gated to mods+
+/// (moderation gate); CSRF-checked; the message must live in this room. Idempotent + audited.
+pub async fn pin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, msg_id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_user(&headers)?;
+    auth::verify_csrf(&headers)?;
+    auth::require_admin(&headers)?;
+
+    // The target must exist AND belong to this room (no cross-room pins).
+    state
+        .store
+        .get_message(&msg_id)
+        .await
+        .filter(|m| m.room_id == id)
+        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
+
+    state
+        .store
+        .pin_message(&id, &msg_id, &sub, now_secs())
+        .await?;
+    let pinned = state.store.list_pinned(&id).await;
+
+    state.audit.emit(AuditEvent::notice(
+        "chat.message.pin",
+        &actor(&email, &sub),
+        &msg_id,
+        "pinned",
+    ));
+    tracing::info!(room_id = %id, %msg_id, "message pinned");
+
+    Ok(Json(json!({ "room_id": id, "pinned": true, "messages": pinned })).into_response())
+}
+
+/// `POST /api/rooms/{id}/messages/{msg_id}/unpin` — unpin a message. Gated to mods+; CSRF-checked.
+/// Idempotent (no-op when it was not pinned) + audited.
+pub async fn unpin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, msg_id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let (sub, email) = auth::require_user(&headers)?;
+    auth::verify_csrf(&headers)?;
+    auth::require_admin(&headers)?;
+
+    state.store.unpin_message(&id, &msg_id).await?;
+    let pinned = state.store.list_pinned(&id).await;
+
+    state.audit.emit(AuditEvent::notice(
+        "chat.message.unpin",
+        &actor(&email, &sub),
+        &msg_id,
+        "unpinned",
+    ));
+    tracing::info!(room_id = %id, %msg_id, "message unpinned");
+
+    Ok(Json(json!({ "room_id": id, "pinned": false, "messages": pinned })).into_response())
+}
+
+/// `GET /api/rooms/{id}/pinned` — the room's pinned-message panel. Membership-gated (a non-member
+/// can never read a room's pinned content), newest-pinned first.
+pub async fn pinned(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let (sub, _email) = auth::require_user(&headers)?;
+    require_membership(&state, &id, &sub).await?;
+    let messages = state.store.list_pinned(&id).await;
+    Ok(Json(json!({ "room_id": id, "messages": messages })).into_response())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve the `@mentions` in `message` against the room's CURRENT members and record one mention
+/// per matched member (never the author themselves). A token matches a member whose email
+/// local-part OR full email equals it (case-insensitive). Best-effort: a store hiccup only warns.
+async fn record_mentions(state: &AppState, message: &Message) {
+    let tokens = parse_mentions(&message.body);
+    if tokens.is_empty() {
+        return;
+    }
+    let members = state.store.list_room_members(&message.room_id).await;
+    for m in members.iter() {
+        if m.banned || m.user_sub == message.sender_sub {
+            continue;
+        }
+        let email = m.user_email.to_lowercase();
+        let local = email.split('@').next().unwrap_or("");
+        let matched = tokens
+            .iter()
+            .any(|t| t == &email || (!local.is_empty() && t == local));
+        if matched {
+            if let Err(e) = state
+                .store
+                .add_mention(&message.id, &message.room_id, &m.user_sub, message.created_at)
+                .await
+            {
+                tracing::warn!(error = %e, "record mention failed");
+            }
+        }
+    }
+}
 
 /// Enforce that `sub` is a member of `room_id`, else `Forbidden` (or `NotFound` for a missing
 /// room). Defense in depth behind the gateway: SSO authenticates, membership authorizes.

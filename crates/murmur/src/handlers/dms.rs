@@ -72,6 +72,7 @@ pub async fn open(
         created_by: sub.clone(),
         created_at: now,
         archived: false,
+        topic: String::new(),
     };
     // Idempotent: `ensure_room` no-ops if the DM already exists (first-creator's row wins).
     state.store.ensure_room(&room).await?;

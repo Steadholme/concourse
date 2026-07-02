@@ -18,15 +18,32 @@
         <button id="new-room" class="btn btn-secondary btn-sm" type="button">New</button>
       </div>
     </div>
+    <form id="search-form" class="sidebar__search" autocomplete="off">
+      <input id="search-input" class="input input-sm" type="search" placeholder="Search messages&hellip;" maxlength="200" aria-label="Search messages">
+      <button id="mentions-btn" class="btn btn-ghost btn-sm" type="button" title="Your mentions" aria-label="Your mentions">@ Mentions</button>
+    </form>
     <ul id="room-list" class="room-list">
       {{ROOMS}}
     </ul>
   </aside>
   <section class="room-view">
     <header class="room-view__head">
-      <h2 id="room-title" class="room-view__title">{{ROOM_TITLE}}</h2>
-      <span id="presence" class="room-view__presence"></span>
+      <div class="room-view__heading">
+        <h2 id="room-title" class="room-view__title">{{ROOM_TITLE}}</h2>
+        <div id="room-topic" class="room-view__topic">{{TOPIC}}</div>
+      </div>
+      <div class="room-view__meta">
+        <button id="topic-edit" class="btn btn-ghost btn-sm" type="button" hidden>Edit topic</button>
+        <button id="pin-toggle" class="btn btn-ghost btn-sm" type="button" aria-expanded="false">Pinned</button>
+        <span id="presence" class="room-view__presence"></span>
+      </div>
     </header>
+    <div id="pinned-panel" class="pinned-panel" hidden>
+      <div class="pinned-panel__head">Pinned messages</div>
+      <div id="pinned-list" class="pinned-panel__list">
+        {{PINNED}}
+      </div>
+    </div>
     <div id="timeline" class="timeline">
       {{MESSAGES}}
     </div>
@@ -41,7 +58,8 @@
   window.MURMUR = {
     csrf: "{{CSRF}}",
     me: "{{ME}}",
-    selected: "{{SELECTED}}"
+    selected: "{{SELECTED}}",
+    isMod: {{IS_MOD}}
   };
 </script>
 <script>{{JS}}</script>

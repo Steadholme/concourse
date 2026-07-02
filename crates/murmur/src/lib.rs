@@ -17,13 +17,19 @@
 //! - `POST /api/rooms`                create a room `{name, kind}` (CSRF)
 //! - `GET  /api/directory`            people the caller can DM (distinct known subjects/emails)
 //! - `POST /api/dms`                  open/reuse a 1:1 DM room `{subject, email}` (CSRF)
+//! - `GET  /api/search`               search `?q=` over messages in the caller's member rooms (keyset)
+//! - `GET  /api/mentions`             the caller's global @mentions view (keyset `?before=`)
 //! - `POST /api/rooms/{id}/join`      join a room (CSRF)
+//! - `POST /api/rooms/{id}/topic`     set the room topic `{topic}` (mods+, CSRF)
+//! - `GET  /api/rooms/{id}/pinned`    the room's pinned-message panel (members only)
 //! - `GET  /api/rooms/{id}/messages`  recent messages (keyset `?before=`)
 //! - `POST /api/rooms/{id}/messages`  send `{body}` -> insert + broadcast (CSRF)
 //! - `POST /api/rooms/{id}/messages/{msg_id}/edit`    author edits `{body}` -> update + broadcast (CSRF)
 //! - `POST /api/rooms/{id}/messages/{msg_id}/delete`  author soft-deletes -> `[deleted]` + broadcast (CSRF)
 //! - `POST /api/rooms/{id}/messages/{msg_id}/react`   toggle an emoji reaction -> counts + broadcast (CSRF)
 //! - `GET  /api/rooms/{id}/messages/{msg_id}/reactions`  per-emoji reaction tallies + the caller's own
+//! - `POST /api/rooms/{id}/messages/{msg_id}/pin`     pin a message in the room (mods+, CSRF)
+//! - `POST /api/rooms/{id}/messages/{msg_id}/unpin`   unpin a message (mods+, CSRF)
 //! - `POST /api/rooms/{id}/read`      advance `last_read_at`
 //! - `GET  /ws`                       WebSocket: live messages/presence for the user's rooms
 //! - `GET  /admin`                    moderator panel: all rooms (admins/infra-admins only)
@@ -75,7 +81,12 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/directory", get(handlers::dms::directory))
         .route("/api/dms", post(handlers::dms::open))
+        // Cross-room discovery: search over member rooms + the global @mentions view.
+        .route("/api/search", get(handlers::search::search))
+        .route("/api/mentions", get(handlers::search::mentions))
         .route("/api/rooms/{id}/join", post(handlers::rooms::join))
+        .route("/api/rooms/{id}/topic", post(handlers::rooms::set_topic))
+        .route("/api/rooms/{id}/pinned", get(handlers::rooms::pinned))
         .route(
             "/api/rooms/{id}/messages",
             get(handlers::rooms::messages).post(handlers::rooms::send),
@@ -95,6 +106,14 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/rooms/{id}/messages/{msg_id}/reactions",
             get(handlers::rooms::reactions),
+        )
+        .route(
+            "/api/rooms/{id}/messages/{msg_id}/pin",
+            post(handlers::rooms::pin),
+        )
+        .route(
+            "/api/rooms/{id}/messages/{msg_id}/unpin",
+            post(handlers::rooms::unpin),
         )
         .route("/api/rooms/{id}/read", post(handlers::rooms::read))
         .route("/ws", get(handlers::ws::ws_handler))
@@ -209,6 +228,7 @@ pub async fn ensure_lobby(state: &AppState, sub: &str, email: &str) {
         created_by: "system".to_string(),
         created_at: 0, // created_at=0 keeps the lobby first in the oldest-first room ordering.
         archived: false,
+        topic: String::new(),
     };
     if let Err(e) = state.store.ensure_room(&lobby).await {
         tracing::warn!(error = %e, "ensure lobby room failed");

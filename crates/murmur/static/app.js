@@ -11,15 +11,21 @@
 
   var cfg = window.MURMUR || {};
   var selected = cfg.selected || "lobby";
+  var isMod = !!cfg.isMod; // whether the signed-in user may edit topics / pin messages
   var replyTarget = null; // id of the message the composer is currently replying to (or null)
+  // The caller's own @mention handle (email local-part) — used to light the live mention dot.
+  var myHandle = String(cfg.me || "").toLowerCase().split("@")[0];
 
   var $ = function (sel) { return document.querySelector(sel); };
   var timeline = $("#timeline");
   var roomList = $("#room-list");
   var roomTitle = $("#room-title");
+  var roomTopic = $("#room-topic");
   var presence = $("#presence");
   var composer = $("#composer");
   var input = $("#composer-input");
+  var pinnedPanel = $("#pinned-panel");
+  var pinnedList = $("#pinned-list");
 
   // --- helpers --------------------------------------------------------------
 
@@ -91,6 +97,7 @@
     tools.className = "msg__tools";
     tools.appendChild(makeTool("react", "React"));
     tools.appendChild(makeTool("reply", "Reply"));
+    if (isMod) tools.appendChild(makeTool("pin", "Pin"));
     return tools;
   }
   function makeTool(act, label) {
@@ -227,9 +234,16 @@
     if (roomTitle) roomTitle.textContent = name || id;
     if (input) input.placeholder = "Message " + (name || id) + "…";
     var items = roomList ? roomList.querySelectorAll(".room") : [];
+    var topic = "";
     for (var i = 0; i < items.length; i++) {
-      items[i].classList.toggle("is-active", items[i].getAttribute("data-room-id") === id);
+      var match = items[i].getAttribute("data-room-id") === id;
+      items[i].classList.toggle("is-active", match);
+      if (match) topic = items[i].getAttribute("data-room-topic") || "";
     }
+    if (roomTopic) roomTopic.textContent = topic;
+    clearReply();
+    clearUnread(id);       // opening a room marks it read — drop its badge
+    loadPinned(id);        // refresh the pinned panel for the new room
     loadMessages(id);
   }
 
@@ -317,6 +331,8 @@
         if (emoji) toggleReaction(id, emoji.trim());
       } else if (tool.getAttribute("data-act") === "reply") {
         setReply(id, msg.getAttribute("data-author") || "");
+      } else if (tool.getAttribute("data-act") === "pin") {
+        pinMessage(id);
       }
     });
   }
@@ -387,11 +403,21 @@
     li.className = "room";
     li.setAttribute("data-room-id", room.id);
     li.setAttribute("data-room-name", room.name);
+    li.setAttribute("data-room-topic", room.topic || "");
     var btn = document.createElement("button");
     btn.className = "room__btn";
     btn.type = "button";
     btn.textContent = room.name;
     li.appendChild(btn);
+    // A badge scaffold (hidden until unread) so live bumps have somewhere to write.
+    var badge = document.createElement("span");
+    badge.className = "room__badge";
+    var unread = document.createElement("span");
+    unread.className = "room__unread";
+    unread.hidden = true;
+    unread.textContent = "0";
+    badge.appendChild(unread);
+    li.appendChild(badge);
     roomList.appendChild(li);
   }
 
@@ -486,6 +512,313 @@
       .catch(function () {});
   }
 
+  // --- room topic (mods) ----------------------------------------------------
+
+  var topicEditBtn = document.getElementById("topic-edit");
+  if (topicEditBtn && isMod) {
+    topicEditBtn.hidden = false;
+    topicEditBtn.addEventListener("click", editTopic);
+  }
+
+  function editTopic() {
+    var current = roomTopic ? roomTopic.textContent : "";
+    var next = window.prompt("Room topic", current);
+    if (next === null) return; // cancelled
+    fetch("/api/rooms/" + encodeURIComponent(selected) + "/topic", {
+      method: "POST",
+      headers: apiHeaders(true),
+      credentials: "same-origin",
+      body: JSON.stringify({ topic: next })
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data || !data.room) return;
+        var t = data.room.topic || "";
+        if (roomTopic) roomTopic.textContent = t;
+        // Keep the room-list data attribute in sync so re-selecting shows the new topic.
+        var li = roomList
+          ? roomList.querySelector('[data-room-id="' + cssEscape(selected) + '"]')
+          : null;
+        if (li) li.setAttribute("data-room-topic", t);
+      })
+      .catch(function () {});
+  }
+
+  // --- pinned messages ------------------------------------------------------
+
+  var pinToggleBtn = document.getElementById("pin-toggle");
+  if (pinToggleBtn) {
+    pinToggleBtn.addEventListener("click", function () {
+      if (!pinnedPanel) return;
+      var show = pinnedPanel.hasAttribute("hidden");
+      if (show) { pinnedPanel.removeAttribute("hidden"); loadPinned(selected); }
+      else { pinnedPanel.setAttribute("hidden", ""); }
+      pinToggleBtn.setAttribute("aria-expanded", show ? "true" : "false");
+    });
+  }
+
+  function loadPinned(id) {
+    if (!pinnedList) return;
+    fetch("/api/rooms/" + encodeURIComponent(id) + "/pinned", { credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : { messages: [] }; })
+      .then(function (data) { renderPinned(data.messages || []); })
+      .catch(function () {});
+  }
+
+  function renderPinned(messages) {
+    if (!pinnedList) return;
+    pinnedList.innerHTML = "";
+    if (messages.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "pinned-panel__empty";
+      empty.textContent = "No pinned messages.";
+      pinnedList.appendChild(empty);
+      return;
+    }
+    for (var i = 0; i < messages.length; i++) {
+      pinnedList.appendChild(buildPinnedItem(messages[i]));
+    }
+  }
+
+  function buildPinnedItem(m) {
+    var item = document.createElement("div");
+    item.className = "pinned-item";
+    item.setAttribute("data-jump-id", m.id);
+    var jump = document.createElement("button");
+    jump.type = "button";
+    jump.className = "pinned-item__jump";
+    var author = document.createElement("span");
+    author.className = "pinned-item__author";
+    author.textContent = m.sender_email || m.sender_sub || "—";
+    var body = document.createElement("span");
+    body.className = "pinned-item__body";
+    var text = m.deleted ? "[deleted]" : String(m.body || "");
+    text = text.replace(/[\r\n]+/g, " ");
+    if (text.length > 140) text = text.slice(0, 140) + "…";
+    body.textContent = text;
+    jump.appendChild(author);
+    jump.appendChild(body);
+    item.appendChild(jump);
+    if (isMod) {
+      var unpin = document.createElement("button");
+      unpin.type = "button";
+      unpin.className = "pinned-item__unpin";
+      unpin.setAttribute("data-unpin", m.id);
+      unpin.textContent = "Unpin";
+      item.appendChild(unpin);
+    }
+    return item;
+  }
+
+  if (pinnedList) {
+    pinnedList.addEventListener("click", function (e) {
+      var unpinBtn = e.target.closest ? e.target.closest("[data-unpin]") : null;
+      if (unpinBtn) { unpinMessage(unpinBtn.getAttribute("data-unpin")); return; }
+      var jumpEl = e.target.closest ? e.target.closest(".pinned-item") : null;
+      if (jumpEl) jumpToMessage(jumpEl.getAttribute("data-jump-id"));
+    });
+  }
+
+  function pinMessage(msgId) {
+    fetch("/api/rooms/" + encodeURIComponent(selected) + "/messages/" +
+      encodeURIComponent(msgId) + "/pin", {
+      method: "POST",
+      headers: apiHeaders(false),
+      credentials: "same-origin"
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        renderPinned(data.messages || []);
+        if (pinnedPanel) { pinnedPanel.removeAttribute("hidden"); }
+        if (pinToggleBtn) pinToggleBtn.setAttribute("aria-expanded", "true");
+      })
+      .catch(function () {});
+  }
+
+  function unpinMessage(msgId) {
+    fetch("/api/rooms/" + encodeURIComponent(selected) + "/messages/" +
+      encodeURIComponent(msgId) + "/unpin", {
+      method: "POST",
+      headers: apiHeaders(false),
+      credentials: "same-origin"
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) { if (data) renderPinned(data.messages || []); })
+      .catch(function () {});
+  }
+
+  function jumpToMessage(msgId) {
+    if (!timeline) return;
+    var row = timeline.querySelector('[data-id="' + cssEscape(msgId) + '"]');
+    if (!row) return;
+    row.scrollIntoView({ block: "center" });
+    row.classList.add("msg--flash");
+    setTimeout(function () { row.classList.remove("msg--flash"); }, 1200);
+  }
+
+  // --- search + mentions ----------------------------------------------------
+
+  var searchForm = document.getElementById("search-form");
+  var searchInput = document.getElementById("search-input");
+  if (searchForm) {
+    searchForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var q = searchInput ? searchInput.value.trim() : "";
+      if (q.length < 2) return;
+      doSearch(q);
+    });
+  }
+
+  var mentionsBtn = document.getElementById("mentions-btn");
+  if (mentionsBtn) {
+    mentionsBtn.addEventListener("click", loadMentions);
+  }
+
+  function doSearch(q) {
+    fetch("/api/search?q=" + encodeURIComponent(q), { credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : { results: [] }; })
+      .then(function (data) { openResults("Search: " + q, data.results || []); })
+      .catch(function () {});
+  }
+
+  function loadMentions() {
+    fetch("/api/mentions", { credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : { results: [] }; })
+      .then(function (data) { openResults("Your mentions", data.results || []); })
+      .catch(function () {});
+  }
+
+  // A lightweight results overlay (reuses the DM-picker chrome). Each hit links back to its room.
+  function openResults(title, results) {
+    closeResults();
+    var overlay = document.createElement("div");
+    overlay.className = "dm-picker";
+    overlay.id = "results-picker";
+    var panel = document.createElement("div");
+    panel.className = "dm-picker__panel";
+
+    var head = document.createElement("div");
+    head.className = "dm-picker__head";
+    var h = document.createElement("h3");
+    h.className = "dm-picker__title";
+    h.textContent = title;
+    var close = document.createElement("button");
+    close.className = "btn btn-ghost btn-sm";
+    close.type = "button";
+    close.textContent = "Close";
+    close.addEventListener("click", closeResults);
+    head.appendChild(h);
+    head.appendChild(close);
+    panel.appendChild(head);
+
+    var list = document.createElement("ul");
+    list.className = "dm-picker__list";
+    if (results.length === 0) {
+      var empty = document.createElement("li");
+      empty.className = "dm-picker__empty";
+      empty.textContent = "No matches.";
+      list.appendChild(empty);
+    } else {
+      for (var i = 0; i < results.length; i++) {
+        list.appendChild(buildResultRow(results[i]));
+      }
+    }
+    panel.appendChild(list);
+    overlay.appendChild(panel);
+    overlay.addEventListener("click", function (e) { if (e.target === overlay) closeResults(); });
+    document.body.appendChild(overlay);
+  }
+
+  function buildResultRow(hit) {
+    var li = document.createElement("li");
+    var btn = document.createElement("button");
+    btn.className = "result-row";
+    btn.type = "button";
+    var room = document.createElement("span");
+    room.className = "result-row__room";
+    room.textContent = hit.room_name || hit.room_id || "—";
+    var meta = document.createElement("span");
+    meta.className = "result-row__meta";
+    meta.textContent = (hit.sender_email || hit.sender_sub || "—") + " · " + fmtTime(hit.created_at);
+    var body = document.createElement("span");
+    body.className = "result-row__body";
+    body.textContent = String(hit.body || "");
+    btn.appendChild(room);
+    btn.appendChild(meta);
+    btn.appendChild(body);
+    btn.addEventListener("click", function () {
+      closeResults();
+      openRoomFromResult(hit);
+    });
+    li.appendChild(btn);
+    return li;
+  }
+
+  // Select the hit's room (adding it to the sidebar if it is not already listed), then jump to the
+  // matched message once its history loads.
+  function openRoomFromResult(hit) {
+    var li = roomList
+      ? roomList.querySelector('[data-room-id="' + cssEscape(hit.room_id) + '"]')
+      : null;
+    var name = li ? li.getAttribute("data-room-name") : (hit.room_name || hit.room_id);
+    if (!li) addRoomToList({ id: hit.room_id, name: hit.room_name || hit.room_id, topic: "" });
+    selectRoom(hit.room_id, name);
+    // Give the timeline a moment to load, then flash the target message if present.
+    setTimeout(function () { jumpToMessage(hit.id); }, 250);
+  }
+
+  function closeResults() {
+    var existing = document.getElementById("results-picker");
+    if (existing) existing.remove();
+  }
+
+  // --- unread badges --------------------------------------------------------
+
+  // Increment a background room's unread count (and optionally light its mention dot).
+  function bumpUnread(roomId, mention) {
+    if (!roomList) return;
+    var li = roomList.querySelector('[data-room-id="' + cssEscape(roomId) + '"]');
+    if (!li) return;
+    var count = li.querySelector(".room__unread");
+    if (count) {
+      var n = parseInt(count.textContent, 10) || 0;
+      count.textContent = String(n + 1);
+      count.hidden = false;
+    }
+    if (mention) ensureMentionDot(li);
+  }
+
+  // Clear a room's unread badge + mention dot (called when the room is opened / read).
+  function clearUnread(roomId) {
+    if (!roomList) return;
+    var li = roomList.querySelector('[data-room-id="' + cssEscape(roomId) + '"]');
+    if (!li) return;
+    var count = li.querySelector(".room__unread");
+    if (count) { count.textContent = "0"; count.hidden = true; }
+    var dot = li.querySelector(".room__mention");
+    if (dot) dot.remove();
+  }
+
+  function ensureMentionDot(li) {
+    var badge = li.querySelector(".room__badge");
+    if (!badge || badge.querySelector(".room__mention")) return;
+    var dot = document.createElement("span");
+    dot.className = "room__mention";
+    dot.title = "You were mentioned";
+    badge.insertBefore(dot, badge.firstChild);
+  }
+
+  // Does a message body @mention the signed-in user (by email local-part)?
+  function mentionsMe(body) {
+    if (!myHandle) return false;
+    var re = /(^|[^A-Za-z0-9._@-])@([A-Za-z0-9._-]+)/g, m;
+    while ((m = re.exec(body)) !== null) {
+      if (m[2].toLowerCase() === myHandle) return true;
+    }
+    return false;
+  }
+
   // --- live stream (WebSocket) ---------------------------------------------
 
   var ws = null, retry = 0;
@@ -521,7 +854,14 @@
   }
 
   function onLiveMessage(frame) {
-    if (frame.room_id !== selected || !timeline) return; // (unread bumps for other rooms: future work)
+    if (frame.room_id !== selected || !timeline) {
+      // A message in a room the user is NOT looking at: bump that room's unread badge (never for
+      // the user's own posts) and light the mention dot when the body @mentions them.
+      if (frame.room_id !== selected && !frame.deleted && frame.sender_email !== cfg.me) {
+        bumpUnread(frame.room_id, mentionsMe(frame.body || ""));
+      }
+      return;
+    }
     // An edit/soft-delete arrives with the SAME id as an on-screen row: update it in place.
     var existing = timeline.querySelector('[data-id="' + cssEscape(frame.id) + '"]');
     if (existing) {

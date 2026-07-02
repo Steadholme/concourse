@@ -525,3 +525,77 @@ pre { font-family:var(--mono); font-size:12.5px; background:var(--surface-2); bo
 .admin__actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
 .admin__actions form { margin: 0; }
 .admin__body { max-width: 42ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- Chat: search / mentions / topic / pinned / unread (w8 additions) ---- */
+/* Sidebar search + mentions row */
+.sidebar__search { display: flex; align-items: center; gap: 8px; padding: 10px 14px 4px; }
+.input-sm { height: 32px; font-size: 13px; }
+.sidebar__search .btn { flex: 0 0 auto; white-space: nowrap; }
+
+/* Room-list unread badge + mention dot */
+.room { display: flex; align-items: center; gap: 6px; }
+.room .room__btn { flex: 1 1 auto; }
+.room__badge { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; padding-right: 8px; }
+.room__mention {
+  width: 7px; height: 7px; border-radius: 999px; background: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.room__unread {
+  min-width: 18px; height: 18px; padding: 0 6px; border-radius: 999px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; line-height: 1;
+}
+.room__unread[hidden] { display: none; }
+
+/* Room-view head: title + topic + meta actions */
+.room-view__head { align-items: flex-start; justify-content: space-between; }
+.room-view__heading { min-width: 0; }
+.room-view__topic {
+  margin-top: 3px; color: var(--ink-3); font-size: 12.5px; line-height: 1.4;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60ch;
+}
+.room-view__topic:empty { display: none; }
+.room-view__meta { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+
+/* Pinned-message panel */
+.pinned-panel { border-bottom: 1px solid var(--border); background: var(--surface); max-height: 240px; overflow-y: auto; }
+.pinned-panel[hidden] { display: none; }
+.pinned-panel__head {
+  padding: 8px 20px; font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .1em; color: var(--ink-3); border-bottom: 1px solid var(--border);
+}
+.pinned-panel__list { padding: 6px 12px 10px; }
+.pinned-panel__empty { color: var(--ink-3); font-size: 13px; padding: 12px 8px; }
+.pinned-item { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.pinned-item__jump {
+  flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px;
+  padding: 6px 8px; border: 0; border-radius: var(--radius-sm); background: transparent;
+  color: var(--ink-2); font: inherit; text-align: left; cursor: pointer;
+}
+.pinned-item__jump:hover { background: var(--surface-2); }
+.pinned-item__author { flex: 0 0 auto; font-size: 12.5px; font-weight: 600; color: var(--ink); }
+.pinned-item__body { flex: 1 1 auto; min-width: 0; font-size: 12.5px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pinned-item__unpin { flex: 0 0 auto; background: transparent; border: none; color: var(--ink-3); cursor: pointer; font-size: 11px; }
+.pinned-item__unpin:hover { color: var(--down-ink); }
+
+/* Search / mentions results overlay rows (reuse .dm-picker chrome) */
+.result-row {
+  display: flex; flex-direction: column; gap: 2px; width: 100%; text-align: left;
+  padding: 10px 12px; margin: 2px 0; border: 0; border-radius: var(--radius-md);
+  background: transparent; color: var(--ink-2); font: inherit; cursor: pointer;
+  transition: background .1s;
+}
+.result-row:hover { background: var(--surface-2); }
+.result-row__room { font-size: 13px; font-weight: 600; color: var(--accent-ink); }
+.result-row__meta { font-size: 11px; color: var(--ink-3); }
+.result-row__body {
+  font-size: 13px; color: var(--ink-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Jump-to-message flash highlight */
+.msg--flash { animation: msg-flash 1.2s ease; border-radius: var(--radius-sm); }
+@keyframes msg-flash {
+  0% { background: var(--accent-soft); }
+  100% { background: transparent; }
+}

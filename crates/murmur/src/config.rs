@@ -27,6 +27,25 @@ pub const MAX_ROOM_NAME_CHARS: usize = 120;
 /// (skin-tone modifiers, ZWJ / flag sequences) while rejecting arbitrary text as a "reaction".
 pub const MAX_EMOJI_CHARS: usize = 32;
 
+/// Maximum room topic / description length, in characters.
+pub const MAX_TOPIC_CHARS: usize = 500;
+
+/// Hard cap on how many pinned messages a room's pinned panel returns.
+pub const PINNED_LIMIT: i64 = 100;
+
+/// Hard cap on how many hits one search page returns.
+pub const SEARCH_PAGE_LIMIT: i64 = 50;
+
+/// Hard cap on how many mentions the global mentions view returns per page.
+pub const MENTIONS_PAGE_LIMIT: i64 = 50;
+
+/// Minimum search needle length (characters). Shorter queries are rejected to avoid scanning the
+/// whole corpus for a single-character substring.
+pub const MIN_SEARCH_QUERY_CHARS: usize = 2;
+
+/// Maximum search needle length, in characters.
+pub const MAX_SEARCH_QUERY_CHARS: usize = 200;
+
 /// Tombstone body a message is redacted TO by an admin/moderator (replaces the original text).
 pub const REDACTED_BODY: &str = "[removed by moderator]";
 

@@ -29,6 +29,9 @@ pub mod calendar;
 pub mod config;
 pub mod error;
 pub mod handlers;
+pub mod ics;
+pub mod quickadd;
+pub mod reminders;
 pub mod render;
 pub mod rrule;
 pub mod store;
@@ -64,6 +67,15 @@ pub fn app(state: AppState) -> Router {
             get(handlers::events::edit_form).post(handlers::events::update),
         )
         .route("/delete/{id}", post(handlers::events::delete))
+        // Natural-language quick-add ("Lunch tomorrow 12pm"); unparseable falls back to the editor.
+        .route("/quick-add", post(handlers::events::quick_add))
+        // Per-event detail: attendees + their RSVP status + reminders + the .ics download.
+        .route("/event/{id}", get(handlers::detail::show))
+        // Read-only iCalendar: the whole subscription feed + a single-event download.
+        .route("/calendar.ics", get(handlers::feed::calendar_ics))
+        .route("/event/{id}/ics", get(handlers::feed::event_ics))
+        // Public (no-SSO) per-attendee RSVP capability link.
+        .route("/rsvp/{token}", get(handlers::rsvp::rsvp))
         // Contacts / address book.
         .route("/contacts", get(handlers::contacts::index))
         .route("/contacts/new", post(handlers::contacts::create))
@@ -137,6 +149,24 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         "memory" => Arc::new(InMemoryStore::new()),
         other => return Err(format!("unknown ALMANAC_STORE={other} (use memory|postgres)")),
     };
+
+    // Reminder delivery hook (standalone only): when Klaxon's ingest is configured, spawn the
+    // timed, bounded due-scan that POSTs due reminders to Klaxon. Inert (reminders stay stored +
+    // queryable) when unset. NOTE: the composite builds AppState directly and starts no Almanac
+    // background task, so wiring this scan there is a noted follow-up.
+    if let (Some(url), Some(token)) = (
+        config.klaxon_notify_url.clone(),
+        config.klaxon_ingest_token.clone(),
+    ) {
+        let sink: Arc<dyn reminders::ReminderSink> =
+            Arc::new(reminders::HttpKlaxonSink::new(url, token));
+        reminders::spawn_reminder_scanner(
+            store.clone(),
+            sink,
+            std::time::Duration::from_secs(config::REMINDER_SCAN_SECS),
+        );
+        tracing::info!("reminder scanner started (Klaxon delivery configured)");
+    }
 
     Ok(AppState {
         config: Arc::new(config),

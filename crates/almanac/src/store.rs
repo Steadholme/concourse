@@ -85,6 +85,55 @@ impl Settings {
     }
 }
 
+/// An invited attendee on one event. Owned (like everything) by the event's `owner_sub`; the
+/// per-attendee `token` is an unguessable RSVP capability handed out in a public link, so its
+/// lookup is the ONLY store read that is NOT owner-scoped. `status` is one of the four RFC 5545
+/// PARTSTAT keywords (see [`ATTENDEE_STATUSES`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attendee {
+    pub id: String,
+    pub event_id: String,
+    pub owner_sub: String,
+    pub email: String,
+    pub name: String,
+    /// `needs-action` (default) | `accepted` | `declined` | `tentative`.
+    pub status: String,
+    /// Unguessable RSVP capability (64 hex chars); the public `/rsvp/{token}` link carries it.
+    pub token: String,
+    pub created_at: i64,
+}
+
+/// The RSVP states an attendee row may hold. `needs-action` is the initial state; the public RSVP
+/// link only ever sets one of the latter three.
+pub const ATTENDEE_STATUSES: [&str; 4] = ["needs-action", "accepted", "declined", "tentative"];
+
+/// A pre-event reminder: fire `minutes_before` the owning event's start by delivering an in-app
+/// notification. `delivered_at` is `0` until a due-scan hands it off (so a reminder fires at most
+/// once); the scan filters on it with a bounded query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reminder {
+    pub id: String,
+    pub event_id: String,
+    pub owner_sub: String,
+    pub minutes_before: i64,
+    /// Epoch ms of successful hand-off, or `0` while still pending.
+    pub delivered_at: i64,
+    pub created_at: i64,
+}
+
+/// A reminder joined to its (still-upcoming) event, produced by [`Store::due_reminders`]. Carries
+/// everything the delivery hook needs to build the notification without a second lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DueReminder {
+    pub reminder_id: String,
+    pub owner_sub: String,
+    pub minutes_before: i64,
+    pub event_id: String,
+    pub event_title: String,
+    pub event_starts_at: i64,
+    pub event_location: String,
+}
+
 /// Pluggable store. Methods are `async`: the axum handlers `.await` them directly on the serving
 /// runtime, and `PgStore` drives sqlx natively, so a worker thread is never blocked on a DB
 /// round-trip (no `block_in_place`, no sync-over-async bridge).
@@ -120,6 +169,66 @@ pub trait Store: Send + Sync {
 
     /// Insert or replace the owner's settings row. Returns the stored value.
     async fn upsert_settings(&self, settings: Settings) -> Result<Settings, StoreError>;
+
+    // --- Attendees / invites ----------------------------------------------------------------
+
+    /// The event's attendees, ordered by name (case-insensitive), only if the event belongs to
+    /// `owner_sub`.
+    async fn list_attendees(&self, owner_sub: &str, event_id: &str)
+        -> Result<Vec<Attendee>, StoreError>;
+
+    /// Replace the whole attendee set for `(owner_sub, event_id)` with `attendees` (delete-then-
+    /// insert). The caller reconciles tokens/status beforehand so retained emails keep their RSVP
+    /// links; this call just persists the final set.
+    async fn replace_attendees(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+        attendees: Vec<Attendee>,
+    ) -> Result<(), StoreError>;
+
+    /// Remove all attendees of an event (used when the event itself is deleted).
+    async fn delete_event_attendees(&self, owner_sub: &str, event_id: &str)
+        -> Result<(), StoreError>;
+
+    /// Look up one attendee by its RSVP `token`. NOT owner-scoped: the token IS the capability.
+    async fn get_attendee_by_token(&self, token: &str) -> Result<Option<Attendee>, StoreError>;
+
+    /// Set an attendee's RSVP status by `token`; returns the updated row (or `None` if unknown).
+    async fn set_attendee_status_by_token(
+        &self,
+        token: &str,
+        status: &str,
+    ) -> Result<Option<Attendee>, StoreError>;
+
+    // --- Reminders --------------------------------------------------------------------------
+
+    /// The event's reminders, ordered by `minutes_before` ascending, only if the event belongs to
+    /// `owner_sub`.
+    async fn list_reminders(&self, owner_sub: &str, event_id: &str)
+        -> Result<Vec<Reminder>, StoreError>;
+
+    /// Replace the whole reminder set for `(owner_sub, event_id)` with `reminders`.
+    async fn replace_reminders(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+        reminders: Vec<Reminder>,
+    ) -> Result<(), StoreError>;
+
+    /// Remove all reminders of an event (used when the event itself is deleted).
+    async fn delete_event_reminders(&self, owner_sub: &str, event_id: &str)
+        -> Result<(), StoreError>;
+
+    /// Pending reminders whose fire time (`event.starts_at - minutes_before`) has arrived while the
+    /// event is still upcoming, joined to their event. A SINGLE bounded query (`LIMIT limit`) — the
+    /// delivery hook scans on a timer, never a busy loop. Ordered by event start ascending.
+    async fn due_reminders(&self, now_ms: i64, limit: usize)
+        -> Result<Vec<DueReminder>, StoreError>;
+
+    /// Mark a reminder delivered (sets `delivered_at`), so it never fires twice.
+    async fn mark_reminder_delivered(&self, reminder_id: &str, when_ms: i64)
+        -> Result<(), StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -131,6 +240,10 @@ struct MemData {
     events: HashMap<String, Event>,
     contacts: HashMap<String, Contact>,
     settings: HashMap<String, Settings>,
+    /// Attendees keyed by attendee id.
+    attendees: HashMap<String, Attendee>,
+    /// Reminders keyed by reminder id.
+    reminders: HashMap<String, Reminder>,
 }
 
 /// In-memory `Store`. A single `Mutex` guards both maps.
@@ -259,6 +372,187 @@ impl Store for InMemoryStore {
         data.settings.insert(settings.owner_sub.clone(), settings.clone());
         Ok(settings)
     }
+
+    async fn list_attendees(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<Vec<Attendee>, StoreError> {
+        let data = self.data.lock().expect("almanac store lock poisoned");
+        let mut out: Vec<Attendee> = data
+            .attendees
+            .values()
+            .filter(|a| a.owner_sub == owner_sub && a.event_id == event_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.email.to_lowercase().cmp(&b.email.to_lowercase()))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    async fn replace_attendees(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+        attendees: Vec<Attendee>,
+    ) -> Result<(), StoreError> {
+        let mut data = self.data.lock().expect("almanac store lock poisoned");
+        data.attendees
+            .retain(|_, a| !(a.owner_sub == owner_sub && a.event_id == event_id));
+        for a in attendees {
+            if a.owner_sub == owner_sub && a.event_id == event_id {
+                data.attendees.insert(a.id.clone(), a);
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_event_attendees(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<(), StoreError> {
+        let mut data = self.data.lock().expect("almanac store lock poisoned");
+        data.attendees
+            .retain(|_, a| !(a.owner_sub == owner_sub && a.event_id == event_id));
+        Ok(())
+    }
+
+    async fn get_attendee_by_token(&self, token: &str) -> Result<Option<Attendee>, StoreError> {
+        let data = self.data.lock().expect("almanac store lock poisoned");
+        Ok(data
+            .attendees
+            .values()
+            .find(|a| a.token == token)
+            .cloned())
+    }
+
+    async fn set_attendee_status_by_token(
+        &self,
+        token: &str,
+        status: &str,
+    ) -> Result<Option<Attendee>, StoreError> {
+        let mut data = self.data.lock().expect("almanac store lock poisoned");
+        let id = data
+            .attendees
+            .values()
+            .find(|a| a.token == token)
+            .map(|a| a.id.clone());
+        match id {
+            Some(id) => {
+                let a = data.attendees.get_mut(&id).expect("just found");
+                a.status = status.to_string();
+                Ok(Some(a.clone()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn list_reminders(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<Vec<Reminder>, StoreError> {
+        let data = self.data.lock().expect("almanac store lock poisoned");
+        let mut out: Vec<Reminder> = data
+            .reminders
+            .values()
+            .filter(|r| r.owner_sub == owner_sub && r.event_id == event_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.minutes_before
+                .cmp(&b.minutes_before)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(out)
+    }
+
+    async fn replace_reminders(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+        reminders: Vec<Reminder>,
+    ) -> Result<(), StoreError> {
+        let mut data = self.data.lock().expect("almanac store lock poisoned");
+        data.reminders
+            .retain(|_, r| !(r.owner_sub == owner_sub && r.event_id == event_id));
+        for r in reminders {
+            if r.owner_sub == owner_sub && r.event_id == event_id {
+                data.reminders.insert(r.id.clone(), r);
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_event_reminders(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<(), StoreError> {
+        let mut data = self.data.lock().expect("almanac store lock poisoned");
+        data.reminders
+            .retain(|_, r| !(r.owner_sub == owner_sub && r.event_id == event_id));
+        Ok(())
+    }
+
+    async fn due_reminders(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<DueReminder>, StoreError> {
+        let data = self.data.lock().expect("almanac store lock poisoned");
+        let mut out: Vec<DueReminder> = data
+            .reminders
+            .values()
+            .filter(|r| r.delivered_at == 0)
+            .filter_map(|r| {
+                let event = data.events.get(&r.event_id)?;
+                if event.owner_sub != r.owner_sub {
+                    return None;
+                }
+                let fire_at = event.starts_at - r.minutes_before * 60_000;
+                // Due once the fire time has arrived AND the event has not yet started.
+                if fire_at <= now_ms && event.starts_at >= now_ms {
+                    Some(DueReminder {
+                        reminder_id: r.id.clone(),
+                        owner_sub: r.owner_sub.clone(),
+                        minutes_before: r.minutes_before,
+                        event_id: event.id.clone(),
+                        event_title: event.title.clone(),
+                        event_starts_at: event.starts_at,
+                        event_location: event.location.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.event_starts_at
+                .cmp(&b.event_starts_at)
+                .then_with(|| a.reminder_id.cmp(&b.reminder_id))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn mark_reminder_delivered(
+        &self,
+        reminder_id: &str,
+        when_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut data = self.data.lock().expect("almanac store lock poisoned");
+        if let Some(r) = data.reminders.get_mut(reminder_id) {
+            r.delivered_at = when_ms;
+        }
+        Ok(())
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -365,6 +659,58 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+
+        // Invites / attendees: one row per invited attendee of an event. `token` is the unguessable
+        // public RSVP capability (unique). Portable standard SQL only.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS event_attendees (\
+                 id TEXT PRIMARY KEY, \
+                 event_id TEXT NOT NULL, \
+                 owner_sub TEXT NOT NULL, \
+                 email TEXT NOT NULL DEFAULT '', \
+                 name TEXT NOT NULL DEFAULT '', \
+                 status TEXT NOT NULL DEFAULT 'needs-action', \
+                 token TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_attendees_owner_event ON event_attendees (owner_sub, event_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_attendees_token ON event_attendees (token)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Reminders: one row per (event, minutes_before). `delivered_at = 0` means pending; the
+        // bounded due-scan filters on it. Portable standard SQL only.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS event_reminders (\
+                 id TEXT PRIMARY KEY, \
+                 event_id TEXT NOT NULL, \
+                 owner_sub TEXT NOT NULL, \
+                 minutes_before BIGINT NOT NULL, \
+                 delivered_at BIGINT NOT NULL DEFAULT 0, \
+                 created_at BIGINT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_reminders_owner_event ON event_reminders (owner_sub, event_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_reminders_due ON event_reminders (delivered_at)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -401,6 +747,42 @@ impl PgStore {
             timezone: row.try_get("timezone")?,
             week_start: row.try_get("week_start")?,
             updated_at: row.try_get("updated_at")?,
+        })
+    }
+
+    fn attendee_from_row(row: &PgRow) -> Result<Attendee, sqlx::Error> {
+        Ok(Attendee {
+            id: row.try_get("id")?,
+            event_id: row.try_get("event_id")?,
+            owner_sub: row.try_get("owner_sub")?,
+            email: row.try_get("email")?,
+            name: row.try_get("name")?,
+            status: row.try_get("status")?,
+            token: row.try_get("token")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn reminder_from_row(row: &PgRow) -> Result<Reminder, sqlx::Error> {
+        Ok(Reminder {
+            id: row.try_get("id")?,
+            event_id: row.try_get("event_id")?,
+            owner_sub: row.try_get("owner_sub")?,
+            minutes_before: row.try_get("minutes_before")?,
+            delivered_at: row.try_get("delivered_at")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn due_reminder_from_row(row: &PgRow) -> Result<DueReminder, sqlx::Error> {
+        Ok(DueReminder {
+            reminder_id: row.try_get("reminder_id")?,
+            owner_sub: row.try_get("owner_sub")?,
+            minutes_before: row.try_get("minutes_before")?,
+            event_id: row.try_get("event_id")?,
+            event_title: row.try_get("event_title")?,
+            event_starts_at: row.try_get("event_starts_at")?,
+            event_location: row.try_get("event_location")?,
         })
     }
 
@@ -561,6 +943,196 @@ impl PgStore {
         .await?;
         Ok(())
     }
+
+    async fn list_attendees_async(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<Vec<Attendee>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, event_id, owner_sub, email, name, status, token, created_at \
+             FROM event_attendees WHERE owner_sub = $1 AND event_id = $2 \
+             ORDER BY lower(name) ASC, lower(email) ASC, id ASC",
+        )
+        .bind(owner_sub)
+        .bind(event_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::attendee_from_row).collect()
+    }
+
+    async fn replace_attendees_async(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+        attendees: &[Attendee],
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM event_attendees WHERE owner_sub = $1 AND event_id = $2")
+            .bind(owner_sub)
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        for a in attendees {
+            if a.owner_sub != owner_sub || a.event_id != event_id {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO event_attendees \
+                     (id, event_id, owner_sub, email, name, status, token, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(&a.id)
+            .bind(&a.event_id)
+            .bind(&a.owner_sub)
+            .bind(&a.email)
+            .bind(&a.name)
+            .bind(&a.status)
+            .bind(&a.token)
+            .bind(a.created_at)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_event_attendees_async(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM event_attendees WHERE owner_sub = $1 AND event_id = $2")
+            .bind(owner_sub)
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_attendee_by_token_async(
+        &self,
+        token: &str,
+    ) -> Result<Option<Attendee>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, event_id, owner_sub, email, name, status, token, created_at \
+             FROM event_attendees WHERE token = $1",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(Self::attendee_from_row).transpose()
+    }
+
+    async fn set_attendee_status_by_token_async(
+        &self,
+        token: &str,
+        status: &str,
+    ) -> Result<Option<Attendee>, sqlx::Error> {
+        sqlx::query("UPDATE event_attendees SET status = $1 WHERE token = $2")
+            .bind(status)
+            .bind(token)
+            .execute(&self.pool)
+            .await?;
+        self.get_attendee_by_token_async(token).await
+    }
+
+    async fn list_reminders_async(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<Vec<Reminder>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, event_id, owner_sub, minutes_before, delivered_at, created_at \
+             FROM event_reminders WHERE owner_sub = $1 AND event_id = $2 \
+             ORDER BY minutes_before ASC, id ASC",
+        )
+        .bind(owner_sub)
+        .bind(event_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::reminder_from_row).collect()
+    }
+
+    async fn replace_reminders_async(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+        reminders: &[Reminder],
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM event_reminders WHERE owner_sub = $1 AND event_id = $2")
+            .bind(owner_sub)
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        for r in reminders {
+            if r.owner_sub != owner_sub || r.event_id != event_id {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO event_reminders \
+                     (id, event_id, owner_sub, minutes_before, delivered_at, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(&r.id)
+            .bind(&r.event_id)
+            .bind(&r.owner_sub)
+            .bind(r.minutes_before)
+            .bind(r.delivered_at)
+            .bind(r.created_at)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_event_reminders_async(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM event_reminders WHERE owner_sub = $1 AND event_id = $2")
+            .bind(owner_sub)
+            .bind(event_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn due_reminders_async(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<DueReminder>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT r.id AS reminder_id, r.owner_sub AS owner_sub, \
+                    r.minutes_before AS minutes_before, e.id AS event_id, \
+                    e.title AS event_title, e.starts_at AS event_starts_at, \
+                    e.location AS event_location \
+             FROM event_reminders r \
+             JOIN events e ON e.id = r.event_id AND e.owner_sub = r.owner_sub \
+             WHERE r.delivered_at = 0 \
+               AND (e.starts_at - r.minutes_before * 60000) <= $1 \
+               AND e.starts_at >= $1 \
+             ORDER BY e.starts_at ASC, r.id ASC LIMIT $2",
+        )
+        .bind(now_ms)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::due_reminder_from_row).collect()
+    }
+
+    async fn mark_reminder_delivered_async(
+        &self,
+        reminder_id: &str,
+        when_ms: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE event_reminders SET delivered_at = $1 WHERE id = $2")
+            .bind(when_ms)
+            .bind(reminder_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -626,6 +1198,104 @@ impl Store for PgStore {
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         Ok(settings)
+    }
+
+    async fn list_attendees(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<Vec<Attendee>, StoreError> {
+        self.list_attendees_async(owner_sub, event_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn replace_attendees(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+        attendees: Vec<Attendee>,
+    ) -> Result<(), StoreError> {
+        self.replace_attendees_async(owner_sub, event_id, &attendees)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_event_attendees(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<(), StoreError> {
+        self.delete_event_attendees_async(owner_sub, event_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn get_attendee_by_token(&self, token: &str) -> Result<Option<Attendee>, StoreError> {
+        self.get_attendee_by_token_async(token)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn set_attendee_status_by_token(
+        &self,
+        token: &str,
+        status: &str,
+    ) -> Result<Option<Attendee>, StoreError> {
+        self.set_attendee_status_by_token_async(token, status)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn list_reminders(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<Vec<Reminder>, StoreError> {
+        self.list_reminders_async(owner_sub, event_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn replace_reminders(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+        reminders: Vec<Reminder>,
+    ) -> Result<(), StoreError> {
+        self.replace_reminders_async(owner_sub, event_id, &reminders)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_event_reminders(
+        &self,
+        owner_sub: &str,
+        event_id: &str,
+    ) -> Result<(), StoreError> {
+        self.delete_event_reminders_async(owner_sub, event_id)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn due_reminders(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<DueReminder>, StoreError> {
+        self.due_reminders_async(now_ms, limit)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn mark_reminder_delivered(
+        &self,
+        reminder_id: &str,
+        when_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.mark_reminder_delivered_async(reminder_id, when_ms)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 }
 
@@ -730,5 +1400,134 @@ mod tests {
 
         // Another owner is unaffected — still the default.
         assert_eq!(store.get_settings("bob").await.unwrap(), Settings::default_for("bob"));
+    }
+
+    fn attendee(id: &str, event: &str, owner: &str, email: &str, token: &str) -> Attendee {
+        Attendee {
+            id: id.to_string(),
+            event_id: event.to_string(),
+            owner_sub: owner.to_string(),
+            email: email.to_string(),
+            name: String::new(),
+            status: "needs-action".to_string(),
+            token: token.to_string(),
+            created_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn attendees_replace_and_token_rsvp() {
+        let store = InMemoryStore::new();
+        store
+            .replace_attendees(
+                "alice",
+                "e1",
+                vec![
+                    attendee("a1", "e1", "alice", "guest@x.co", "tok-guest"),
+                    attendee("a2", "e1", "alice", "team@x.co", "tok-team"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.list_attendees("alice", "e1").await.unwrap().len(), 2);
+        // Another owner sees nothing for the same event id.
+        assert!(store.list_attendees("bob", "e1").await.unwrap().is_empty());
+
+        // Public token lookup is NOT owner-scoped; RSVP updates status.
+        let got = store.get_attendee_by_token("tok-guest").await.unwrap().unwrap();
+        assert_eq!(got.email, "guest@x.co");
+        let updated = store
+            .set_attendee_status_by_token("tok-guest", "accepted")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "accepted");
+        // An unknown token yields None (no panic, no mutation).
+        assert!(store.set_attendee_status_by_token("nope", "declined").await.unwrap().is_none());
+
+        // Replace preserves only the final set; old rows are gone.
+        store
+            .replace_attendees("alice", "e1", vec![attendee("a3", "e1", "alice", "solo@x.co", "tok-solo")])
+            .await
+            .unwrap();
+        assert_eq!(store.list_attendees("alice", "e1").await.unwrap().len(), 1);
+        assert!(store.get_attendee_by_token("tok-guest").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reminders_due_scan_and_mark_delivered() {
+        let store = InMemoryStore::new();
+        // Event starts at t=1_000_000 ms.
+        let start = 1_000_000i64;
+        store.upsert_event(ev("e1", "alice", "Standup", start)).await.unwrap();
+        // Two reminders: 10 min before (fires at start-600_000) and at-time (fires at start).
+        store
+            .replace_reminders(
+                "alice",
+                "e1",
+                vec![
+                    Reminder { id: "r10".into(), event_id: "e1".into(), owner_sub: "alice".into(), minutes_before: 10, delivered_at: 0, created_at: 0 },
+                    Reminder { id: "r0".into(), event_id: "e1".into(), owner_sub: "alice".into(), minutes_before: 0, delivered_at: 0, created_at: 0 },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.list_reminders("alice", "e1").await.unwrap().len(), 2);
+
+        // Well before either fire time: nothing due.
+        assert!(store.due_reminders(start - 700_000, 100).await.unwrap().is_empty());
+
+        // After the 10-min fire time but before start: only r10 is due.
+        let due = store.due_reminders(start - 300_000, 100).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].reminder_id, "r10");
+        assert_eq!(due[0].event_title, "Standup");
+
+        // Deliver r10; it no longer appears. At start, r0 fires.
+        store.mark_reminder_delivered("r10", 42).await.unwrap();
+        let due = store.due_reminders(start, 100).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].reminder_id, "r0");
+
+        // Past the start instant: the upcoming-only guard drops everything.
+        store.mark_reminder_delivered("r0", 43).await.unwrap();
+        assert!(store.due_reminders(start + 1, 100).await.unwrap().is_empty());
+
+        // Limit bounds the result set.
+        store
+            .replace_reminders(
+                "alice",
+                "e1",
+                vec![
+                    Reminder { id: "x1".into(), event_id: "e1".into(), owner_sub: "alice".into(), minutes_before: 30, delivered_at: 0, created_at: 0 },
+                    Reminder { id: "x2".into(), event_id: "e1".into(), owner_sub: "alice".into(), minutes_before: 20, delivered_at: 0, created_at: 0 },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.due_reminders(start - 100_000, 1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_event_cascade_helpers_scope_to_owner() {
+        let store = InMemoryStore::new();
+        store
+            .replace_attendees("alice", "e1", vec![attendee("a1", "e1", "alice", "g@x.co", "t1")])
+            .await
+            .unwrap();
+        store
+            .replace_reminders("alice", "e1", vec![Reminder { id: "r1".into(), event_id: "e1".into(), owner_sub: "alice".into(), minutes_before: 5, delivered_at: 0, created_at: 0 }])
+            .await
+            .unwrap();
+        // A different owner's delete does not touch alice's rows.
+        store.delete_event_attendees("bob", "e1").await.unwrap();
+        store.delete_event_reminders("bob", "e1").await.unwrap();
+        assert_eq!(store.list_attendees("alice", "e1").await.unwrap().len(), 1);
+        assert_eq!(store.list_reminders("alice", "e1").await.unwrap().len(), 1);
+        // The owner's cascade clears them.
+        store.delete_event_attendees("alice", "e1").await.unwrap();
+        store.delete_event_reminders("alice", "e1").await.unwrap();
+        assert!(store.list_attendees("alice", "e1").await.unwrap().is_empty());
+        assert!(store.list_reminders("alice", "e1").await.unwrap().is_empty());
     }
 }

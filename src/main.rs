@@ -168,9 +168,21 @@ async fn build_cal() -> Result<Router, String> {
         .map_err(|e| format!("connect: {e}"))?;
     pg.migrate().await.map_err(|e| format!("migrate: {e}"))?;
     tracing::info!("cal (almanac) store ready");
+    let config = almanac::config::Config::from_env();
+    let store: Arc<dyn almanac::store::Store> = Arc::new(pg);
+    // Reminder delivery: when ALMANAC_KLAXON_NOTIFY_URL/_INGEST_TOKEN are set, run the bounded
+    // due-reminder scanner that POSTs in-app notifications to Klaxon (sibling surface in-process).
+    if let (Some(url), Some(token)) = (
+        config.klaxon_notify_url.clone(),
+        config.klaxon_ingest_token.clone(),
+    ) {
+        let sink = Arc::new(almanac::reminders::HttpKlaxonSink::new(url, token));
+        almanac::reminders::spawn_reminder_scanner(store.clone(), sink, Duration::from_secs(30));
+        tracing::info!("cal (almanac) reminder scanner started");
+    }
     let state = almanac::AppState {
-        config: Arc::new(almanac::config::Config::from_env()),
-        store: Arc::new(pg),
+        config: Arc::new(config),
+        store,
     };
     Ok(almanac::app(state))
 }

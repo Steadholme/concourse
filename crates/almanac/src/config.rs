@@ -19,18 +19,32 @@ pub const DAY_CHIP_LIMIT: usize = 3;
 /// (366 days). Bounds occurrence generation so an open-ended series stays cheap to render.
 pub const AGENDA_HORIZON_MS: i64 = 366 * 86_400_000;
 
+/// How often the standalone reminder scanner runs one bounded due-scan, seconds.
+pub const REMINDER_SCAN_SECS: u64 = 30;
+
 /// Runtime configuration. Cheap to clone; shared read-only behind `Arc`.
+///
+/// The `klaxon_notify_*` fields are the OPTIONAL reminder-delivery hook. They live on `Config`
+/// (populated by [`Config::from_env`]) rather than on `AppState` so the composite — which builds
+/// `AppState` with an explicit `{ config, store }` literal — picks them up unchanged. Both `None`
+/// (the default) leaves reminders stored + queryable but undelivered.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Listen address (`BIND_ADDR`).
     pub bind_addr: String,
+    /// Klaxon internal ingest URL, e.g. `http://klaxon:9050/api/notify` (`ALMANAC_KLAXON_NOTIFY_URL`).
+    pub klaxon_notify_url: Option<String>,
+    /// Bearer token for that ingest (`ALMANAC_KLAXON_INGEST_TOKEN` = Klaxon's `KLAXON_INGEST_TOKEN`).
+    pub klaxon_ingest_token: Option<String>,
 }
 
 impl Config {
-    /// Default development configuration (in-memory, no database, no persistence).
+    /// Default development configuration (in-memory, no database, no persistence, no delivery).
     pub fn dev() -> Self {
         Config {
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
+            klaxon_notify_url: None,
+            klaxon_ingest_token: None,
         }
     }
 
@@ -40,6 +54,8 @@ impl Config {
         if let Some(v) = env_nonempty("BIND_ADDR") {
             config.bind_addr = v;
         }
+        config.klaxon_notify_url = env_nonempty("ALMANAC_KLAXON_NOTIFY_URL");
+        config.klaxon_ingest_token = env_nonempty("ALMANAC_KLAXON_INGEST_TOKEN");
         config
     }
 }

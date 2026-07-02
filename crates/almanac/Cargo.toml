@@ -19,7 +19,10 @@ path = "src/main.rs"
 axum = "0.8"
 # Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
 # PgStore uses sqlx natively, so a worker thread is NEVER blocked (no sync-over-async bridge).
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# `net`/`io-util`/`time` back the reminder delivery hook: a raw TCP HTTP/1.1 POST to Klaxon's
+# internal ingest (mirroring the sibling producers — no HTTP-client dependency) plus the timed,
+# bounded due-scan. Inert unless `ALMANAC_KLAXON_NOTIFY_URL` is configured.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "io-util", "time"] }
 # Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe (same seam as the
 # rest of the estate).
 async-trait = "0.1"

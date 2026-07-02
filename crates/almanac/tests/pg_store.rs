@@ -46,6 +46,8 @@ async fn pg_store_full_integration() {
 
     // Raw pool for clean-slate setup, out-of-band asserts, and teardown.
     let raw = PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+    sqlx::query("DELETE FROM event_attendees").execute(&raw).await.unwrap();
+    sqlx::query("DELETE FROM event_reminders").execute(&raw).await.unwrap();
     sqlx::query("DELETE FROM events").execute(&raw).await.unwrap();
     sqlx::query("DELETE FROM contacts").execute(&raw).await.unwrap();
     sqlx::query("DELETE FROM settings").execute(&raw).await.unwrap();
@@ -231,13 +233,121 @@ async fn pg_store_full_integration() {
         .unwrap();
     assert_eq!(settings_count, 1, "one settings row per owner");
 
+    // --- attendees + reminders + RSVP + due-scan through Postgres ----------
+    let (_s, ah, _b) = call(&state, get_as("/new", "u_alice", "alice@holdfast.local")).await;
+    let acookie = set_cookie(&ah).unwrap();
+    let acsrf = cookie_value(&acookie).unwrap();
+    let ev = post_form(
+        &state,
+        "/new",
+        &acookie,
+        "u_alice",
+        "alice@holdfast.local",
+        &[
+            ("csrf_token", &acsrf),
+            ("title", "Review"),
+            ("starts_at", "2099-09-01T09:00"),
+            ("ends_at", "2099-09-01T10:00"),
+            ("attendees", "Guest <guest@x.co>"),
+            ("rem_10", "on"),
+        ],
+    )
+    .await;
+    assert_eq!(ev.0, StatusCode::SEE_OTHER);
+    let (_s, _h, m9) = call(&state, get_as("/?y=2099&m=9", "u_alice", "alice@holdfast.local")).await;
+    let eid = find_between(&m9, "/edit/", "\"").expect("event id");
+
+    let acount: i64 = sqlx::query("SELECT count(*) AS n FROM event_attendees WHERE event_id = $1")
+        .bind(&eid)
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap();
+    assert_eq!(acount, 1, "attendee persisted to Postgres");
+    let rcount: i64 = sqlx::query("SELECT count(*) AS n FROM event_reminders WHERE event_id = $1")
+        .bind(&eid)
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap();
+    assert_eq!(rcount, 1, "reminder persisted to Postgres");
+
+    // The public RSVP token round-trips and updates the row.
+    let (_s, _h, detail) =
+        call(&state, get_as(&format!("/event/{eid}"), "u_alice", "alice@holdfast.local")).await;
+    let token = find_between(&detail, "/rsvp/", "\"").expect("rsvp token");
+    let rs = call(
+        &state,
+        Request::builder()
+            .uri(format!("/rsvp/{token}?reply=accepted"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(rs.0, StatusCode::OK);
+    let status: String = sqlx::query("SELECT status FROM event_attendees WHERE token = $1")
+        .bind(&token)
+        .fetch_one(&raw)
+        .await
+        .unwrap()
+        .try_get("status")
+        .unwrap();
+    assert_eq!(status, "accepted", "RSVP status persisted to Postgres");
+
+    // due_reminders: an imminent event with a 10-min reminder surfaces from the JOIN query, then
+    // stops once marked delivered.
+    use almanac::store::{Event as StoreEvent, Reminder as StoreReminder};
+    let now = almanac::now_ms();
+    state
+        .store
+        .upsert_event(StoreEvent {
+            id: "pg-soon".into(),
+            owner_sub: "u_alice".into(),
+            title: "Soon".into(),
+            starts_at: now + 5 * 60_000,
+            ends_at: now + 65 * 60_000,
+            all_day: false,
+            location: String::new(),
+            notes: String::new(),
+            rrule: String::new(),
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    state
+        .store
+        .replace_reminders(
+            "u_alice",
+            "pg-soon",
+            vec![StoreReminder {
+                id: "pg-rem".into(),
+                event_id: "pg-soon".into(),
+                owner_sub: "u_alice".into(),
+                minutes_before: 10,
+                delivered_at: 0,
+                created_at: now,
+            }],
+        )
+        .await
+        .unwrap();
+    let due = state.store.due_reminders(now, 50).await.unwrap();
+    assert!(due.iter().any(|d| d.reminder_id == "pg-rem"), "due reminder surfaces from Postgres JOIN");
+    state.store.mark_reminder_delivered("pg-rem", now).await.unwrap();
+    let due2 = state.store.due_reminders(now, 50).await.unwrap();
+    assert!(!due2.iter().any(|d| d.reminder_id == "pg-rem"), "delivered reminder no longer due");
+
     // Teardown.
+    sqlx::query("DELETE FROM event_attendees").execute(&raw).await.unwrap();
+    sqlx::query("DELETE FROM event_reminders").execute(&raw).await.unwrap();
     sqlx::query("DELETE FROM events").execute(&raw).await.unwrap();
     sqlx::query("DELETE FROM contacts").execute(&raw).await.unwrap();
     sqlx::query("DELETE FROM settings").execute(&raw).await.unwrap();
     println!(
         "PG STORE INTEGRATION OK: migrate (idempotent) + event create/edit upsert + created_at \
-         preserved + owner isolation + CSRF enforced + delete + contacts — all through Postgres."
+         preserved + owner isolation + CSRF enforced + delete + contacts + attendees/RSVP + \
+         reminders due-scan — all through Postgres."
     );
 }
 

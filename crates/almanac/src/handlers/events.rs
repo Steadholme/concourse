@@ -19,8 +19,22 @@ use crate::error::AppError;
 use crate::handlers::html_with_csrf_cookie;
 use crate::render::{self, esc, layout};
 use crate::rrule::{self, Freq};
-use crate::store::Event;
-use crate::{now_ms, AppState};
+use crate::store::{Attendee, Event, Reminder};
+use crate::{now_ms, quickadd, AppState};
+
+/// Reminder presets offered as checkboxes: `(form field suffix, minutes_before, label)`.
+const REMINDER_PRESETS: &[(&str, i64, &str)] = &[
+    ("0", 0, "At time of event"),
+    ("5", 5, "5 minutes before"),
+    ("10", 10, "10 minutes before"),
+    ("15", 15, "15 minutes before"),
+    ("30", 30, "30 minutes before"),
+    ("60", 60, "1 hour before"),
+    ("120", 120, "2 hours before"),
+    ("1440", 1440, "1 day before"),
+];
+/// Hard cap on attendees parsed from one submission.
+const MAX_ATTENDEES: usize = 100;
 
 /// Pixel height of one hour row in the week/day time-grid (matches the `.tgrid` CSS).
 const HOUR_PX: f64 = 48.0;
@@ -107,6 +121,27 @@ pub struct EventForm {
     /// Optional `YYYY-MM-DD` end date (`UNTIL`).
     #[serde(default)]
     pub repeat_until: String,
+    /// Attendees, one per line: `Name <email@host>` or `email@host`.
+    #[serde(default)]
+    pub attendees: String,
+    // Reminder preset checkboxes (`"on"` when ticked). Distinct fields (not a repeated key) so
+    // `serde_urlencoded` deserializes them without a Vec.
+    #[serde(default)]
+    pub rem_0: Option<String>,
+    #[serde(default)]
+    pub rem_5: Option<String>,
+    #[serde(default)]
+    pub rem_10: Option<String>,
+    #[serde(default)]
+    pub rem_15: Option<String>,
+    #[serde(default)]
+    pub rem_30: Option<String>,
+    #[serde(default)]
+    pub rem_60: Option<String>,
+    #[serde(default)]
+    pub rem_120: Option<String>,
+    #[serde(default)]
+    pub rem_1440: Option<String>,
 }
 
 /// A bare CSRF-only body, used by the delete forms.
@@ -114,6 +149,15 @@ pub struct EventForm {
 pub struct DeleteForm {
     #[serde(default)]
     pub csrf_token: String,
+}
+
+/// The quick-add box body: a raw phrase like `Lunch tomorrow 12pm`.
+#[derive(Debug, Deserialize)]
+pub struct QuickAddForm {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub text: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +212,12 @@ pub async fn index(
         }
     };
 
-    let content = format!("{}{}", render::subnav("calendar"), inner);
+    let content = format!(
+        "{}{}{}",
+        render::subnav("calendar"),
+        render_quick_add(&csrf),
+        inner
+    );
     let title = match kind {
         ViewKind::Week => "Week",
         ViewKind::Day => "Day",
@@ -176,6 +225,21 @@ pub async fn index(
     };
     let html = layout(title, &headers, &content);
     Ok(html_with_csrf_cookie(html, &csrf))
+}
+
+/// The natural-language quick-add box shown above every calendar view. Posts the raw phrase to
+/// `/quick-add`; an unparseable phrase re-renders the editor prefilled (see [`quick_add`]).
+fn render_quick_add(csrf: &str) -> String {
+    format!(
+        "<form class=\"card quickadd\" method=\"post\" action=\"/quick-add\">\
+           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+           <input class=\"quickadd__input\" type=\"text\" name=\"text\" autocomplete=\"off\" \
+             maxlength=\"200\" placeholder=\"Quick add — e.g. Lunch tomorrow 12pm\" \
+             aria-label=\"Quick add an event\">\
+           <button class=\"btn btn-primary\" type=\"submit\">Add</button>\
+         </form>",
+        csrf = esc(csrf),
+    )
 }
 
 /// The Month / Week / Day switch pills, threading `anchor` (an owner-local `YYYY-MM-DD`) so
@@ -640,6 +704,8 @@ pub async fn new_form(
         repeat_interval,
         repeat_count,
         repeat_until,
+        attendees: String::new(),
+        reminders: Vec::new(),
         csrf: csrf.clone(),
         is_edit: false,
         id: String::new(),
@@ -664,12 +730,14 @@ pub async fn create(
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
     let parsed = parse_event_form(&form, off)?;
+    let now = now_ms();
+    let id = auth::random_hex();
 
     state
         .store
         .upsert_event(Event {
-            id: auth::random_hex(),
-            owner_sub: owner,
+            id: id.clone(),
+            owner_sub: owner.clone(),
             title: parsed.title,
             starts_at: parsed.starts_at,
             ends_at: parsed.ends_at,
@@ -677,10 +745,12 @@ pub async fn create(
             location: parsed.location,
             notes: parsed.notes,
             rrule: parsed.rrule,
-            created_at: now_ms(),
+            created_at: now,
         })
         .await?;
+    save_attendees_and_reminders(&state, &owner, &id, &form, now).await?;
 
+    tracing::info!(target: "audit", event = "event.created", "event created");
     Ok(redirect_to_month(parsed.starts_at, off))
 }
 
@@ -704,6 +774,14 @@ pub async fn edit_form(
     let csrf = auth::new_csrf_token();
     let (repeat, repeat_interval, repeat_count, repeat_until) =
         FormView::recurrence_from(&event.rrule);
+    let attendees = state.store.list_attendees(&owner, &id).await?;
+    let reminders: Vec<i64> = state
+        .store
+        .list_reminders(&owner, &id)
+        .await?
+        .iter()
+        .map(|r| r.minutes_before)
+        .collect();
     let view = FormView {
         action: format!("/edit/{}", event.id),
         title: event.title.clone(),
@@ -716,6 +794,8 @@ pub async fn edit_form(
         repeat_interval,
         repeat_count,
         repeat_until,
+        attendees: format_attendees_textarea(&attendees),
+        reminders,
         csrf: csrf.clone(),
         is_edit: true,
         id: event.id.clone(),
@@ -747,12 +827,13 @@ pub async fn update(
         .await?
         .ok_or_else(|| AppError::NotFound("That event does not exist.".to_string()))?;
     let parsed = parse_event_form(&form, off)?;
+    let now = now_ms();
 
     state
         .store
         .upsert_event(Event {
             id: existing.id,
-            owner_sub: owner,
+            owner_sub: owner.clone(),
             title: parsed.title,
             starts_at: parsed.starts_at,
             ends_at: parsed.ends_at,
@@ -763,7 +844,9 @@ pub async fn update(
             created_at: existing.created_at,
         })
         .await?;
+    save_attendees_and_reminders(&state, &owner, &id, &form, now).await?;
 
+    tracing::info!(target: "audit", event = "event.updated", "event updated");
     Ok(redirect_to_month(parsed.starts_at, off))
 }
 
@@ -780,7 +863,69 @@ pub async fn delete(
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
     state.store.delete_event(&owner, &id).await?;
+    // Cascade: an event's attendees + reminders go with it (both ownership-scoped).
+    state.store.delete_event_attendees(&owner, &id).await?;
+    state.store.delete_event_reminders(&owner, &id).await?;
+    tracing::info!(target: "audit", event = "event.deleted", "event deleted");
     Ok(Redirect::to("/").into_response())
+}
+
+// ---------------------------------------------------------------------------
+// POST /quick-add  — natural-language quick-add
+// ---------------------------------------------------------------------------
+
+pub async fn quick_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<QuickAddForm>,
+) -> Result<Response, AppError> {
+    require_csrf(&headers, &form.csrf_token)?;
+    let owner = auth::owner_subject(&headers);
+    let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
+    let raw = form.text.trim();
+
+    match quickadd::parse_quick_add(raw) {
+        Some(qa) => {
+            let now = now_ms();
+            // Resolve the relative day against the owner's LOCAL "today", place the time, then
+            // convert the local wall clock back to a real UTC instant to store.
+            let local_now = now + off as i64 * 60_000;
+            let today_local_mid = calendar::start_of_day(local_now);
+            let target_local_mid = quickadd::resolve_local_midnight(qa.day, today_local_mid);
+            let local_start =
+                target_local_mid + qa.hour as i64 * 3_600_000 + qa.minute as i64 * 60_000;
+            let starts_at = local_start - off as i64 * 60_000;
+
+            let id = auth::random_hex();
+            state
+                .store
+                .upsert_event(Event {
+                    id,
+                    owner_sub: owner,
+                    title: qa.title,
+                    starts_at,
+                    ends_at: starts_at + 3_600_000,
+                    all_day: false,
+                    location: String::new(),
+                    notes: String::new(),
+                    rrule: String::new(),
+                    created_at: now,
+                })
+                .await?;
+            tracing::info!(target: "audit", event = "event.created", "event quick-added");
+            Ok(redirect_to_month(starts_at, off))
+        }
+        None => {
+            // Unparseable: fall back to the normal editor, prefilled with the raw text as the title.
+            let csrf = auth::new_csrf_token();
+            let view = blank_form_view(&csrf, raw);
+            let content = format!("{}{}", render::subnav("calendar"), render_event_form(&view));
+            Ok(html_with_csrf_cookie(
+                layout("New event", &headers, &content),
+                &csrf,
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -801,9 +946,37 @@ struct FormView {
     repeat_interval: String,
     repeat_count: String,
     repeat_until: String,
+    /// Attendees textarea value (`Name <email>` lines).
+    attendees: String,
+    /// Which reminder presets (minutes-before) are currently checked.
+    reminders: Vec<i64>,
     csrf: String,
     is_edit: bool,
     id: String,
+}
+
+/// A blank (non-recurring) create-form view, optionally prefilled with a `title` — used by the
+/// quick-add fallback when a phrase could not be parsed.
+fn blank_form_view(csrf: &str, title: &str) -> FormView {
+    let (repeat, repeat_interval, repeat_count, repeat_until) = FormView::no_recurrence();
+    FormView {
+        action: "/new".to_string(),
+        title: title.to_string(),
+        starts_local: String::new(),
+        ends_local: String::new(),
+        all_day: false,
+        location: String::new(),
+        notes: String::new(),
+        repeat,
+        repeat_interval,
+        repeat_count,
+        repeat_until,
+        attendees: String::new(),
+        reminders: Vec::new(),
+        csrf: csrf.to_string(),
+        is_edit: false,
+        id: String::new(),
+    }
 }
 
 impl FormView {
@@ -876,6 +1049,209 @@ fn render_recurrence(v: &FormView) -> String {
     )
 }
 
+/// The attendees textarea (one `Name <email>` per line).
+fn render_attendees_field(v: &FormView) -> String {
+    format!(
+        "<div class=\"editor__field\">\
+           <label for=\"attendees\">Attendees</label>\
+           <textarea id=\"attendees\" name=\"attendees\" rows=\"3\" \
+             placeholder=\"One per line — Name &lt;email@host&gt; or email@host\">{attendees}</textarea>\
+           <p class=\"editor__hint\">Each attendee gets a private RSVP link — open the event page after saving to copy it.</p>\
+         </div>",
+        attendees = esc(&v.attendees),
+    )
+}
+
+/// The reminder-preset checkbox group.
+fn render_reminders(v: &FormView) -> String {
+    let boxes: String = REMINDER_PRESETS
+        .iter()
+        .map(|(suffix, minutes, label)| {
+            let checked = if v.reminders.contains(minutes) { " checked" } else { "" };
+            format!(
+                "<label class=\"check\"><input type=\"checkbox\" name=\"rem_{suffix}\" value=\"on\"{checked}> {label}</label>",
+                suffix = suffix,
+                checked = checked,
+                label = label,
+            )
+        })
+        .collect();
+    format!(
+        "<fieldset class=\"editor__field editor__recur\">\
+           <legend>Reminders</legend>\
+           <div class=\"reminders-grid\">{boxes}</div>\
+           <p class=\"editor__hint\">Delivered as an in-app notification before the event starts.</p>\
+         </fieldset>",
+        boxes = boxes,
+    )
+}
+
+/// The reminder minutes-before selected by the form's preset checkboxes.
+fn reminder_minutes_from_form(f: &EventForm) -> Vec<i64> {
+    let mut out = Vec::new();
+    if checkbox_on(f.rem_0.as_deref()) {
+        out.push(0);
+    }
+    if checkbox_on(f.rem_5.as_deref()) {
+        out.push(5);
+    }
+    if checkbox_on(f.rem_10.as_deref()) {
+        out.push(10);
+    }
+    if checkbox_on(f.rem_15.as_deref()) {
+        out.push(15);
+    }
+    if checkbox_on(f.rem_30.as_deref()) {
+        out.push(30);
+    }
+    if checkbox_on(f.rem_60.as_deref()) {
+        out.push(60);
+    }
+    if checkbox_on(f.rem_120.as_deref()) {
+        out.push(120);
+    }
+    if checkbox_on(f.rem_1440.as_deref()) {
+        out.push(1440);
+    }
+    out
+}
+
+/// Parse the attendees textarea into `(name, email)` pairs. Lines without a usable email are
+/// dropped; duplicate emails (case-insensitive) collapse to the first; capped at [`MAX_ATTENDEES`].
+fn parse_attendees(raw: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, email) = parse_attendee_line(line);
+        if email.is_empty() {
+            continue; // an RSVP needs an address
+        }
+        if seen.insert(email.to_lowercase()) {
+            out.push((name, email));
+        }
+        if out.len() >= MAX_ATTENDEES {
+            break;
+        }
+    }
+    out
+}
+
+/// Parse one attendee line: `Name <email>` → (name, email); a bare `email` token → ("", email);
+/// otherwise → (line, "") which the caller drops (no address).
+fn parse_attendee_line(line: &str) -> (String, String) {
+    // The email is the TRAILING `<...>` group, so a name may itself contain angle brackets.
+    if let (Some(lt), Some(gt)) = (line.rfind('<'), line.rfind('>')) {
+        if lt < gt {
+            let email = line[lt + 1..gt].trim();
+            let name = line[..lt].trim();
+            if email.contains('@') && !email.contains(char::is_whitespace) {
+                return (name.to_string(), email.to_string());
+            }
+        }
+    }
+    if line.contains('@') && !line.contains(char::is_whitespace) {
+        return (String::new(), line.to_string());
+    }
+    (line.to_string(), String::new())
+}
+
+/// Format stored attendees back into textarea lines for the edit form.
+fn format_attendees_textarea(attendees: &[Attendee]) -> String {
+    attendees
+        .iter()
+        .map(|a| {
+            if a.name.trim().is_empty() {
+                a.email.clone()
+            } else {
+                format!("{} <{}>", a.name, a.email)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reconcile submitted `(name, email)` pairs against the event's existing attendees: an email that
+/// is retained KEEPS its id/token/status (so its RSVP link + reply stay valid), while a new email
+/// gets a fresh token and `needs-action`. Removed emails simply fall out of the returned set.
+fn reconcile_attendees(
+    owner: &str,
+    event_id: &str,
+    submitted: &[(String, String)],
+    existing: &[Attendee],
+    now: i64,
+) -> Vec<Attendee> {
+    submitted
+        .iter()
+        .map(|(name, email)| {
+            let key = email.to_lowercase();
+            match existing
+                .iter()
+                .find(|e| !e.email.is_empty() && e.email.to_lowercase() == key)
+            {
+                Some(prev) => Attendee {
+                    id: prev.id.clone(),
+                    event_id: event_id.to_string(),
+                    owner_sub: owner.to_string(),
+                    email: email.clone(),
+                    name: name.clone(),
+                    status: prev.status.clone(),
+                    token: prev.token.clone(),
+                    created_at: prev.created_at,
+                },
+                None => Attendee {
+                    id: auth::random_hex(),
+                    event_id: event_id.to_string(),
+                    owner_sub: owner.to_string(),
+                    email: email.clone(),
+                    name: name.clone(),
+                    status: "needs-action".to_string(),
+                    token: auth::random_hex(),
+                    created_at: now,
+                },
+            }
+        })
+        .collect()
+}
+
+/// Persist the submitted attendees + reminders for an event. Attendees reconcile against the stored
+/// set (retained RSVP links survive); reminders preserve `delivered_at` for a retained minutes value
+/// so a trivial edit does not re-fire an already-delivered reminder.
+async fn save_attendees_and_reminders(
+    state: &AppState,
+    owner: &str,
+    event_id: &str,
+    form: &EventForm,
+    now: i64,
+) -> Result<(), AppError> {
+    let submitted = parse_attendees(&form.attendees);
+    let existing_att = state.store.list_attendees(owner, event_id).await?;
+    let attendees = reconcile_attendees(owner, event_id, &submitted, &existing_att, now);
+    state.store.replace_attendees(owner, event_id, attendees).await?;
+
+    let minutes = reminder_minutes_from_form(form);
+    let existing_rem = state.store.list_reminders(owner, event_id).await?;
+    let reminders: Vec<Reminder> = minutes
+        .into_iter()
+        .map(|m| {
+            let prev = existing_rem.iter().find(|r| r.minutes_before == m);
+            Reminder {
+                id: prev.map(|r| r.id.clone()).unwrap_or_else(auth::random_hex),
+                event_id: event_id.to_string(),
+                owner_sub: owner.to_string(),
+                minutes_before: m,
+                delivered_at: prev.map(|r| r.delivered_at).unwrap_or(0),
+                created_at: prev.map(|r| r.created_at).unwrap_or(now),
+            }
+        })
+        .collect();
+    state.store.replace_reminders(owner, event_id, reminders).await?;
+    Ok(())
+}
+
 fn render_event_form(v: &FormView) -> String {
     let main = format!(
         "<form class=\"card editor\" method=\"post\" action=\"{action}\">\
@@ -907,9 +1283,12 @@ fn render_event_form(v: &FormView) -> String {
              <label for=\"notes\">Notes</label>\
              <textarea id=\"notes\" name=\"notes\" rows=\"5\">{notes}</textarea>\
            </div>\
+           {attendees}\
+           {reminders}\
            {recurrence}\
            <div class=\"editor__actions\">\
              <a class=\"btn btn-secondary\" href=\"/\">Cancel</a>\
+             {detail_link}\
              <button class=\"btn btn-primary\" type=\"submit\">Save event</button>\
            </div>\
          </form>",
@@ -922,7 +1301,17 @@ fn render_event_form(v: &FormView) -> String {
         checked = if v.all_day { " checked" } else { "" },
         location = esc(&v.location),
         notes = esc(&v.notes),
+        attendees = render_attendees_field(v),
+        reminders = render_reminders(v),
         recurrence = render_recurrence(v),
+        detail_link = if v.is_edit {
+            format!(
+                "<a class=\"btn btn-secondary\" href=\"/event/{id}\">Event page</a>",
+                id = esc(&v.id)
+            )
+        } else {
+            String::new()
+        },
     );
 
     if !v.is_edit {
@@ -1021,5 +1410,87 @@ pub(crate) fn require_csrf(headers: &HeaderMap, token: &str) -> Result<(), AppEr
         Err(AppError::Forbidden(
             "CSRF token missing or invalid — reload the page and try again.".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_attendees_extracts_name_email_pairs() {
+        let raw = "Grace Hopper <grace@navy.mil>\n\
+                   bob@x.co\n\
+                   Just A Name\n\
+                   grace@navy.mil\n\
+                   ";
+        let got = parse_attendees(raw);
+        // Name+email, bare email; the name-only line is dropped (no address); duplicate collapses.
+        assert_eq!(
+            got,
+            vec![
+                ("Grace Hopper".to_string(), "grace@navy.mil".to_string()),
+                (String::new(), "bob@x.co".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_preserves_token_and_status_for_retained_email() {
+        let existing = vec![Attendee {
+            id: "a1".into(),
+            event_id: "e1".into(),
+            owner_sub: "alice".into(),
+            email: "guest@x.co".into(),
+            name: "Guest".into(),
+            status: "accepted".into(),
+            token: "keep-tok".into(),
+            created_at: 100,
+        }];
+        // Same email (different case) retained + a brand-new one added.
+        let submitted = vec![
+            ("Guest Renamed".to_string(), "GUEST@x.co".to_string()),
+            (String::new(), "new@x.co".to_string()),
+        ];
+        let out = reconcile_attendees("alice", "e1", &submitted, &existing, 200);
+        assert_eq!(out.len(), 2);
+        let retained = out.iter().find(|a| a.email.eq_ignore_ascii_case("guest@x.co")).unwrap();
+        assert_eq!(retained.token, "keep-tok", "RSVP link survives the edit");
+        assert_eq!(retained.status, "accepted", "status survives the edit");
+        assert_eq!(retained.name, "Guest Renamed", "display name updates");
+        assert_eq!(retained.id, "a1", "row identity preserved");
+        let added = out.iter().find(|a| a.email == "new@x.co").unwrap();
+        assert_eq!(added.status, "needs-action");
+        assert_ne!(added.token, "keep-tok");
+        assert!(!added.token.is_empty());
+    }
+
+    #[test]
+    fn reminder_minutes_reads_checked_presets() {
+        let mut f = EventForm {
+            csrf_token: String::new(),
+            title: String::new(),
+            starts_at: String::new(),
+            ends_at: String::new(),
+            all_day: None,
+            location: String::new(),
+            notes: String::new(),
+            repeat: String::new(),
+            repeat_interval: String::new(),
+            repeat_count: String::new(),
+            repeat_until: String::new(),
+            attendees: String::new(),
+            rem_0: None,
+            rem_5: None,
+            rem_10: Some("on".to_string()),
+            rem_15: None,
+            rem_30: None,
+            rem_60: Some("on".to_string()),
+            rem_120: None,
+            rem_1440: None,
+        };
+        assert_eq!(reminder_minutes_from_form(&f), vec![10, 60]);
+        f.rem_0 = Some("on".to_string());
+        assert_eq!(reminder_minutes_from_form(&f), vec![0, 10, 60]);
     }
 }

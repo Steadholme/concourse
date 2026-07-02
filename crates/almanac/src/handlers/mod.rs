@@ -8,8 +8,11 @@
 //! Shared helpers ([`html_with_csrf_cookie`], the 404 [`not_found`] fallback) live here.
 
 pub mod contacts;
+pub mod detail;
 pub mod events;
+pub mod feed;
 pub mod health;
+pub mod rsvp;
 pub mod settings;
 
 use axum::http::{header, HeaderMap, StatusCode};

@@ -141,6 +141,33 @@ pub fn error_page(status: u16, title: &str, detail: &str) -> String {
     layout(title, &HeaderMap::new(), &content)
 }
 
+/// A minimal PUBLIC page shell (no SSO app-bar, nav, or user chrome) for the no-SSO RSVP pages.
+/// Reuses the estate design tokens so it still looks native, but exposes no authenticated links.
+/// `content` is already-safe HTML built by the handler; `page_title` is escaped.
+pub fn public_shell(page_title: &str, content: &str) -> String {
+    format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <meta name=\"color-scheme\" content=\"light\"><meta name=\"robots\" content=\"noindex\">\
+         <title>{title} · Almanac · HOLDFAST</title><style>{css}</style></head>\
+         <body class=\"page-almanac\"><main class=\"wrap wrap--narrow\">{content}</main></body></html>",
+        title = esc(page_title),
+        css = APP_CSS,
+        content = content,
+    )
+}
+
+/// A design-system pill for an attendee's RSVP status.
+pub fn status_pill(status: &str) -> String {
+    let (cls, label) = match status {
+        "accepted" => ("pill pill-ok", "Accepted"),
+        "declined" => ("pill pill-down", "Declined"),
+        "tentative" => ("pill pill-warn", "Tentative"),
+        _ => ("pill pill-info", "No response"),
+    };
+    format!("<span class=\"{cls}\">{label}</span>")
+}
+
 /// Minimal HTML-escape for any untrusted text rendered into the page.
 pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

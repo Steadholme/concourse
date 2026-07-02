@@ -26,6 +26,47 @@
   var input = $("#composer-input");
   var pinnedPanel = $("#pinned-panel");
   var pinnedList = $("#pinned-list");
+  var roomView = document.querySelector(".room-view");
+  var sendBtn = composer ? composer.querySelector("button[type='submit']") : null;
+  var sendLabel = sendBtn ? sendBtn.textContent : "Send";
+  var jumpBtn = null; // the "jump to latest" affordance, lazily created
+
+  // Honor the OS "reduce motion" setting for our few micro-interactions (smooth scroll).
+  var reduceMotion = false;
+  try {
+    var mq = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
+    reduceMotion = !!(mq && mq.matches);
+    if (mq && mq.addEventListener) {
+      mq.addEventListener("change", function (e) { reduceMotion = e.matches; });
+    }
+  } catch (e) { /* matchMedia unsupported — keep instant scrolling */ }
+
+  // --- toast (transient write feedback via the Odyssey v2 .toast kit) --------
+  var toastHost = null;
+  function ensureToastHost() {
+    if (toastHost) return toastHost;
+    toastHost = document.createElement("div");
+    toastHost.className = "toast-host";
+    toastHost.setAttribute("aria-live", "polite");
+    toastHost.setAttribute("aria-atomic", "true");
+    document.body.appendChild(toastHost);
+    return toastHost;
+  }
+  // Show a small toast. `kind` is "ok" (default) or "err". Text is inserted as textContent only.
+  function toast(text, kind) {
+    var host = ensureToastHost();
+    var el = document.createElement("div");
+    el.className = "toast" + (kind === "err" ? " toast--err" : " toast--ok");
+    el.setAttribute("role", "status");
+    el.textContent = String(text);
+    host.appendChild(el);
+    // Reflow-then-show so the fade-in transition runs; auto-dismiss after a short hold.
+    requestAnimationFrame(function () { el.classList.add("is-in"); });
+    setTimeout(function () {
+      el.classList.remove("is-in");
+      setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 200);
+    }, 2600);
+  }
 
   // --- helpers --------------------------------------------------------------
 
@@ -133,16 +174,21 @@
     return quote;
   }
 
-  // Build/replace a message's reaction chip row from a reactions array ([{emoji,count}]).
-  function buildReactions(reactions) {
+  // Build/replace a message's reaction chip row from a reactions array ([{emoji,count}]). Chips the
+  // caller has reacted with (`mine`) are marked `is-mine` + aria-pressed for keyboard/AT clarity.
+  function buildReactions(reactions, mine) {
+    var mineSet = {};
+    for (var mi = 0; mi < (mine || []).length; mi++) mineSet[mine[mi]] = true;
     var wrap = document.createElement("div");
     wrap.className = "msg__reactions";
     for (var i = 0; i < (reactions || []).length; i++) {
       var r = reactions[i];
       var chip = document.createElement("button");
       chip.type = "button";
-      chip.className = "reaction";
+      chip.className = "reaction" + (mineSet[r.emoji] ? " is-mine" : "");
       chip.setAttribute("data-emoji", r.emoji);
+      chip.setAttribute("aria-pressed", mineSet[r.emoji] ? "true" : "false");
+      chip.setAttribute("aria-label", "React " + r.emoji);
       var em = document.createElement("span");
       em.className = "reaction__emoji";
       em.textContent = r.emoji;
@@ -156,24 +202,70 @@
     return wrap;
   }
 
-  // Replace (or drop) a message row's reaction chips in place.
-  function applyReactions(msgId, reactions) {
+  // Read a row's current reaction state back out of the DOM ({reactions:[{emoji,count}], mine:[]}).
+  function readReactions(row) {
+    var reactions = [];
+    var chips = row.querySelectorAll(".reaction");
+    for (var i = 0; i < chips.length; i++) {
+      var emoji = chips[i].getAttribute("data-emoji");
+      var cnt = parseInt((chips[i].querySelector(".reaction__count") || {}).textContent, 10) || 0;
+      reactions.push({ emoji: emoji, count: cnt });
+    }
+    var mine = [];
+    try { mine = JSON.parse(row.getAttribute("data-mine") || "[]"); } catch (e) { mine = []; }
+    return { reactions: reactions, mine: mine };
+  }
+
+  // Replace (or drop) a message row's reaction chips in place. When `mine` is omitted the row's
+  // existing "mine" set is preserved (live WS frames carry counts but not the viewer's own set).
+  function applyReactions(msgId, reactions, mine) {
     if (!timeline) return;
     var row = timeline.querySelector('[data-id="' + cssEscape(msgId) + '"]');
     if (!row) return;
+    if (mine === undefined) {
+      try { mine = JSON.parse(row.getAttribute("data-mine") || "[]"); } catch (e) { mine = []; }
+    }
+    row.setAttribute("data-mine", JSON.stringify(mine || []));
     var existing = row.querySelector(".msg__reactions");
     if (!reactions || reactions.length === 0) {
       if (existing) existing.remove();
       return;
     }
-    var next = buildReactions(reactions);
+    var next = buildReactions(reactions, mine);
     if (existing) existing.parentNode.replaceChild(next, existing);
     else row.appendChild(next);
   }
 
-  // Toggle a reaction on a message via the API (chips update live from the returned frame).
+  // Compute the optimistic next reaction state for a local toggle of `emoji` (before the server
+  // confirms): flip it in/out of `mine` and bump the matching chip's count, adding/removing chips.
+  function optimisticToggle(state, emoji) {
+    var mine = state.mine.slice();
+    var reactions = state.reactions.map(function (r) { return { emoji: r.emoji, count: r.count }; });
+    var had = mine.indexOf(emoji) !== -1;
+    var idx = -1;
+    for (var i = 0; i < reactions.length; i++) { if (reactions[i].emoji === emoji) { idx = i; break; } }
+    if (had) {
+      mine.splice(mine.indexOf(emoji), 1);
+      if (idx !== -1) { reactions[idx].count -= 1; if (reactions[idx].count <= 0) reactions.splice(idx, 1); }
+    } else {
+      mine.push(emoji);
+      if (idx !== -1) reactions[idx].count += 1;
+      else reactions.push({ emoji: emoji, count: 1 });
+    }
+    return { reactions: reactions, mine: mine };
+  }
+
+  // Toggle a reaction OPTIMISTICALLY: update the chips immediately for instant feedback, then POST.
+  // On success the server's authoritative counts + own-set replace the guess; on failure the prior
+  // chips are restored and a toast explains why (progressive: the /react form route is unchanged).
   function toggleReaction(msgId, emoji) {
     if (!emoji) return;
+    var row = timeline ? timeline.querySelector('[data-id="' + cssEscape(msgId) + '"]') : null;
+    var snapshot = row ? readReactions(row) : null;
+    if (snapshot) {
+      var next = optimisticToggle(snapshot, emoji);
+      applyReactions(msgId, next.reactions, next.mine);
+    }
     fetch("/api/rooms/" + encodeURIComponent(selected) + "/messages/" +
       encodeURIComponent(msgId) + "/react", {
       method: "POST",
@@ -181,9 +273,12 @@
       credentials: "same-origin",
       body: JSON.stringify({ emoji: emoji })
     })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (data) { if (data) applyReactions(msgId, data.reactions); })
-      .catch(function () {});
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+      .then(function (data) { applyReactions(msgId, data.reactions, data.mine); })
+      .catch(function () {
+        if (snapshot) applyReactions(msgId, snapshot.reactions, snapshot.mine);
+        toast("Couldn't save your reaction", "err");
+      });
   }
 
   // Append text to `el`, turning bare http/https URLs into <a> elements. Uses text nodes so the
@@ -221,11 +316,79 @@
     if (last < line.length) el.appendChild(document.createTextNode(line.slice(last)));
   }
 
-  function scrollToBottom() {
-    if (timeline) timeline.scrollTop = timeline.scrollHeight;
+  function scrollToBottom(smooth) {
+    if (!timeline) return;
+    if (smooth && !reduceMotion && timeline.scrollTo) {
+      timeline.scrollTo({ top: timeline.scrollHeight, behavior: "smooth" });
+    } else {
+      timeline.scrollTop = timeline.scrollHeight;
+    }
+    hideJump();
   }
 
   function clearTimeline() { if (timeline) timeline.innerHTML = ""; }
+
+  // --- jump-to-latest -------------------------------------------------------
+  // How far from the bottom (px) counts as "scrolled up" — below this the timeline auto-follows.
+  var NEAR_BOTTOM = 80;
+  function nearBottom() {
+    if (!timeline) return true;
+    return timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < NEAR_BOTTOM;
+  }
+  function ensureJumpBtn() {
+    if (jumpBtn || !roomView) return jumpBtn;
+    jumpBtn = document.createElement("button");
+    jumpBtn.type = "button";
+    jumpBtn.className = "jump-latest";
+    jumpBtn.hidden = true;
+    jumpBtn.setAttribute("aria-label", "Jump to latest messages");
+    var label = document.createElement("span");
+    label.className = "jump-latest__label";
+    label.textContent = "Jump to latest";
+    jumpBtn.appendChild(label);
+    jumpBtn.addEventListener("click", function () { scrollToBottom(true); });
+    roomView.appendChild(jumpBtn);
+    return jumpBtn;
+  }
+  function showJump(newCount) {
+    var b = ensureJumpBtn();
+    if (!b) return;
+    b.hidden = false;
+    var label = b.querySelector(".jump-latest__label");
+    if (newCount > 0) {
+      b.classList.add("has-new");
+      if (label) label.textContent = newCount + (newCount === 1 ? " new message" : " new messages");
+    }
+  }
+  function hideJump() {
+    if (!jumpBtn) return;
+    jumpBtn.hidden = true;
+    jumpBtn.classList.remove("has-new");
+    jumpBtn.__new = 0;
+    var label = jumpBtn.querySelector(".jump-latest__label");
+    if (label) label.textContent = "Jump to latest";
+  }
+  if (timeline) {
+    timeline.addEventListener("scroll", function () {
+      if (nearBottom()) hideJump();
+      else if (jumpBtn && !jumpBtn.classList.contains("has-new")) showJump(0);
+    });
+  }
+
+  // --- composer affordances (autosize + send-enabled + in-flight) ------------
+  function autosize() {
+    if (!input) return;
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 200) + "px";
+  }
+  function updateSendState() {
+    if (!sendBtn) return;
+    var empty = !input || input.value.trim().length === 0;
+    sendBtn.disabled = empty || sendBtn.classList.contains("is-sending");
+  }
+  if (input) {
+    input.addEventListener("input", function () { autosize(); updateSendState(); });
+  }
 
   // --- room switching + history --------------------------------------------
 
@@ -292,11 +455,26 @@
     });
   }
 
+  function setSending(on) {
+    if (!sendBtn) return;
+    if (on) {
+      sendBtn.classList.add("is-sending");
+      sendBtn.disabled = true;
+      sendBtn.textContent = "Sending…";
+    } else {
+      sendBtn.classList.remove("is-sending");
+      sendBtn.textContent = sendLabel;
+      updateSendState();
+    }
+  }
+
   function sendMessage() {
     var body = input ? input.value.trim() : "";
     if (!body) return;
+    if (sendBtn && sendBtn.classList.contains("is-sending")) return; // guard double-submit
     var payload = { body: body };
     if (replyTarget) payload.reply_to_id = replyTarget;
+    setSending(true);
     fetch("/api/rooms/" + encodeURIComponent(selected) + "/messages", {
       method: "POST",
       headers: apiHeaders(true),
@@ -304,11 +482,13 @@
       body: JSON.stringify(payload)
     })
       .then(function (r) {
-        if (r.ok && input) { input.value = ""; input.style.height = "auto"; }
+        if (!r.ok) throw new Error("send failed");
+        if (input) { input.value = ""; autosize(); }
         clearReply();
         // The message arrives back over /ws and is appended there (no optimistic dup).
       })
-      .catch(function () {});
+      .catch(function () { toast("Message not sent — check your connection", "err"); })
+      .then(function () { setSending(false); });
   }
 
   // --- reactions + threaded-reply affordances (event delegation) -----------
@@ -868,11 +1048,20 @@
       existing.parentNode.replaceChild(buildMessage(frame), existing);
       return;
     }
-    var emptyEl = timeline ? timeline.querySelector(".timeline__empty") : null;
+    var emptyEl = timeline.querySelector(".timeline__empty");
     if (emptyEl) emptyEl.remove();
-    var nearBottom = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 80;
+    var wasNear = nearBottom();
+    var mine = frame.sender_email === cfg.me;
     timeline.appendChild(buildMessage(frame));
-    if (nearBottom) scrollToBottom();
+    if (wasNear || mine) {
+      scrollToBottom(true);
+    } else {
+      // Reader is scrolled up: don't yank them — surface a "N new messages" jump affordance.
+      ensureJumpBtn();
+      var n = (jumpBtn.__new || 0) + 1;
+      jumpBtn.__new = n;
+      showJump(n);
+    }
     markRead(selected);
   }
 
@@ -892,6 +1081,8 @@
   // --- boot -----------------------------------------------------------------
 
   scrollToBottom();
+  autosize();
+  updateSendState();
   if (selected) markRead(selected);
   connect();
 })();

@@ -69,6 +69,8 @@ pub fn app(state: AppState) -> Router {
         .route("/delete/{id}", post(handlers::events::delete))
         // Natural-language quick-add ("Lunch tomorrow 12pm"); unparseable falls back to the editor.
         .route("/quick-add", post(handlers::events::quick_add))
+        // JSON sibling for the optimistic, no-reload quick-add box (the form route above stays).
+        .route("/quick-add.json", post(handlers::events::quick_add_json))
         .route("/calendars/new", post(handlers::events::create_calendar))
         .route(
             "/calendars/update/{id}",

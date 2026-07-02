@@ -142,6 +142,9 @@ pub trait Store: Send + Sync {
     /// Mark one notification read (when `id` is `Some`) or all of the user's unread (when `None`).
     /// Returns the number of rows updated.
     async fn mark_read(&self, keys: &[String], id: Option<&str>, now: i64) -> Result<u64, StoreError>;
+    /// Delete (dismiss) one of a user's notifications by id. Owner-scoped: only a row whose
+    /// `user_sub` matches ANY of `keys` AND whose id matches is removed. Returns rows deleted (0/1).
+    async fn delete_notification(&self, keys: &[String], id: &str) -> Result<u64, StoreError>;
     /// Count a user's unread notifications.
     async fn unread_count(&self, keys: &[String]) -> i64;
     /// Store (or refresh) a Web Push subscription, keyed by its unique `endpoint`.
@@ -244,6 +247,13 @@ impl Store for InMemoryStore {
             updated += 1;
         }
         Ok(updated)
+    }
+
+    async fn delete_notification(&self, keys: &[String], id: &str) -> Result<u64, StoreError> {
+        let mut all = self.notifications.lock().expect("notifications lock poisoned");
+        let before = all.len();
+        all.retain(|n| !(matches(&n.user_sub, keys) && n.id == id));
+        Ok((before - all.len()) as u64)
     }
 
     async fn unread_count(&self, keys: &[String]) -> i64 {
@@ -586,6 +596,19 @@ impl PgStore {
         Ok(result.rows_affected())
     }
 
+    async fn delete_notification_async(&self, keys: &[String], id: &str) -> Result<u64, sqlx::Error> {
+        let (k1, k2) = Self::key_pair(keys);
+        let result = sqlx::query(
+            "DELETE FROM notifications WHERE id = $1 AND (user_sub = $2 OR user_sub = $3)",
+        )
+        .bind(id)
+        .bind(&k1)
+        .bind(&k2)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn unread_count_async(&self, keys: &[String]) -> Result<i64, sqlx::Error> {
         let (k1, k2) = Self::key_pair(keys);
         let row = sqlx::query(
@@ -780,6 +803,12 @@ impl Store for PgStore {
 
     async fn mark_read(&self, keys: &[String], id: Option<&str>, now: i64) -> Result<u64, StoreError> {
         self.mark_read_async(keys, id, now)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    async fn delete_notification(&self, keys: &[String], id: &str) -> Result<u64, StoreError> {
+        self.delete_notification_async(keys, id)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
     }

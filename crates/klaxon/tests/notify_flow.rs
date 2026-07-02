@@ -248,6 +248,98 @@ async fn mark_read_requires_csrf_then_succeeds() {
     assert!(page.body.contains(r#"<span class="count" data-zero="0">0</span>"#));
 }
 
+/// POST a JSON body to `uri` as `subject` with the double-submit CSRF cookie set to `csrf`.
+fn json_post(uri: &str, subject: &str, csrf: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("x-auth-subject", subject)
+        .header(header::COOKIE, format!("__Host-csrf={csrf}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn optimistic_read_and_dismiss_json_endpoints() {
+    let st = state();
+    // Two notifications for the signed-in user.
+    for i in 0..2 {
+        let body = format!(r#"{{"user_sub":"{SUBJECT}","source":"loom","title":"Item {i}"}}"#);
+        assert_eq!(send(&st, ingest(Some(INGEST_TOKEN), &body)).await.status, StatusCode::OK);
+    }
+    // Mint a CSRF cookie.
+    let page = send(&st, inbox(SUBJECT, EMAIL)).await;
+    let cookie = page.csrf_cookie().expect("csrf cookie");
+    // Grab the two ids straight from the store (order-independent).
+    let ids: Vec<String> = st
+        .store
+        .list_notifications(&[SUBJECT.to_string()])
+        .await
+        .iter()
+        .map(|n| n.id.clone())
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    // read.json with a bad CSRF -> 401.
+    let bad = json_post(
+        "/api/read.json",
+        SUBJECT,
+        &cookie,
+        format!(r#"{{"id":"{}","csrf_token":"wrong"}}"#, ids[0]),
+    );
+    assert_eq!(send(&st, bad).await.status, StatusCode::UNAUTHORIZED);
+
+    // read.json marks one read and returns the fresh unread count.
+    let ok = json_post(
+        "/api/read.json",
+        SUBJECT,
+        &cookie,
+        format!(r#"{{"id":"{}","csrf_token":"{cookie}"}}"#, ids[0]),
+    );
+    let resp = send(&st, ok).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert!(resp.body.contains(r#""unread":1"#), "one unread remains: {}", resp.body);
+
+    // A FOREIGN dismiss (owner-scoped) removes nothing from the owner's inbox.
+    let mallory = send(&st, inbox("u_mallory", "m@w33d.xyz")).await;
+    let mcookie = mallory.csrf_cookie().unwrap();
+    let forged = json_post(
+        "/api/dismiss.json",
+        "u_mallory",
+        &mcookie,
+        format!(r#"{{"id":"{}","csrf_token":"{mcookie}"}}"#, ids[1]),
+    );
+    assert_eq!(send(&st, forged).await.status, StatusCode::OK);
+    assert_eq!(
+        st.store.list_notifications(&[SUBJECT.to_string()]).await.len(),
+        2,
+        "foreign dismiss must not touch the owner's rows"
+    );
+
+    // The owner dismisses the remaining unread -> the row is gone, unread hits 0.
+    let del = json_post(
+        "/api/dismiss.json",
+        SUBJECT,
+        &cookie,
+        format!(r#"{{"id":"{}","csrf_token":"{cookie}"}}"#, ids[1]),
+    );
+    let resp = send(&st, del).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert!(resp.body.contains(r#""unread":0"#), "no unread left: {}", resp.body);
+    assert_eq!(st.store.list_notifications(&[SUBJECT.to_string()]).await.len(), 1);
+
+    // The progressive-enhancement form route still works (no-JS dismiss) -> 303 redirect.
+    let form = form_post(
+        "/api/dismiss",
+        SUBJECT,
+        &cookie,
+        format!("csrf_token={cookie}&id={}", ids[0]),
+    );
+    assert_eq!(send(&st, form).await.status, StatusCode::SEE_OTHER);
+    assert!(st.store.list_notifications(&[SUBJECT.to_string()]).await.is_empty());
+}
+
 #[tokio::test]
 async fn subscribe_unsubscribe_roundtrip_is_owner_scoped() {
     let st = state();

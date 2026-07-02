@@ -14,7 +14,7 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::Form;
+use axum::{Form, Json};
 use serde::Deserialize;
 
 use crate::audit::AuditEvent;
@@ -27,6 +27,15 @@ use crate::{new_id, now_secs, AppState};
 
 const DASHBOARD_HTML: &str = include_str!("../../templates/dashboard.html");
 const SERVICE_WORKER_JS: &str = include_str!("../../static/sw.js");
+
+/// The Odyssey v2 `.empty` kit state shown when the inbox has no notifications. Reused verbatim by
+/// the page JS when the last card is dismissed, so the calm empty state is identical either way.
+const EMPTY_INBOX_HTML: &str = r#"<div class="empty" id="inbox-empty">
+  <div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></div>
+  <h3>You're all caught up</h3>
+  <p>New notifications from across the HOLDFAST estate will land here.</p>
+  <a class="btn btn-primary btn-sm" href="/settings/prefs">Delivery preferences</a>
+</div>"#;
 
 /// Mark-read form: an optional `id` (mark one) or none (mark all unread), plus the CSRF token.
 #[derive(Debug, Deserialize)]
@@ -82,9 +91,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<
 
     let mut items = String::new();
     if notifications.is_empty() {
-        items.push_str(
-            r#"<div class="empty-state"><h2>No notifications</h2><p>You're all caught up. New notifications from across the estate will land here.</p></div>"#,
-        );
+        items.push_str(EMPTY_INBOX_HTML);
     } else {
         for n in &notifications {
             items.push_str(&render_item(n, &csrf));
@@ -142,7 +149,7 @@ fn render_item(n: &crate::store::Notification, csrf: &str) -> String {
     };
     let mark = if n.read_at == 0 {
         format!(
-            r#"<form class="inline-form" method="post" action="/api/read">
+            r#"<form class="inline-form note__read" method="post" action="/api/read">
       <input type="hidden" name="csrf_token" value="{csrf}">
       <input type="hidden" name="id" value="{id}">
       <button class="btn btn-ghost btn-sm" type="submit">Mark read</button>
@@ -153,22 +160,35 @@ fn render_item(n: &crate::store::Notification, csrf: &str) -> String {
     } else {
         String::new()
     };
+    // Dismiss is available on every card (read or not); it hits the additive /api/dismiss route
+    // (progressive-enhancement form — the page JS upgrades it to an optimistic /api/dismiss.json).
+    let dismiss = format!(
+        r#"<form class="inline-form note__dismiss" method="post" action="/api/dismiss">
+      <input type="hidden" name="csrf_token" value="{csrf}">
+      <input type="hidden" name="id" value="{id}">
+      <button class="btn btn-subtle btn-sm" type="submit">Dismiss</button>
+    </form>"#,
+        csrf = esc(csrf),
+        id = esc(&n.id)
+    );
     let body_html = if n.body.is_empty() {
         String::new()
     } else {
         format!(r#"<p class="note__body">{}</p>"#, esc(&n.body))
     };
     format!(
-        r#"<article class="card-note{unread_class}">
+        r#"<article class="card-note{unread_class}" data-id="{data_id}" data-read="{read}">
   <div class="note__head">
     <span class="badge badge-source">{source}</span>
     <h2 class="note__title">{dot}{title}</h2>
   </div>
   {body}
   <div class="note__meta">{date}{open}</div>
-  <div class="note__actions">{mark}</div>
+  <div class="note__actions">{mark}{dismiss}</div>
 </article>"#,
         unread_class = unread_class,
+        data_id = esc(&n.id),
+        read = if n.read_at == 0 { "0" } else { "1" },
         source = esc(&n.source),
         dot = unread_dot,
         title = esc(&n.title),
@@ -176,6 +196,7 @@ fn render_item(n: &crate::store::Notification, csrf: &str) -> String {
         date = esc(&fmt_datetime(n.created_at)),
         open = open_link,
         mark = mark,
+        dismiss = dismiss,
     )
 }
 
@@ -200,6 +221,92 @@ pub async fn mark_read(
     tracing::info!(updated, all = id.is_none(), "notifications marked read");
 
     Ok(redirect("/"))
+}
+
+// ---------------------------------------------------------------------------
+// JSON siblings for the no-reload inbox (progressive enhancement)
+// ---------------------------------------------------------------------------
+
+/// JSON body for the optimistic inbox actions: an optional `id` (omit to mark all read) plus the
+/// double-submit CSRF token (echoed from the page cookie, exactly like the form field).
+#[derive(Debug, Deserialize)]
+pub struct ActionJson {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub csrf_token: String,
+}
+
+/// `POST /api/read.json` — JSON sibling of [`mark_read`]. Same identity + CSRF + owner scope as the
+/// form route (which is unchanged); returns `{ok, updated, unread}` so the page updates the badge in
+/// place instead of reloading. No-JS users still use the `/api/read` form.
+pub async fn mark_read_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ActionJson>,
+) -> Result<Response, AppError> {
+    let keys = auth::require_keys(&headers)?;
+    auth::verify_csrf(&headers, &body.csrf_token)?;
+    let id = {
+        let t = body.id.trim();
+        if t.is_empty() { None } else { Some(t) }
+    };
+    let updated = state.store.mark_read(&keys, id, now_secs()).await?;
+    let unread = state.store.unread_count(&keys).await;
+    tracing::info!(updated, all = id.is_none(), "notifications marked read (json)");
+    Ok(Json(serde_json::json!({ "ok": true, "updated": updated, "unread": unread })).into_response())
+}
+
+/// `POST /api/dismiss` — remove one notification from the inbox. A progressive-enhancement FORM
+/// route (no-JS users get a 303 redirect), owner-scoped + CSRF, audited like the read path.
+pub async fn dismiss(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ActionJson>,
+) -> Result<Response, AppError> {
+    let keys = auth::require_keys(&headers)?;
+    auth::verify_csrf(&headers, &form.csrf_token)?;
+    let id = form.id.trim();
+    if id.is_empty() {
+        return Err(AppError::InvalidRequest("id is required".to_string()));
+    }
+    let removed = state.store.delete_notification(&keys, id).await?;
+    if removed > 0 {
+        state.audit.emit(AuditEvent::notice(
+            "notify.dismiss",
+            &keys[0],
+            id,
+            "notification dismissed",
+        ));
+    }
+    tracing::info!(user = %keys[0], removed, "notification dismissed");
+    Ok(redirect("/"))
+}
+
+/// `POST /api/dismiss.json` — JSON sibling of [`dismiss`] for the optimistic inbox: same CSRF +
+/// owner-scoped delete + audit; returns `{ok, removed, unread}`.
+pub async fn dismiss_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ActionJson>,
+) -> Result<Response, AppError> {
+    let keys = auth::require_keys(&headers)?;
+    auth::verify_csrf(&headers, &body.csrf_token)?;
+    let id = body.id.trim();
+    if id.is_empty() {
+        return Err(AppError::InvalidRequest("id is required".to_string()));
+    }
+    let removed = state.store.delete_notification(&keys, id).await?;
+    if removed > 0 {
+        state.audit.emit(AuditEvent::notice(
+            "notify.dismiss",
+            &keys[0],
+            id,
+            "notification dismissed",
+        ));
+    }
+    let unread = state.store.unread_count(&keys).await;
+    Ok(Json(serde_json::json!({ "ok": true, "removed": removed, "unread": unread })).into_response())
 }
 
 // ---------------------------------------------------------------------------

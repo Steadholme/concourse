@@ -37,8 +37,18 @@
     </div>
   </section>
 
-  <div class="note-list">
+  <div class="tabs note-filter" role="tablist" aria-label="Filter notifications">
+    <button class="tab is-active" type="button" role="tab" aria-selected="true" data-filter="all">All</button>
+    <button class="tab" type="button" role="tab" aria-selected="false" data-filter="unread">Unread<span class="note-filter__count" id="unread-tab-count">{{UNREAD}}</span></button>
+  </div>
+
+  <div class="note-list" id="note-list">
     {{ITEMS}}
+  </div>
+  <div class="empty" id="filter-empty" hidden>
+    <div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></div>
+    <h3>No unread notifications</h3>
+    <p>You've read everything. Switch to <button class="linklike" type="button" data-filter="all">All</button> to see the rest.</p>
   </div>
 
   <p class="site-foot">HOLDFAST · Sovereign infrastructure · one sign-on across every service</p>
@@ -48,6 +58,150 @@
   <span id="live-toast-text">New notification</span>
   <a href="/">Refresh</a>
 </div>
+
+<div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="true"></div>
+
+<script>
+// Progressive enhancement for the inbox: optimistic mark-read / dismiss (fetch + local DOM update,
+// rollback + toast on failure) and instant All/Unread filter tabs. The underlying <form> routes
+// (/api/read, /api/dismiss) still work with JS off — this only intercepts them.
+(function () {
+  var list = document.getElementById("note-list");
+  if (!list) return;
+  function csrf() {
+    var el = document.querySelector('input[name="csrf_token"]');
+    return el ? el.value : "";
+  }
+  var toastHost = document.getElementById("toast-host");
+  function toast(text, kind) {
+    if (!toastHost) return;
+    var el = document.createElement("div");
+    el.className = "toast " + (kind === "err" ? "toast--err" : "toast--ok");
+    el.setAttribute("role", "status");
+    el.textContent = String(text);
+    toastHost.appendChild(el);
+    requestAnimationFrame(function () { el.classList.add("is-in"); });
+    setTimeout(function () {
+      el.classList.remove("is-in");
+      setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 200);
+    }, 2600);
+  }
+
+  var countEl = document.querySelector(".reader__title .count");
+  var tabCountEl = document.getElementById("unread-tab-count");
+  function unreadCards() { return list.querySelectorAll('.card-note[data-read="0"]').length; }
+  function setUnread(n) {
+    if (countEl) countEl.textContent = String(n);
+    if (tabCountEl) {
+      tabCountEl.textContent = String(n);
+      tabCountEl.classList.toggle("is-empty", n === 0);
+    }
+    var markAll = document.querySelector('.reader__actions form[action="/api/read"]');
+    if (markAll) markAll.style.display = n > 0 ? "" : "none";
+    applyFilter();
+  }
+
+  function postJson(path, id) {
+    return fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      cache: "no-store",
+      body: JSON.stringify({ id: id || "", csrf_token: csrf() })
+    }).then(function (r) { return r.ok ? r.json() : Promise.reject(); });
+  }
+
+  function markCardRead(card) {
+    card.setAttribute("data-read", "1");
+    card.classList.remove("card-note--unread");
+    var dot = card.querySelector(".note-dot"); if (dot) dot.remove();
+    var f = card.querySelector(".note__read"); if (f) f.remove();
+  }
+
+  function ensureListEmpty() {
+    if (list.querySelector(".card-note")) return;
+    if (list.querySelector("#inbox-empty")) return;
+    // Reuse the server's empty markup shape (kept in sync with EMPTY_INBOX_HTML).
+    list.innerHTML =
+      '<div class="empty" id="inbox-empty">' +
+      '<div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></div>' +
+      "<h3>You're all caught up</h3>" +
+      "<p>New notifications from across the HOLDFAST estate will land here.</p>" +
+      '<a class="btn btn-primary btn-sm" href="/settings/prefs">Delivery preferences</a></div>';
+  }
+
+  list.addEventListener("submit", function (ev) {
+    var form = ev.target.closest("form");
+    if (!form) return;
+    var action = form.getAttribute("action");
+    var card = form.closest(".card-note");
+    if (!card) return;
+    var id = card.getAttribute("data-id");
+    if (action === "/api/read") {
+      ev.preventDefault();
+      markCardRead(card); // optimistic
+      setUnread(unreadCards());
+      postJson("/api/read.json", id)
+        .then(function (d) { setUnread(d.unread); })
+        .catch(function () { toast("Couldn't mark as read", "err"); location.reload(); });
+    } else if (action === "/api/dismiss") {
+      ev.preventDefault();
+      var next = card.nextElementSibling;
+      card.classList.add("is-leaving"); // optimistic fade
+      var placeholder = card;
+      setTimeout(function () { if (placeholder.parentNode) placeholder.parentNode.removeChild(placeholder); ensureListEmpty(); applyFilter(); }, 140);
+      setUnread(card.getAttribute("data-read") === "0" ? unreadCards() - 1 : unreadCards());
+      postJson("/api/dismiss.json", id)
+        .then(function (d) { setUnread(d.unread); toast("Dismissed"); })
+        .catch(function () {
+          card.classList.remove("is-leaving");
+          if (!card.parentNode) { next ? list.insertBefore(card, next) : list.appendChild(card); }
+          setUnread(unreadCards());
+          toast("Couldn't dismiss", "err");
+        });
+    }
+  });
+
+  // Mark-all-read (the header form) also upgrades to the no-reload path.
+  var markAllForm = document.querySelector('.reader__actions form[action="/api/read"]');
+  if (markAllForm) {
+    markAllForm.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var cards = list.querySelectorAll('.card-note[data-read="0"]');
+      for (var i = 0; i < cards.length; i++) markCardRead(cards[i]);
+      setUnread(0);
+      postJson("/api/read.json", "")
+        .then(function () { toast("All caught up"); })
+        .catch(function () { toast("Couldn't mark all read", "err"); location.reload(); });
+    });
+  }
+
+  // --- All / Unread filter tabs -------------------------------------------
+  var filter = "all";
+  var filterEmpty = document.getElementById("filter-empty");
+  function applyFilter() {
+    var showUnreadOnly = filter === "unread";
+    list.classList.toggle("filter-unread", showUnreadOnly);
+    if (filterEmpty) filterEmpty.hidden = !(showUnreadOnly && unreadCards() === 0 && list.querySelector(".card-note"));
+  }
+  function setFilter(next) {
+    filter = next;
+    var tabs = document.querySelectorAll(".note-filter .tab");
+    for (var i = 0; i < tabs.length; i++) {
+      var on = tabs[i].getAttribute("data-filter") === next;
+      tabs[i].classList.toggle("is-active", on);
+      tabs[i].setAttribute("aria-selected", on ? "true" : "false");
+    }
+    applyFilter();
+  }
+  document.addEventListener("click", function (ev) {
+    var t = ev.target.closest("[data-filter]");
+    if (!t) return;
+    setFilter(t.getAttribute("data-filter"));
+  });
+  setUnread(unreadCards());
+})();
+</script>
 
 <script>
 (function () {

@@ -70,6 +70,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/notify", post(handlers::notify::notify))
         .route("/", get(handlers::inbox::index))
         .route("/api/read", post(handlers::inbox::mark_read))
+        // JSON siblings for the optimistic, no-reload inbox (the form routes above stay for no-JS).
+        .route("/api/read.json", post(handlers::inbox::mark_read_json))
+        .route("/api/dismiss", post(handlers::inbox::dismiss))
+        .route("/api/dismiss.json", post(handlers::inbox::dismiss_json))
         .route("/api/subscribe", post(handlers::inbox::subscribe))
         .route("/api/unsubscribe", post(handlers::inbox::unsubscribe))
         .route("/api/test", post(handlers::inbox::send_test))

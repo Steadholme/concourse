@@ -521,3 +521,41 @@ pre { font-family:var(--mono); font-size:12.5px; background:var(--surface-2); bo
 
 /* v2: app-bar owns the section nav on wide screens; sub-nav is the <=720px fallback */
 @media (min-width:721px){ .subnav { display:none; } }
+
+/* ============================================================================
+   UIUX v2 additive layer — optimistic quick-add feedback + toast.
+   140ms transitions only; prefers-reduced-motion honored by the shared rule.
+   ============================================================================ */
+
+/* The quick-add box: gentle focus lift + in-flight button state. */
+.quickadd__input { transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+.quickadd .btn[disabled] { cursor: progress; }
+
+/* A freshly quick-added agenda item flashes in so the optimistic insert is obvious. */
+.agenda__item--fresh { animation: agenda-fresh 1.2s var(--ease); }
+@keyframes agenda-fresh {
+  0% { background: var(--accent-soft); }
+  100% { background: transparent; }
+}
+
+/* Segment the Month/Week/Day/Agenda switch into one cohesive control. */
+.cal-viewswitch { display: inline-flex; gap: 4px; }
+.cal-viewswitch .btn { transition: background var(--dur) var(--ease), color var(--dur) var(--ease); }
+
+/* Toast host: bottom-center stack, fades in/out (kit .toast for the chrome). */
+.toast-host {
+  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+  z-index: 60; display: flex; flex-direction: column; gap: 8px; align-items: center;
+  pointer-events: none;
+}
+.toast-host .toast {
+  opacity: 0; transform: translateY(6px);
+  transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.toast-host .toast.is-in { opacity: 1; transform: translateY(0); }
+.toast--err { background: var(--down-ink); }
+
+@media (max-width: 720px) {
+  .toast-host { left: 12px; right: 12px; transform: none; }
+  .toast-host .toast { width: 100%; justify-content: center; }
+}

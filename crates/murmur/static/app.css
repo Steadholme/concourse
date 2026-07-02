@@ -599,3 +599,54 @@ pre { font-family:var(--mono); font-size:12.5px; background:var(--surface-2); bo
   0% { background: var(--accent-soft); }
   100% { background: transparent; }
 }
+
+/* ============================================================================
+   UIUX v2 additive layer — composer/reaction/scroll affordances + toast.
+   Restrained: 140ms transitions only; the shared prefers-reduced-motion rule
+   already neutralizes them for readers who ask.
+   ============================================================================ */
+
+/* Composer: autosizes in JS; cap the growth + kill the manual resize handle. */
+.composer__input { resize: none; max-height: 200px; overflow-y: auto; transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+.composer .btn.is-sending { opacity: .8; cursor: progress; }
+
+/* Reaction chips: the caller's own reactions read as "pressed". */
+.reaction { transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease); }
+.reaction.is-mine { background: var(--accent-soft); border-color: var(--accent-2); color: var(--accent-ink); }
+
+/* Jump-to-latest: a floating pill above the composer, shown only when scrolled up. */
+.room-view { position: relative; }
+.jump-latest {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  bottom: 84px; z-index: 5;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 14px;
+  font: inherit; font-size: 12.5px; font-weight: 600;
+  color: var(--ink); background: var(--surface);
+  border: 1px solid var(--border-2); border-radius: var(--r-pill);
+  box-shadow: var(--sh-pop); cursor: pointer;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.jump-latest[hidden] { display: none; }
+.jump-latest:hover { background: var(--surface-2); }
+.jump-latest.has-new { color: #fff; background: var(--accent); border-color: var(--accent); }
+.jump-latest::after { content: "↓"; font-size: 13px; line-height: 1; }
+
+/* Toast host: bottom-center stack, fades in/out (kit .toast for the chrome). */
+.toast-host {
+  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+  z-index: 60; display: flex; flex-direction: column; gap: 8px; align-items: center;
+  pointer-events: none;
+}
+.toast-host .toast {
+  opacity: 0; transform: translateY(6px);
+  transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.toast-host .toast.is-in { opacity: 1; transform: translateY(0); }
+.toast--err { background: var(--down-ink); }
+
+@media (max-width: 720px) {
+  .jump-latest { bottom: 92px; }
+  .toast-host { left: 12px; right: 12px; transform: none; }
+  .toast-host .toast { width: 100%; justify-content: center; }
+}

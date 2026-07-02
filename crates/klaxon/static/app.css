@@ -436,3 +436,52 @@ pre { font-family:var(--mono); font-size:12.5px; background:var(--surface-2); bo
   .reader__head { flex-direction: column; align-items: stretch; }
   .prefs { flex-direction: column; align-items: stretch; }
 }
+
+/* ============================================================================
+   UIUX v2 additive layer — optimistic inbox actions, filter tabs, toast.
+   140ms transitions only; the shared prefers-reduced-motion rule neutralizes
+   them for readers who ask.
+   ============================================================================ */
+
+/* Filter tabs sit above the list; the small count rides the Unread tab. */
+.note-filter { margin: 4px 0 14px; }
+.note-filter .tab { background: transparent; border: 0; cursor: pointer; font: inherit; }
+.note-filter__count {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; margin-left: 7px; padding: 0 5px;
+  font-size: 11px; font-weight: 700; border-radius: var(--r-pill);
+  background: var(--accent-soft); color: var(--accent-ink);
+}
+.note-filter__count.is-empty { display: none; }
+
+/* Unread filter: hide the read cards (no reflow jank, instant). */
+.note-list.filter-unread .card-note[data-read="1"] { display: none; }
+
+/* Row actions align right with breathing room; dismiss recedes vs mark-read. */
+.note__actions { display: flex; gap: 8px; align-items: center; }
+.card-note { transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease); }
+.card-note.is-leaving { opacity: 0; transform: translateY(-4px); }
+
+/* A text button that reads like an inline link (used inside the filter empty state). */
+.linklike {
+  background: none; border: 0; padding: 0; font: inherit; cursor: pointer;
+  color: var(--accent-ink); text-decoration: underline;
+}
+
+/* Toast host: bottom-center stack, fades in/out (kit .toast for the chrome). */
+.toast-host {
+  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+  z-index: 60; display: flex; flex-direction: column; gap: 8px; align-items: center;
+  pointer-events: none;
+}
+.toast-host .toast {
+  opacity: 0; transform: translateY(6px);
+  transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.toast-host .toast.is-in { opacity: 1; transform: translateY(0); }
+.toast--err { background: var(--down-ink); }
+
+@media (max-width: 640px) {
+  .toast-host { left: 12px; right: 12px; transform: none; }
+  .toast-host .toast { width: 100%; justify-content: center; }
+}

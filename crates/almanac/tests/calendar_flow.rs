@@ -927,7 +927,73 @@ async fn unknown_route_renders_404() {
     assert!(body.contains("Not found"));
 }
 
+#[tokio::test]
+async fn quick_add_json_creates_event_optimistically() {
+    let state = build_dev_state();
+    // GET the calendar to mint the CSRF cookie the quick-add box carries.
+    let (_s, headers, _b) = call(&state, get_as("/", "u_alice", "a@x.co")).await;
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+
+    // Bad CSRF -> 403 JSON, nothing written.
+    let bad = json_post(
+        "/quick-add.json",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        r#"{"text":"Dentist tomorrow 12pm","csrf_token":"wrong"}"#.to_string(),
+    );
+    assert_eq!(call(&state, bad).await.0, StatusCode::FORBIDDEN);
+
+    // Valid parse -> 200 {ok:true} with the echoed title.
+    let ok = json_post(
+        "/quick-add.json",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        format!(r#"{{"text":"Dentist tomorrow 12pm","csrf_token":"{csrf}"}}"#),
+    );
+    let (status, _h, body) = call(&state, ok).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"ok\":true"), "created: {body}");
+    assert!(body.contains("Dentist"), "title echoed in JSON: {body}");
+
+    // The created event shows in the agenda (owner-scoped, no reload needed by the client).
+    let (_s, _h, agenda) = call(&state, get_as("/?view=agenda", "u_alice", "a@x.co")).await;
+    assert!(agenda.contains("Dentist"), "quick-added event is listed");
+
+    // An unparseable phrase -> 200 {ok:false} (the client then falls back to the form editor).
+    let vague = json_post(
+        "/quick-add.json",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        format!(r#"{{"text":"just some notes","csrf_token":"{csrf}"}}"#),
+    );
+    let (status, _h, body) = call(&state, vague).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"ok\":false"), "unparseable is a soft no: {body}");
+
+    // Owner scoping: Bob never sees Alice's quick-added event.
+    let (_s, _h, bob) = call(&state, get_as("/?view=agenda", "u_bob", "b@x.co")).await;
+    assert!(!bob.contains("Dentist"), "quick-add is owner-scoped");
+}
+
 // --- helpers ---------------------------------------------------------------------------
+
+/// POST a JSON body to `uri` as `subject`, carrying the double-submit CSRF `cookie`.
+fn json_post(uri: &str, cookie: &str, subject: &str, email: &str, body: String) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", email);
+    if !cookie.is_empty() {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    builder.body(Body::from(body)).unwrap()
+}
 
 async fn call(state: &AppState, req: Request<Body>) -> (StatusCode, axum::http::HeaderMap, String) {
     let resp = app(state.clone()).oneshot(req).await.unwrap();

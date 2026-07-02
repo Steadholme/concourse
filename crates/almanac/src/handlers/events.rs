@@ -7,9 +7,9 @@
 //! user-supplied text is HTML-escaped on the way out.
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::Form;
+use axum::{Form, Json};
 use serde::{Deserialize, Deserializer};
 
 use crate::auth;
@@ -303,11 +303,12 @@ pub async fn index(
     };
 
     let content = format!(
-        "{}<div class=\"cal-layout\">{}<div class=\"cal-main\">{}{}</div></div>",
+        "{}<div class=\"cal-layout\">{}<div class=\"cal-main\">{}{}</div></div>{}",
         render::subnav("calendar"),
         render_calendar_sidebar(&calendars, &selected_calendars, &q, kind, &csrf),
         render_quick_add(&csrf),
         inner,
+        QUICKADD_ENHANCER,
     );
     let title = match kind {
         ViewKind::Week => "Week",
@@ -318,6 +319,80 @@ pub async fn index(
     let html = layout(title, &headers, &content);
     Ok(html_with_csrf_cookie(html, &csrf))
 }
+
+/// Progressive-enhancement layer for the quick-add box + a toast host. With JS off the `.quickadd`
+/// form posts to `/quick-add` (unchanged); with JS on this intercepts the submit, POSTs the phrase
+/// to `/quick-add.json`, and on success clears the box, prepends the new event to the on-screen
+/// agenda, and toasts — no reload. An unparseable phrase falls through to the plain form submit so
+/// the editor still opens prefilled. Remote strings are inserted via textContent only (XSS-safe).
+const QUICKADD_ENHANCER: &str = r##"<div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="true"></div>
+<script>
+(function () {
+  var form = document.querySelector('.quickadd');
+  if (!form) return;
+  var input = form.querySelector('.quickadd__input');
+  var btn = form.querySelector('button[type=submit]');
+  var btnLabel = btn ? btn.textContent : 'Add';
+  var toastHost = document.getElementById('toast-host');
+  function toast(text, kind) {
+    if (!toastHost) return;
+    var el = document.createElement('div');
+    el.className = 'toast ' + (kind === 'err' ? 'toast--err' : 'toast--ok');
+    el.setAttribute('role', 'status');
+    el.textContent = String(text);
+    toastHost.appendChild(el);
+    requestAnimationFrame(function () { el.classList.add('is-in'); });
+    setTimeout(function () {
+      el.classList.remove('is-in');
+      setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 200);
+    }, 2600);
+  }
+  function csrf() { var el = form.querySelector('input[name=csrf_token]'); return el ? el.value : ''; }
+  function setBusy(on) { if (!btn) return; btn.disabled = on; btn.textContent = on ? 'Adding…' : btnLabel; }
+  function prependAgenda(data) {
+    var agenda = document.querySelector('.agenda');
+    if (!agenda) return false;
+    var empty = agenda.querySelector('.agenda-empty'); if (empty) empty.remove();
+    var item = document.createElement('div');
+    item.className = 'agenda__item agenda__item--fresh';
+    var when = document.createElement('div'); when.className = 'agenda__when'; when.textContent = data.when || '';
+    var body = document.createElement('div'); body.className = 'agenda__body';
+    var a = document.createElement('a'); a.className = 'agenda__title';
+    a.href = '/edit/' + encodeURIComponent(data.id); a.textContent = data.title || '(untitled)';
+    body.appendChild(a); item.appendChild(when); item.appendChild(body);
+    agenda.insertBefore(item, agenda.querySelector('.agenda__item') || null);
+    return true;
+  }
+  form.addEventListener('submit', function (ev) {
+    var text = input ? input.value.trim() : '';
+    if (!text) { ev.preventDefault(); return; }
+    ev.preventDefault();
+    setBusy(true);
+    fetch('/quick-add.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      cache: 'no-store',
+      body: JSON.stringify({ text: text, csrf_token: csrf() })
+    })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+      .then(function (data) {
+        if (data && data.ok) {
+          if (input) input.value = '';
+          prependAgenda(data);
+          toast('Added ' + (data.title || 'event') + (data.when ? ' · ' + data.when : ''));
+          setBusy(false);
+        } else {
+          // Unparseable — hand off to the real form (opens the editor prefilled). form.submit()
+          // bypasses this handler, so there is no recursion.
+          setBusy(false);
+          form.submit();
+        }
+      })
+      .catch(function () { setBusy(false); toast("Couldn't add — try again", 'err'); });
+  });
+})();
+</script>"##;
 
 /// The natural-language quick-add box shown above every calendar view. Posts the raw phrase to
 /// `/quick-add`; an unparseable phrase re-renders the editor prefilled (see [`quick_add`]).
@@ -1426,20 +1501,11 @@ pub async fn quick_add(
     match quickadd::parse_quick_add(raw) {
         Some(qa) => {
             let now = now_ms();
-            // Resolve the relative day against the owner's LOCAL "today", place the time, then
-            // convert the local wall clock back to a real UTC instant to store.
-            let local_now = now + off as i64 * 60_000;
-            let today_local_mid = calendar::start_of_day(local_now);
-            let target_local_mid = quickadd::resolve_local_midnight(qa.day, today_local_mid);
-            let local_start =
-                target_local_mid + qa.hour as i64 * 3_600_000 + qa.minute as i64 * 60_000;
-            let starts_at = local_start - off as i64 * 60_000;
-
-            let id = auth::random_hex();
+            let starts_at = quick_add_starts_at(&qa, off, now);
             state
                 .store
                 .upsert_event(Event {
-                    id,
+                    id: auth::random_hex(),
                     owner_sub: owner.clone(),
                     calendar_id: String::new(),
                     title: qa.title,
@@ -1470,6 +1536,131 @@ pub async fn quick_add(
             ))
         }
     }
+}
+
+/// Resolve a parsed quick-add phrase into a real UTC start instant: place the time on the owner's
+/// LOCAL target day (relative to their "today"), then convert the local wall clock back to UTC.
+/// Shared by the form [`quick_add`] and the JSON [`quick_add_json`] so both agree exactly.
+fn quick_add_starts_at(qa: &quickadd::QuickAdd, off: i32, now: i64) -> i64 {
+    let local_now = now + off as i64 * 60_000;
+    let today_local_mid = calendar::start_of_day(local_now);
+    let target_local_mid = quickadd::resolve_local_midnight(qa.day, today_local_mid);
+    let local_start = target_local_mid + qa.hour as i64 * 3_600_000 + qa.minute as i64 * 60_000;
+    local_start - off as i64 * 60_000
+}
+
+/// The JSON body for the optimistic quick-add box: the raw phrase + the double-submit CSRF token.
+#[derive(Debug, Deserialize)]
+pub struct QuickAddJson {
+    #[serde(default)]
+    pub csrf_token: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// `POST /quick-add.json` — JSON sibling of [`quick_add`] for the no-reload quick-add box. Same
+/// owner scope + double-submit CSRF as the form route (which is unchanged, so no-JS users still get
+/// the redirect / editor fallback). Returns `{ok:true, id, title, when, href}` on a parsed create,
+/// or `{ok:false, parsed:false}` when the phrase can't be understood (the client then falls back to
+/// posting the real form so the editor opens prefilled).
+pub async fn quick_add_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(form): Json<QuickAddJson>,
+) -> Response {
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            r#"{"ok":false,"error":"csrf"}"#.to_string(),
+        );
+    }
+    let owner = auth::owner_subject(&headers);
+    let off = match state.store.get_settings(&owner).await {
+        Ok(s) => calendar::tz_offset_minutes(&s.timezone),
+        Err(_) => 0,
+    };
+    let raw = form.text.trim();
+
+    match quickadd::parse_quick_add(raw) {
+        Some(qa) => {
+            let now = now_ms();
+            let starts_at = quick_add_starts_at(&qa, off, now);
+            let ends_at = starts_at + 3_600_000;
+            let id = auth::random_hex();
+            let title = qa.title.clone();
+            if state
+                .store
+                .upsert_event(Event {
+                    id: id.clone(),
+                    owner_sub: owner.clone(),
+                    calendar_id: String::new(),
+                    title: qa.title,
+                    starts_at,
+                    ends_at,
+                    all_day: false,
+                    location: String::new(),
+                    notes: String::new(),
+                    rrule: String::new(),
+                    series_id: String::new(),
+                    override_occurrence_date: 0,
+                    exception_dates: Vec::new(),
+                    created_at: now,
+                })
+                .await
+                .is_err()
+            {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"ok":false,"error":"store"}"#.to_string(),
+                );
+            }
+            tracing::info!(target: "audit", event = "event.created", "event quick-added (json)");
+            let (y, m) = calendar::month_of_at(starts_at, off);
+            let when = calendar::fmt_event_when_at(starts_at, ends_at, false, off);
+            let body = format!(
+                r#"{{"ok":true,"id":"{id}","title":"{title}","when":"{when}","href":"/?y={y}&m={m}"}}"#,
+                id = json_escape(&id),
+                title = json_escape(&title),
+                when = json_escape(&when),
+                y = y,
+                m = m,
+            );
+            json_response(StatusCode::OK, body)
+        }
+        // Unparseable is NOT an error: 200 with parsed=false, the client re-posts the form so the
+        // editor opens prefilled (identical to the no-JS fallback).
+        None => json_response(StatusCode::OK, r#"{"ok":false,"parsed":false}"#.to_string()),
+    }
+}
+
+/// A JSON response with the given status and an explicit JSON content type.
+fn json_response(status: StatusCode, body: String) -> Response {
+    (
+        status,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+/// Escape a string for embedding inside a JSON string literal (control chars + quote + backslash).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

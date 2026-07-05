@@ -7,9 +7,11 @@
 
 use crate::auth;
 use axum::http::HeaderMap;
+use std::sync::OnceLock;
 
-/// Embedded design-system CSS (brand tokens shared across the HOLDFAST estate).
-const APP_CSS: &str = include_str!("../static/app.css");
+/// Embedded service CSS layered after Odyssey's canonical HOLDFAST design system.
+const SERVICE_CSS: &str = include_str!("../static/service.css");
+static APP_CSS: OnceLock<String> = OnceLock::new();
 /// Page shell with `{{...}}` slots.
 const LAYOUT: &str = include_str!("../templates/layout.html");
 
@@ -20,6 +22,17 @@ const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 const IC_GRID: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>"#;
 const IC_USER: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"#;
 const IC_LOGOUT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>"#;
+
+/// Full CSS payload: canonical Odyssey first, Almanac's service layer second.
+pub fn app_css() -> &'static str {
+    APP_CSS.get_or_init(|| {
+        let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len() + 1);
+        css.push_str(odyssey::APP_CSS);
+        css.push('\n');
+        css.push_str(SERVICE_CSS);
+        css
+    })
+}
 
 /// The section nav for the v2 app-bar (`Calendar` / `Contacts` / `Settings`), with the current
 /// page marked `is-active` from the page title. Same hrefs/labels as the in-content [`subnav`]
@@ -101,7 +114,7 @@ pub fn userbox(headers: &HeaderMap) -> String {
 /// HTML built by the handler.
 pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
     LAYOUT
-        .replace("{{STYLE}}", APP_CSS)
+        .replace("{{STYLE}}", app_css())
         .replace("{{PAGE_TITLE}}", &esc(page_title))
         .replace("{{NAV}}", &appnav(page_title))
         .replace("{{USERBOX}}", &userbox(headers))
@@ -155,7 +168,7 @@ pub fn public_shell(page_title: &str, content: &str) -> String {
          <title>{title} · Almanac · HOLDFAST</title><style>{css}</style></head>\
          <body class=\"page-almanac\"><main class=\"wrap wrap--narrow\">{content}</main></body></html>",
         title = esc(page_title),
-        css = APP_CSS,
+        css = app_css(),
         content = content,
     )
 }

@@ -70,7 +70,7 @@ pub async fn show(
          <section class=\"card detail\">{meta}</section>\
          {attendees}\
          {reminders}\
-         <p class=\"site-foot\">HOLDFAST Almanac · <a href=\"/calendar.ics\">Subscribe to this calendar</a> (read-only .ics)</p>",
+         <p class=\"almanac-foot\">HOLDFAST Almanac · <a href=\"/calendar.ics\">Subscribe to this calendar</a> (read-only .ics)</p>",
         subnav = render::subnav("calendar"),
         title = esc(&event.title),
         when = esc(&when),
@@ -90,7 +90,7 @@ pub async fn show(
 
 fn render_attendees(attendees: &[Attendee], event_id: &str) -> String {
     let head = format!(
-        "<div class=\"card__head\"><h2>Attendees</h2><span class=\"muted\">{n} invited</span></div>",
+        "<div class=\"almanac-card__head\"><h2>Attendees</h2><span class=\"muted\">{n} invited</span></div>",
         n = attendees.len()
     );
     if attendees.is_empty() {
@@ -138,7 +138,7 @@ fn render_attendee_row(a: &Attendee) -> String {
 }
 
 fn render_reminders(reminders: &[Reminder]) -> String {
-    let head = "<div class=\"card__head\"><h2>Reminders</h2></div>";
+    let head = "<div class=\"almanac-card__head\"><h2>Reminders</h2></div>";
     if reminders.is_empty() {
         return format!(
             "<section class=\"card\">{head}<div class=\"list-empty\">No reminders set.</div></section>"

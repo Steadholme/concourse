@@ -12,7 +12,7 @@ use axum::response::{Html, IntoResponse, Response};
 
 use crate::auth;
 use crate::config::{LOBBY_ID, MESSAGE_PAGE_LIMIT};
-use crate::handlers::{esc, fmt_time, topbar, APP_CSS, APP_JS};
+use crate::handlers::{app_css, esc, fmt_time, topbar, APP_JS};
 use crate::store::{Message, ReactionCount, UserRoom};
 use crate::text::render_body;
 use crate::{ensure_lobby, AppState};
@@ -58,7 +58,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
     let page = DASHBOARD_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Chat", &email))
         .replace("{{ROOMS}}", &render_room_list(&rooms, &selected))
         .replace("{{ROOM_TITLE}}", &esc(&selected_name))
@@ -354,7 +354,7 @@ fn unauthorized_page() -> Response {
 <p>Sign in through the HOLDFAST gateway to use Murmur.</p>
 <a class="btn btn-primary" href="/">Reload</a></div>
 </main></body></html>"#,
-        css = APP_CSS,
+        css = app_css(),
         topbar = topbar("Chat", ""),
     );
     (StatusCode::UNAUTHORIZED, Html(page)).into_response()

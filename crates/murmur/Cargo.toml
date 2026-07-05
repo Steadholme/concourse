@@ -17,6 +17,7 @@ path = "src/main.rs"
 # HTTP framework (shared with keystone/inkwell/sanctum). The `ws` feature pulls in the
 # `axum::extract::ws` WebSocket upgrade used by `GET /ws` for the live message stream.
 axum = { version = "0.8", features = ["ws"] }
+odyssey = { path = "../odyssey" }
 # Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
 # PgStore drives sqlx natively, so a worker thread is NEVER blocked (no sync-over-async bridge).
 # `sync` brings in `broadcast`/`mpsc` for the in-process fan-out hub + the non-blocking audit sink.

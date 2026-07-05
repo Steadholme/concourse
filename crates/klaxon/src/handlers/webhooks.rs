@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::audit::AuditEvent;
 use crate::config::{MAX_WEBHOOKS_PER_USER, MAX_WEBHOOK_SECRET_CHARS, MAX_WEBHOOK_URL_CHARS};
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_datetime, topbar, APP_CSS};
+use crate::handlers::{app_css, esc, fmt_datetime, topbar};
 use crate::store::Webhook;
 use crate::{auth, new_id, now_secs, AppState};
 
@@ -69,7 +69,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<
     };
 
     let page = WEBHOOKS_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Webhooks", &email))
         .replace("{{COUNT}}", &hooks.len().to_string())
         .replace("{{CSRF}}", &esc(&csrf))

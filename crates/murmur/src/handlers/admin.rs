@@ -23,7 +23,7 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::config::MESSAGE_PAGE_LIMIT;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_time, topbar, APP_CSS};
+use crate::handlers::{app_css, esc, fmt_time, topbar};
 use crate::store::{Member, Message, Room};
 use crate::AppState;
 
@@ -50,7 +50,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
     let page = ADMIN_ROOMS_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Admin", &auth::display_email(&headers)))
         .replace("{{ROOMS}}", &render_room_rows(&rooms, &csrf));
 
@@ -77,7 +77,7 @@ pub async fn room_detail(
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
     let page = ADMIN_ROOM_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Admin", &auth::display_email(&headers)))
         .replace("{{ROOM_TITLE}}", &esc(&room.name))
         .replace("{{ROOM_ID}}", &esc(&room.id))
@@ -385,7 +385,7 @@ fn forbidden_page() -> Response {
 <p>The Murmur admin panel is restricted to the <code>admins</code> / <code>infra-admins</code> groups.</p>
 <a class="btn btn-primary" href="/">Back to chat</a></div>
 </main></body></html>"#,
-        css = APP_CSS,
+        css = app_css(),
         topbar = topbar("Admin", ""),
     );
     (StatusCode::FORBIDDEN, Html(page)).into_response()
@@ -400,7 +400,7 @@ fn not_found_page(msg: &str) -> String {
 <div class="signin-card"><h1>Not found</h1><p>{msg}</p>
 <a class="btn btn-primary" href="/admin">Back to rooms</a></div>
 </main></body></html>"#,
-        css = APP_CSS,
+        css = app_css(),
         topbar = topbar("Admin", ""),
         msg = esc(msg),
     )

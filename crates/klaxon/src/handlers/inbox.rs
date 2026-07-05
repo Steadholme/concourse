@@ -21,7 +21,7 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::delivery;
 use crate::error::AppError;
-use crate::handlers::{esc, fmt_datetime, safe_url, topbar, APP_CSS};
+use crate::handlers::{app_css, esc, fmt_datetime, safe_url, topbar};
 use crate::store::{Notification, PushSubscription};
 use crate::{new_id, now_secs, AppState};
 
@@ -118,7 +118,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<
     let vapid_public = state.config.vapid_public_key.clone().unwrap_or_default();
 
     let page = DASHBOARD_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Notifications", &email))
         .replace("{{UNREAD}}", &unread.to_string())
         .replace("{{MARK_ALL}}", &mark_all)

@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 # HTTP framework (shared with the rest of the estate): State extractors, typed responses.
 axum = "0.8"
+odyssey = { path = "../odyssey" }
 # Async runtime axum runs on. The Source trait is async: the engine `.await`s each federated
 # source directly and the Pg sources drive sqlx natively, so a worker thread is NEVER blocked
 # (no block_in_place, no sync-over-async). `rt-multi-thread` keeps the serving runtime parallel

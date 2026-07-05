@@ -18,7 +18,7 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::config::SECTION_LIMIT;
 use crate::csrf;
-use crate::handlers::{esc, rel_time, topbar, truncate, InboxQuery, APP_CSS};
+use crate::handlers::{app_css, esc, rel_time, topbar, truncate, InboxQuery};
 use crate::inbox::{self, Inbox, SectionState, ViewFilter};
 use crate::source::{InboxRow, SectionKind};
 use crate::AppState;
@@ -105,7 +105,7 @@ pub(crate) fn empty_inbox() -> Inbox {
 
 fn render(inbox: &Inbox, email: &str, filter: &ViewFilter, token: &str, now: i64) -> String {
     DASHBOARD_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{CSRF}}", &esc(token))
         .replace("{{TOPBAR}}", &topbar("Inbox", email))
         .replace("{{SEARCH}}", &render_search(filter))

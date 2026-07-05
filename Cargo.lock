@@ -17,6 +17,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hmac",
+ "odyssey",
  "serde",
  "sha2",
  "sqlx",
@@ -82,6 +83,7 @@ dependencies = [
  "async-trait",
  "axum",
  "hmac",
+ "odyssey",
  "serde",
  "serde_json",
  "sha2",
@@ -742,6 +744,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "odyssey",
  "rand 0.8.6",
  "ring",
  "serde",
@@ -851,6 +854,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hmac",
+ "odyssey",
  "serde",
  "serde_json",
  "sha2",
@@ -885,6 +889,10 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
 ]
+
+[[package]]
+name = "odyssey"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell"

@@ -13,6 +13,7 @@ pub mod health;
 
 use axum::http::StatusCode;
 use serde::Deserialize;
+use std::sync::OnceLock;
 
 /// The unified search + source-filter query string shared by the dashboard page and the JSON poll
 /// (`?q=` free text, `?source=` one of `chat` / `notifications` / `feed` / `all`). Both fields are
@@ -25,14 +26,26 @@ pub struct InboxQuery {
     pub source: Option<String>,
 }
 
-/// Embedded design system, inlined into each rendered page's `<style>`.
-pub const APP_CSS: &str = include_str!("../../static/app.css");
+/// Embedded service CSS layered after Odyssey's canonical HOLDFAST design system.
+pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
+static APP_CSS: OnceLock<String> = OnceLock::new();
 
 /// Cross-subdomain gateway logout (Atrium lives at inbox.w33d.xyz; the IdP is at id.w33d.xyz).
 pub const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 
 /// The HOLDFAST shield glyph (small, for the app-bar brand lockup).
 pub const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
+
+/// Full CSS payload: canonical Odyssey first, Atrium's service layer second.
+pub fn app_css() -> &'static str {
+    APP_CSS.get_or_init(|| {
+        let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len() + 1);
+        css.push_str(odyssey::APP_CSS);
+        css.push('\n');
+        css.push_str(SERVICE_CSS);
+        css
+    })
+}
 
 /// Minimal HTML escaping for text/attribute interpolation (defense-in-depth on every field —
 /// chat/notification/feed text comes from other services and is treated as untrusted user content).
@@ -197,7 +210,7 @@ pub fn error_page(status: StatusCode, message: &str) -> String {
   </div>
 </main>
 </body></html>"#,
-        css = APP_CSS,
+        css = app_css(),
         topbar = topbar("Atrium", "—"),
         code = code,
         reason = esc(reason),

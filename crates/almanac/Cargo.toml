@@ -17,6 +17,7 @@ path = "src/main.rs"
 # HTTP framework (shared with keystone/lattice/watchtower): Path/State/Query/Form extractors,
 # typed Html/Redirect responses.
 axum = "0.8"
+odyssey = { path = "../odyssey" }
 # Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
 # PgStore uses sqlx natively, so a worker thread is NEVER blocked (no sync-over-async bridge).
 # `net`/`io-util`/`time` back the reminder delivery hook: a raw TCP HTTP/1.1 POST to Klaxon's

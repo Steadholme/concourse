@@ -17,6 +17,7 @@ path = "src/main.rs"
 # HTTP framework (shared with keystone/sanctum/inkwell): Form/State/Json extractors, SSE
 # responses, server-rendered HTML.
 axum = "0.8"
+odyssey = { path = "../odyssey" }
 # Async runtime axum runs on. The Store trait is async: handlers `.await` it directly and
 # PgStore drives sqlx natively, so a worker thread is NEVER blocked (no block_in_place, no
 # sync-over-async bridge). The audit emitter + the best-effort fan-out workers `tokio::spawn`.

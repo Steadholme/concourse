@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::audit::AuditEvent;
 use crate::config::{MAX_MUTES_PER_KIND, MAX_MUTE_VALUE_CHARS};
 use crate::error::AppError;
-use crate::handlers::{esc, topbar, APP_CSS};
+use crate::handlers::{app_css, esc, topbar};
 use crate::store::NotifyPrefs;
 use crate::{auth, now_secs, AppState};
 
@@ -65,7 +65,7 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<
 fn render(prefs: &NotifyPrefs, csrf: &str, email: &str) -> String {
     let checked = |on: bool| if on { "checked" } else { "" };
     PREFS_HTML
-        .replace("{{CSS}}", APP_CSS)
+        .replace("{{CSS}}", app_css())
         .replace("{{TOPBAR}}", &topbar("Preferences", email))
         .replace("{{CSRF}}", &esc(csrf))
         .replace("{{MUTE_ALL_CHECKED}}", checked(prefs.mute_all))

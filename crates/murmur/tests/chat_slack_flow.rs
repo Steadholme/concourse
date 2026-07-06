@@ -307,6 +307,78 @@ async fn pinned_read_is_membership_scoped() {
 }
 
 // ---------------------------------------------------------------------------
+// Message formatting
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn formatting_renders_and_escapes() {
+    let state = build_dev_state();
+    // Alice + Bob both auto-join the lobby so @bob is a normal in-room mention target.
+    let _ = call(&state, get_auth("/api/rooms", "u_alice", "alice@hf", None)).await;
+    let _ = call(&state, get_auth("/api/rooms", "u_bob", "bob@hf", None)).await;
+
+    let body = "Here is `code`, *bold*, _italic_, and ~strike~\n\
+> quote\n\
+@bob please review\n\
+```rust\n\
+<script>alert(1)</script>\n\
+https://example.com\n\
+_snake_\n\
+```\n\
+`\"><img src=x onerror=alert(1)>`";
+    let json = format!(r#"{{"body":{body:?}}}"#);
+    let (status, resp) = call(
+        &state,
+        post(
+            "/api/rooms/lobby/messages",
+            &json,
+            "u_alice",
+            "alice@hf",
+            None,
+            Some(CSRF),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "formatted send failed: {resp}");
+
+    let (status, page) = call(&state, get_auth("/", "u_alice", "alice@hf", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains(r#"<pre><code class="lang-rust">"#), "fenced block rendered");
+    assert!(page.contains("<code>code</code>"), "inline code rendered");
+    assert!(page.contains("<strong>bold</strong>"), "bold rendered");
+    assert!(page.contains("<em>italic</em>"), "italic rendered");
+    assert!(page.contains("<del>strike</del>"), "strike rendered");
+    assert!(page.contains(r#"<span class="mention">@bob</span>"#), "mention chip rendered");
+    assert!(page.contains("<blockquote>quote</blockquote>"), "quote rendered");
+    assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "script payload escaped");
+    assert!(page.contains("&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"), "img payload escaped");
+    assert!(!page.contains("<img"), "img payload must not become markup");
+    assert!(!page.contains("<script>alert(1)</script>"), "script payload must not become markup");
+
+    // Render-only guard: the membership gate is unchanged for rooms Alice did not join.
+    let (status, body) = call(
+        &state,
+        post(
+            "/api/rooms",
+            r#"{"name":"format-vault","kind":"room"}"#,
+            "u_bob",
+            "bob@hf",
+            None,
+            Some(CSRF),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let room_id = extract_id(&body);
+    let (status, _) = call(
+        &state,
+        get_auth(&format!("/api/rooms/{room_id}/messages"), "u_alice", "alice@hf", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-member room read -> 403");
+}
+
+// ---------------------------------------------------------------------------
 // Search — strictly membership-scoped
 // ---------------------------------------------------------------------------
 

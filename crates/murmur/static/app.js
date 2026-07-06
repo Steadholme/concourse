@@ -124,7 +124,7 @@
       del.textContent = "[deleted]";
       body.appendChild(del);
     } else {
-      appendLinkified(body, m.body || "");
+      renderRichBody(body, m.body || "");
     }
 
     row.appendChild(head);
@@ -291,6 +291,132 @@
     }
   }
 
+  function renderRichBody(el, text) {
+    var lines = String(text).split("\n");
+    var normal = [];
+    var i = 0;
+    while (i < lines.length) {
+      var lang = fenceLang(lines[i]);
+      if (lang !== null) {
+        var close = findFenceClose(lines, i + 1);
+        if (close !== -1) {
+          flushNormal(el, normal);
+          appendFence(el, lines.slice(i + 1, close), lang);
+          i = close + 1;
+          continue;
+        }
+      }
+      normal.push(lines[i]);
+      i++;
+    }
+    flushNormal(el, normal);
+  }
+
+  function flushNormal(el, lines) {
+    for (var i = 0; i < lines.length; i++) {
+      if (i > 0) el.appendChild(document.createElement("br"));
+      renderNormalLine(el, lines[i]);
+    }
+    lines.length = 0;
+  }
+
+  function renderNormalLine(el, line) {
+    var trimmed = String(line).replace(/^\s+/, "");
+    if (trimmed.indexOf("> ") === 0) {
+      var quote = document.createElement("blockquote");
+      renderInline(quote, trimmed.slice(2));
+      el.appendChild(quote);
+    } else {
+      renderInline(el, line);
+    }
+  }
+
+  function renderInline(el, line) {
+    line = String(line);
+    var i = 0;
+    var textStart = 0;
+    while (i < line.length) {
+      var ch = line.charAt(i);
+      if (ch === "`") {
+        var codeEnd = line.indexOf("`", i + 1);
+        if (codeEnd > i + 1) {
+          appendText(el, line.slice(textStart, i));
+          appendWrappedText(el, "code", "", line.slice(i + 1, codeEnd));
+          i = codeEnd + 1;
+          textStart = i;
+          continue;
+        }
+      }
+      if (startsUrlAt(line, i)) {
+        appendText(el, line.slice(textStart, i));
+        var j = i;
+        while (j < line.length && isUrlChar(line.charAt(j))) j++;
+        var raw = line.slice(i, j);
+        var trimmed = trimUrlTrailing(raw);
+        appendUrlLink(el, trimmed);
+        i = i + trimmed.length;
+        textStart = i;
+        continue;
+      }
+      if (ch === "@" && isMentionBoundary(line, i)) {
+        var mentionTo = mentionEnd(line, i);
+        if (mentionTo !== -1) {
+          appendText(el, line.slice(textStart, i));
+          var mention = document.createElement("span");
+          mention.className = "mention";
+          mention.textContent = "@" + line.slice(i + 1, mentionTo);
+          el.appendChild(mention);
+          i = mentionTo;
+          textStart = i;
+          continue;
+        }
+      }
+      if ((ch === "*" || ch === "_" || ch === "~") && isFormatOpenBoundary(line, i)) {
+        var fmtEnd = findClosingDelim(line, i + 1, ch);
+        if (fmtEnd > i + 1) {
+          appendText(el, line.slice(textStart, i));
+          if (ch === "*") appendWrappedText(el, "strong", "", line.slice(i + 1, fmtEnd));
+          else if (ch === "_") appendWrappedText(el, "em", "", line.slice(i + 1, fmtEnd));
+          else appendWrappedText(el, "del", "", line.slice(i + 1, fmtEnd));
+          i = fmtEnd + 1;
+          textStart = i;
+          continue;
+        }
+      }
+      i += charLen(line, i);
+    }
+    appendText(el, line.slice(textStart));
+  }
+
+  function appendFence(el, lines, lang) {
+    var pre = document.createElement("pre");
+    var code = document.createElement("code");
+    if (lang) code.className = "lang-" + lang;
+    code.textContent = lines.join("\n");
+    pre.appendChild(code);
+    el.appendChild(pre);
+  }
+
+  function fenceLang(line) {
+    var trimmed = String(line).trim();
+    if (trimmed.slice(0, 3) !== "```") return null;
+    var lang = trimmed.slice(3).trim();
+    if (!lang) return "";
+    var m = /\s/.exec(lang);
+    return m ? lang.slice(0, m.index) : lang;
+  }
+
+  function isFenceClose(line) {
+    return String(line).replace(/\s+$/, "") === "```";
+  }
+
+  function findFenceClose(lines, start) {
+    for (var i = start; i < lines.length; i++) {
+      if (isFenceClose(lines[i])) return i;
+    }
+    return -1;
+  }
+
   var URL_RE = /(https?:\/\/[^\s]+)/g;
   function linkifyLine(el, line) {
     var last = 0, match;
@@ -302,18 +428,94 @@
       var raw = match[0];
       // Trim trailing sentence punctuation that is unlikely to be part of the URL.
       var trimmed = raw.replace(/[.,;:!?)\]]+$/, "");
-      var a = document.createElement("a");
-      a.href = trimmed;
-      a.textContent = trimmed;
-      a.rel = "noopener noreferrer nofollow";
-      a.target = "_blank";
-      el.appendChild(a);
+      appendUrlLink(el, trimmed);
       if (trimmed.length < raw.length) {
         el.appendChild(document.createTextNode(raw.slice(trimmed.length)));
       }
       last = match.index + raw.length;
     }
     if (last < line.length) el.appendChild(document.createTextNode(line.slice(last)));
+  }
+
+  function startsUrlAt(line, i) {
+    return line.slice(i, i + 7) === "http://" || line.slice(i, i + 8) === "https://";
+  }
+
+  function isUrlChar(ch) {
+    return /^[A-Za-z0-9]$/.test(ch) ||
+      ch === "-" || ch === "." || ch === "_" || ch === "~" || ch === ":" || ch === "/" ||
+      ch === "?" || ch === "#" || ch === "[" || ch === "]" || ch === "@" || ch === "!" ||
+      ch === "$" || ch === "&" || ch === "'" || ch === "(" || ch === ")" || ch === "*" ||
+      ch === "+" || ch === "," || ch === ";" || ch === "=" || ch === "%";
+  }
+
+  function trimUrlTrailing(url) {
+    return String(url).replace(/[.,;:!?)\]]+$/, "");
+  }
+
+  function appendUrlLink(el, url) {
+    var a = document.createElement("a");
+    a.setAttribute("href", url);
+    a.rel = "noopener noreferrer nofollow";
+    a.target = "_blank";
+    a.textContent = url;
+    el.appendChild(a);
+  }
+
+  function appendText(el, text) {
+    if (text) el.appendChild(document.createTextNode(text));
+  }
+
+  function appendWrappedText(el, tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    node.textContent = text;
+    el.appendChild(node);
+  }
+
+  function isMentionChar(ch) {
+    return /^[A-Za-z0-9._-]$/.test(ch);
+  }
+
+  function isMentionBoundary(line, at) {
+    if (at === 0) return true;
+    var prev = line.charAt(at - 1);
+    return !isMentionChar(prev) && prev !== "@";
+  }
+
+  function mentionEnd(line, at) {
+    var j = at + 1;
+    while (j < line.length && isMentionChar(line.charAt(j))) j++;
+    return j > at + 1 ? j : -1;
+  }
+
+  function isFormatOpenBoundary(line, at) {
+    if (at === 0) return true;
+    return !isFormatWord(line.charAt(at - 1));
+  }
+
+  function isFormatCloseBoundary(line, after) {
+    if (after >= line.length) return true;
+    return !isFormatWord(line.charAt(after));
+  }
+
+  function isFormatWord(ch) {
+    return /^[A-Za-z0-9_]$/.test(ch);
+  }
+
+  function findClosingDelim(line, start, delim) {
+    var i = start;
+    while (i < line.length) {
+      var ch = line.charAt(i);
+      if (ch === delim && (delim !== "_" || isFormatCloseBoundary(line, i + 1))) return i;
+      i += charLen(line, i);
+    }
+    return -1;
+  }
+
+  function charLen(line, i) {
+    var code = line.charCodeAt(i);
+    return code >= 0xD800 && code <= 0xDBFF && i + 1 < line.length ? 2 : 1;
   }
 
   function scrollToBottom(smooth) {

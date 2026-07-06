@@ -14,7 +14,7 @@ use crate::auth;
 use crate::config::{LOBBY_ID, MESSAGE_PAGE_LIMIT};
 use crate::handlers::{app_css, esc, fmt_time, topbar, APP_JS};
 use crate::store::{Message, ReactionCount, UserRoom};
-use crate::text::render_body;
+use crate::text::{render_body, render_preview};
 use crate::{ensure_lobby, AppState};
 
 /// Longest quoted-parent snippet shown above a threaded reply, in characters (the full parent is
@@ -296,13 +296,12 @@ fn quote_html(parent: Option<&Message>) -> String {
     if snippet.chars().count() > QUOTE_SNIPPET_CHARS {
         oneline.push('…');
     }
-    let oneline = oneline.replace(['\n', '\r'], " ");
     format!(
         r#"<div class="msg__quote" data-parent-id="{id}"><span class="msg__quote-author">{author}</span><span class="msg__quote-body">{body}</span></div>
   "#,
         id = esc(&p.id),
         author = esc(&p.sender_email),
-        body = esc(&oneline),
+        body = render_preview(&oneline),
     )
 }
 

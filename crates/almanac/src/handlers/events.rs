@@ -41,6 +41,7 @@ const MAX_ATTENDEES: usize = 100;
 const AGENDA_DEFAULT_DAYS: i64 = 30;
 const AGENDA_MAX_DAYS: i64 = 366;
 const DAY_MS: i64 = 86_400_000;
+const SEARCH_LIMIT: usize = 200;
 
 /// Pixel height of one hour row in the week/day time-grid (matches the `.tgrid` CSS).
 const HOUR_PX: f64 = 48.0;
@@ -65,6 +66,18 @@ pub struct IndexQuery {
     /// Agenda/list horizon in days (`?view=agenda&days=N`), clamped to a bounded range.
     #[serde(default)]
     pub days: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_cal_filter")]
+    pub cal: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,6 +333,54 @@ pub async fn index(
     Ok(html_with_csrf_cookie(html, &csrf))
 }
 
+pub async fn search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SearchQuery>,
+) -> Result<Response, AppError> {
+    let owner = auth::owner_subject(&headers);
+    let settings = state.store.get_settings(&owner).await?;
+    let off = calendar::tz_offset_minutes(&settings.timezone);
+    let now = now_ms();
+    let calendars = state.store.list_calendars(&owner).await?;
+    let selected_calendars = selected_calendar_ids(&calendars, &q.cal);
+    let stored = state.store.list_events(&owner).await?;
+    let csrf = auth::new_csrf_token();
+    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
+    let win_start = q
+        .from
+        .as_deref()
+        .and_then(|d| calendar::parse_date_at(d, off))
+        .unwrap_or(now - 365 * DAY_MS);
+    let win_end =
+        q.to.as_deref()
+            .and_then(|d| calendar::parse_date_at(d, off))
+            .map(|t| t + DAY_MS)
+            .unwrap_or(now + 365 * DAY_MS);
+
+    let results = if needle.is_empty() {
+        Vec::new()
+    } else {
+        let expanded = rrule::expand_events(&stored, win_start, win_end);
+        let filtered = filter_events_by_calendar(expanded, &selected_calendars);
+        filtered
+            .into_iter()
+            .filter(|e| e.starts_at < win_end && e.ends_at >= win_start)
+            .filter(|e| {
+                e.title.to_lowercase().contains(&needle)
+                    || e.location.to_lowercase().contains(&needle)
+                    || e.notes.to_lowercase().contains(&needle)
+            })
+            .take(SEARCH_LIMIT)
+            .collect::<Vec<_>>()
+    };
+
+    let inner = render_search_results(&q, &results, &calendars, now, &csrf, off, &needle);
+    let content = format!("{}{}", render::subnav("calendar"), inner);
+    let html = layout("Search", &headers, &content);
+    Ok(html_with_csrf_cookie(html, &csrf))
+}
+
 /// Progressive-enhancement layer for the quick-add box + a toast host. With JS off the `.quickadd`
 /// form posts to `/quick-add` (unchanged); with JS on this intercepts the submit, POSTs the phrase
 /// to `/quick-add.json`, and on success clears the box, prepends the new event to the on-screen
@@ -529,7 +590,7 @@ fn render_calendar_sidebar(
         .collect();
     format!(
         "<aside class=\"card calendar-panel\">\
-           <div class=\"calendar-panel__head\"><h2>Calendars</h2></div>\
+           <div class=\"calendar-panel__head\"><h2>Calendars</h2><a class=\"btn btn-ghost btn-sm\" href=\"/search\">Search</a></div>\
            <form method=\"get\" action=\"/\" class=\"calendar-panel__filter\">{hidden}{filter_rows}\
              <button class=\"btn btn-primary btn-sm\" type=\"submit\">Apply</button>\
            </form>\
@@ -1027,6 +1088,55 @@ fn render_agenda_view(
         days = days,
         body = body,
         tz = esc(tz_label),
+    )
+}
+
+fn render_search_results(
+    q: &SearchQuery,
+    results: &[Event],
+    calendars: &[Calendar],
+    _now: i64,
+    csrf: &str,
+    off: i32,
+    needle: &str,
+) -> String {
+    let q_str = q.q.as_deref().unwrap_or("").trim();
+    let from_str = q.from.as_deref().unwrap_or("").trim();
+    let to_str = q.to.as_deref().unwrap_or("").trim();
+    let body = if needle.is_empty() {
+        "<p class=\"muted\">Type a word to search your events.</p>".to_string()
+    } else if results.is_empty() {
+        format!("<p class=\"muted\">No events match “{}”.</p>", esc(q_str))
+    } else {
+        let mut out = String::new();
+        let mut current_day: Option<i64> = None;
+        for e in results {
+            let day = calendar::start_of_day_at(e.starts_at, off);
+            if current_day != Some(day) {
+                current_day = Some(day);
+                out.push_str(&format!(
+                    "<h2 class=\"agenda__day\">{}</h2>",
+                    esc(&calendar::human_date_at(day, off))
+                ));
+            }
+            out.push_str(&render_agenda_item(e, calendars, csrf, off));
+        }
+        out
+    };
+
+    format!(
+        "<div class=\"cal-head\"><h1>Search</h1></div>\
+         <form method=\"get\" action=\"/search\" class=\"search-form\">\
+           <input type=\"search\" name=\"q\" value=\"{q}\" placeholder=\"Search events\" aria-label=\"Search events\" autofocus>\
+           <input type=\"date\" name=\"from\" value=\"{from}\" aria-label=\"From date\">\
+           <input type=\"date\" name=\"to\" value=\"{to}\" aria-label=\"To date\">\
+           <button class=\"btn btn-primary btn-sm\" type=\"submit\">Search</button>\
+         </form>\
+         <section class=\"agenda agenda--list\">{body}</section>",
+        q = esc(q_str),
+        from = esc(from_str),
+        to = esc(to_str),
+        body = body,
     )
 }
 

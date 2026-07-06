@@ -44,7 +44,7 @@ pub fn appnav(page_title: &str) -> String {
     let on = |b: bool| if b { " is-active" } else { "" };
     let cal = matches!(
         page_title,
-        "Calendar" | "Week" | "Day" | "Agenda" | "New event" | "Edit event"
+        "Calendar" | "Week" | "Day" | "Agenda" | "Search" | "New event" | "Edit event"
     );
     let contacts = matches!(page_title, "Contacts" | "Edit contact");
     let settings = page_title == "Settings";

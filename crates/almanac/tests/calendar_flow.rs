@@ -12,7 +12,7 @@ use tower::ServiceExt;
 
 use almanac::calendar;
 use almanac::store::default_calendar_id;
-use almanac::{app, build_dev_state, AppState};
+use almanac::{app, build_dev_state, now_ms, AppState};
 
 #[tokio::test]
 async fn healthz_ok() {
@@ -162,6 +162,251 @@ async fn full_event_lifecycle_scoped_to_owner() {
     )
     .await;
     assert!(!gone.contains("Quarterly review"), "event deleted");
+}
+
+#[tokio::test]
+async fn search_by_title() {
+    let state = build_dev_state();
+    let (start, end) = future_slot(30, 10, 11);
+    create_event_as(
+        &state,
+        "u_alice",
+        "alice@holdfast.local",
+        &[
+            ("title", "Dentist appointment"),
+            ("starts_at", &start),
+            ("ends_at", &end),
+        ],
+    )
+    .await;
+
+    let (status, _h, body) = call(
+        &state,
+        get_as("/search?q=dentist", "u_alice", "alice@holdfast.local"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Dentist appointment"));
+    assert!(body.contains("href=\"/edit/"), "result links to edit");
+}
+
+#[tokio::test]
+async fn search_matches_location_and_notes() {
+    let state = build_dev_state();
+    let (start, end) = future_slot(31, 10, 11);
+    create_event_as(
+        &state,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("title", "Launch prep"),
+            ("starts_at", &start),
+            ("ends_at", &end),
+            ("location", "War room"),
+            ("notes", "Bring the deck"),
+        ],
+    )
+    .await;
+
+    let (_s, _h, by_location) =
+        call(&state, get_as("/search?q=war%20room", "u_alice", "a@x.co")).await;
+    assert!(by_location.contains("Launch prep"));
+    let (_s, _h, by_notes) = call(&state, get_as("/search?q=deck", "u_alice", "a@x.co")).await;
+    assert!(by_notes.contains("Launch prep"));
+}
+
+#[tokio::test]
+async fn search_case_insensitive() {
+    let state = build_dev_state();
+    let (start, end) = future_slot(32, 10, 11);
+    create_event_as(
+        &state,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("title", "Dentist"),
+            ("starts_at", &start),
+            ("ends_at", &end),
+        ],
+    )
+    .await;
+
+    let (_s, _h, body) = call(&state, get_as("/search?q=DENTIST", "u_alice", "a@x.co")).await;
+    assert!(body.contains("Dentist"));
+}
+
+#[tokio::test]
+async fn search_is_owner_scoped() {
+    let state = build_dev_state();
+    let (start, end) = future_slot(33, 10, 11);
+    create_event_as(
+        &state,
+        "u_alice",
+        "alice@holdfast.local",
+        &[
+            ("title", "Alice secret sync"),
+            ("starts_at", &start),
+            ("ends_at", &end),
+        ],
+    )
+    .await;
+
+    let (status, _h, body) = call(
+        &state,
+        get_as("/search?q=secret", "u_bob", "bob@holdfast.local"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("Alice secret sync"));
+}
+
+#[tokio::test]
+async fn search_recurring_occurrence() {
+    let state = build_dev_state();
+    create_event_as(
+        &state,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("title", "Weekly planning"),
+            ("starts_at", "2099-06-03T09:00"),
+            ("ends_at", "2099-06-03T09:30"),
+            ("repeat", "weekly"),
+            ("repeat_interval", "1"),
+            ("repeat_count", "3"),
+        ],
+    )
+    .await;
+
+    let (_s, _h, body) = call(
+        &state,
+        get_as(
+            "/search?q=weekly%20planning&from=2099-06-10&to=2099-06-17",
+            "u_alice",
+            "a@x.co",
+        ),
+    )
+    .await;
+    assert!(
+        body.matches("Weekly planning").count() >= 2,
+        "search expands recurring occurrences"
+    );
+}
+
+#[tokio::test]
+async fn search_date_range() {
+    let state = build_dev_state();
+    create_event_as(
+        &state,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("title", "Early dentist"),
+            ("starts_at", "2099-01-05T10:00"),
+            ("ends_at", "2099-01-05T11:00"),
+        ],
+    )
+    .await;
+    create_event_as(
+        &state,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("title", "Late dentist"),
+            ("starts_at", "2099-03-05T10:00"),
+            ("ends_at", "2099-03-05T11:00"),
+        ],
+    )
+    .await;
+
+    let (_s, _h, body) = call(
+        &state,
+        get_as(
+            "/search?q=dentist&from=2099-03-01&to=2099-03-31",
+            "u_alice",
+            "a@x.co",
+        ),
+    )
+    .await;
+    assert!(body.contains("Late dentist"));
+    assert!(!body.contains("Early dentist"));
+}
+
+#[tokio::test]
+async fn search_query_is_escaped() {
+    let state = build_dev_state();
+    let (status, _h, body) = call(
+        &state,
+        get_as("/search?q=%3Cscript%3E", "u_alice", "a@x.co"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("<script>"));
+    assert!(body.contains("&lt;script&gt;"));
+}
+
+#[tokio::test]
+async fn search_empty_query() {
+    let state = build_dev_state();
+    let (start, end) = future_slot(34, 10, 11);
+    create_event_as(
+        &state,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("title", "Invisible empty query"),
+            ("starts_at", &start),
+            ("ends_at", &end),
+        ],
+    )
+    .await;
+
+    let (status, _h, body) = call(&state, get_as("/search", "u_alice", "a@x.co")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Type a word to search your events."));
+    assert!(!body.contains("Invisible empty query"));
+    assert!(!body.contains("<div class=\"agenda__item\""));
+}
+
+#[tokio::test]
+async fn search_delete_from_results() {
+    let state = build_dev_state();
+    let (start, end) = future_slot(35, 10, 11);
+    create_event_as(
+        &state,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("title", "Deletable dentist"),
+            ("starts_at", &start),
+            ("ends_at", &end),
+        ],
+    )
+    .await;
+
+    let (status, headers, body) =
+        call(&state, get_as("/search?q=deletable", "u_alice", "a@x.co")).await;
+    assert_eq!(status, StatusCode::OK);
+    let cookie = set_cookie(&headers).expect("search sets a CSRF cookie");
+    assert!(cookie.starts_with("__Host-almanac_csrf="));
+    let csrf = cookie_value(&cookie).expect("csrf cookie value");
+    assert!(
+        body.contains(&format!("value=\"{csrf}\"")),
+        "search result delete form uses the CSRF cookie token"
+    );
+    let id = find_between(&body, "/edit/", "\"").expect("event id link");
+
+    let del = post_form(
+        &format!("/delete/{id}"),
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[("csrf_token", &csrf)],
+    );
+    assert_eq!(call(&state, del).await.0, StatusCode::SEE_OTHER);
+
+    let (_s, _h, gone) = call(&state, get_as("/search?q=deletable", "u_alice", "a@x.co")).await;
+    assert!(!gone.contains("Deletable dentist"));
 }
 
 #[tokio::test]
@@ -972,7 +1217,10 @@ async fn quick_add_json_creates_event_optimistically() {
     );
     let (status, _h, body) = call(&state, vague).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("\"ok\":false"), "unparseable is a soft no: {body}");
+    assert!(
+        body.contains("\"ok\":false"),
+        "unparseable is a soft no: {body}"
+    );
 
     // Owner scoping: Bob never sees Alice's quick-added event.
     let (_s, _h, bob) = call(&state, get_as("/?view=agenda", "u_bob", "b@x.co")).await;
@@ -1016,6 +1264,25 @@ fn get_as(uri: &str, subject: &str, email: &str) -> Request<Body> {
         .header("x-auth-email", email)
         .body(Body::empty())
         .unwrap()
+}
+
+fn future_slot(days_from_now: i64, start_hour: i64, end_hour: i64) -> (String, String) {
+    let day = calendar::start_of_day(now_ms() + days_from_now * 86_400_000);
+    (
+        calendar::fmt_datetime_local(day + start_hour * 3_600_000),
+        calendar::fmt_datetime_local(day + end_hour * 3_600_000),
+    )
+}
+
+async fn create_event_as(state: &AppState, subject: &str, email: &str, fields: &[(&str, &str)]) {
+    let (_s, headers, _b) = call(state, get_as("/new", subject, email)).await;
+    let cookie = set_cookie(&headers).expect("new event form sets a CSRF cookie");
+    let csrf = cookie_value(&cookie).expect("csrf cookie value");
+    let mut pairs = Vec::with_capacity(fields.len() + 1);
+    pairs.push(("csrf_token", csrf.as_str()));
+    pairs.extend_from_slice(fields);
+    let req = post_form("/new", &cookie, subject, email, &pairs);
+    assert_eq!(call(state, req).await.0, StatusCode::SEE_OTHER);
 }
 
 fn post_form(

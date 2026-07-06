@@ -58,6 +58,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(handlers::health::healthz))
         // Calendar + events.
         .route("/", get(handlers::events::index))
+        .route("/search", get(handlers::events::search))
         .route(
             "/new",
             get(handlers::events::new_form).post(handlers::events::create),

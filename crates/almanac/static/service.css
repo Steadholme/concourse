@@ -21,6 +21,10 @@
 .cal-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 18px; align-items: start; }
 .cal-main { min-width: 0; }
 @media (max-width: 860px) { .cal-layout { grid-template-columns: 1fr; } }
+.search-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 18px; }
+.search-form input { height: 34px; padding: 0 10px; border: 1px solid var(--border-2); border-radius: var(--radius-sm); font: inherit; background: var(--surface); color: var(--ink); }
+.search-form input[type="search"] { flex: 1 1 240px; min-width: 220px; }
+.search-form input[type="date"] { flex: 0 1 150px; }
 
 .calendar-panel { padding: 14px; position: sticky; top: 72px; }
 .calendar-panel__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }

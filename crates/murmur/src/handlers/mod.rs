@@ -100,11 +100,31 @@ fn usermenu(email: &str) -> String {
     )
 }
 
+/// The three-state theme switcher (light / dark / system) rendered into the app-bar, just before
+/// the user menu — the same display-only control loom/cellar thread through. Pure `<a href>` links
+/// to the gateway-owned `/_gw/theme` route (no JS, no new service route); the active option mirrors
+/// the resolved theme. `__Secure-theme` is display-only and lives OUTSIDE the gateway HMACs, so this
+/// control can only repaint — never forge identity/CSRF. The `.themeswitch` styles live in the
+/// vendored Odyssey `APP_CSS`, not the service layer.
+fn themeswitch(theme: &str) -> String {
+    let (l, lc) = if theme == "light" { (" is-active", r#" aria-current="true""#) } else { ("", "") };
+    let (d, dc) = if theme == "dark" { (" is-active", r#" aria-current="true""#) } else { ("", "") };
+    let (a, ac) = if theme == "auto" { (" is-active", r#" aria-current="true""#) } else { ("", "") };
+    format!(
+        r#"<div class="themeswitch" role="group" aria-label="Theme">
+  <a class="themeswitch__opt{l}" href="/_gw/theme?to=light" title="Light" aria-label="Light"{lc}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></a>
+  <a class="themeswitch__opt{d}" href="/_gw/theme?to=dark" title="Dark" aria-label="Dark"{dc}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6.5 6.5 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg></a>
+  <a class="themeswitch__opt{a}" href="/_gw/theme?to=auto" title="System" aria-label="System"{ac}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></a>
+</div>"#,
+        l = l, lc = lc, d = d, dc = dc, a = a, ac = ac,
+    )
+}
+
 /// Render the shared v2 app-bar: an app-tile (message-circle in Chat's green) + the Murmur/host
 /// lockup on the left; the surface's nav (Chat, plus Admin on moderator pages); then an "All apps"
-/// button back to the apex portal and the signed-in avatar menu on the right. Same routes and the
-/// same gateway logout as before — only the chrome is modernized.
-pub fn topbar(page_title: &str, email: &str) -> String {
+/// button back to the apex portal, the display-only theme switcher, and the signed-in avatar menu on
+/// the right. Same routes and the same gateway logout as before — only the chrome is modernized.
+pub fn topbar(page_title: &str, email: &str, theme: &str) -> String {
     let tile = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>"#;
     let chat_ic = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>"#;
     let admin_ic = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>"#;
@@ -129,12 +149,14 @@ pub fn topbar(page_title: &str, email: &str) -> String {
   <div class="appbar__spacer"></div>
   <div class="appbar__right">
     <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps">{grid}</a>
+    {themeswitch}
     {usermenu}
   </div>
 </header>"#,
         tile = tile,
         nav = nav,
         grid = IC_GRID,
+        themeswitch = themeswitch(theme),
         usermenu = usermenu(email),
     )
 }

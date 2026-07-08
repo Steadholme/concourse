@@ -57,9 +57,17 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
 
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
 
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
+
     let page = DASHBOARD_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Chat", &email))
+        .replace("{{THEME}}", odyssey::html_theme_attr(theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
+        .replace("{{TOPBAR}}", &topbar("Chat", &email, theme))
         .replace("{{ROOMS}}", &render_room_list(&rooms, &selected))
         .replace("{{ROOM_TITLE}}", &esc(&selected_name))
         .replace("{{TOPIC}}", &esc(&selected_topic))
@@ -354,7 +362,7 @@ fn unauthorized_page() -> Response {
 <a class="btn btn-primary" href="/">Reload</a></div>
 </main></body></html>"#,
         css = app_css(),
-        topbar = topbar("Chat", ""),
+        topbar = topbar("Chat", "", "light"),
     );
     (StatusCode::UNAUTHORIZED, Html(page)).into_response()
 }

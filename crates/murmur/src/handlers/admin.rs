@@ -48,10 +48,17 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
     }
     let rooms = state.store.list_all_rooms().await;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
 
     let page = ADMIN_ROOMS_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Admin", &auth::display_email(&headers)))
+        .replace("{{THEME}}", odyssey::html_theme_attr(theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
+        .replace("{{TOPBAR}}", &topbar("Admin", &auth::display_email(&headers), theme))
         .replace("{{ROOMS}}", &render_room_rows(&rooms, &csrf));
 
     html_with_cookie(page, set_cookie)
@@ -75,10 +82,17 @@ pub async fn room_detail(
         .list_messages(&id, None, MESSAGE_PAGE_LIMIT)
         .await;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let theme = odyssey::resolve_theme(
+        headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok()),
+    );
 
     let page = ADMIN_ROOM_HTML
         .replace("{{CSS}}", app_css())
-        .replace("{{TOPBAR}}", &topbar("Admin", &auth::display_email(&headers)))
+        .replace("{{THEME}}", odyssey::html_theme_attr(theme))
+        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
+        .replace("{{TOPBAR}}", &topbar("Admin", &auth::display_email(&headers), theme))
         .replace("{{ROOM_TITLE}}", &esc(&room.name))
         .replace("{{ROOM_ID}}", &esc(&room.id))
         .replace("{{MEMBERS}}", &render_member_rows(&id, &members, &csrf))
@@ -386,7 +400,7 @@ fn forbidden_page() -> Response {
 <a class="btn btn-primary" href="/">Back to chat</a></div>
 </main></body></html>"#,
         css = app_css(),
-        topbar = topbar("Admin", ""),
+        topbar = topbar("Admin", "", "light"),
     );
     (StatusCode::FORBIDDEN, Html(page)).into_response()
 }
@@ -401,7 +415,7 @@ fn not_found_page(msg: &str) -> String {
 <a class="btn btn-primary" href="/admin">Back to rooms</a></div>
 </main></body></html>"#,
         css = app_css(),
-        topbar = topbar("Admin", ""),
+        topbar = topbar("Admin", "", "light"),
         msg = esc(msg),
     )
 }

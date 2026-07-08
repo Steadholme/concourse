@@ -279,3 +279,17 @@
   .toast-host { left: 12px; right: 12px; transform: none; }
   .toast-host .toast { width: 100%; justify-content: center; }
 }
+
+/* ── Dark ramp ──────────────────────────────────────────────────────────────
+   Murmur cedes its whole accent / surface / ink palette to Odyssey's canonical
+   dark ramp — it defines no brand accent of its own (the green is only the
+   app-tile's local --app), so accent/accent-2/accent-ink/accent-soft/
+   accent-soft-2/ring all dark-remap upstream and need no service override. The
+   one bespoke colour token this service adds to :root is --accent-border, a live
+   alias of --accent-soft-2 which Odyssey already remaps under dark; re-affirming
+   the alias keeps Murmur's reaction / quote / composer borders on the dark
+   accent-soft value in every dark state. --topbar-h is layout, not colour, so it
+   is untouched — and the light :root is left byte-identical. */
+:root[data-theme="dark"] {
+  --accent-border: var(--accent-soft-2);
+}

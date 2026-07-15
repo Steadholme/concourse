@@ -2,7 +2,7 @@
 name = "klaxon"
 version = "0.1.0"
 edition = "2021"
-description = "Klaxon — notification & push fan-out hub for the HOLDFAST stack (internal ingest API + SSO notification inbox, live SSE stream, Web Push subscriptions)."
+description = "Klaxon — notification & push fan-out hub for the Steadholme stack (internal ingest API + SSO notification inbox, live SSE stream, Web Push subscriptions)."
 license = "MIT OR Apache-2.0"
 
 [lib]

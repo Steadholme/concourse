@@ -2,7 +2,7 @@
 name = "murmur"
 version = "0.1.0"
 edition = "2021"
-description = "Murmur — real-time team chat / IM server for the HOLDFAST stack."
+description = "Murmur — real-time team chat / IM server for the Steadholme stack."
 license = "MIT OR Apache-2.0"
 
 [lib]

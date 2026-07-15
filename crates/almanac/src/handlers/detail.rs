@@ -70,7 +70,7 @@ pub async fn show(
          <section class=\"card detail\">{meta}</section>\
          {attendees}\
          {reminders}\
-         <p class=\"almanac-foot\">HOLDFAST Almanac · <a href=\"/calendar.ics\">Subscribe to this calendar</a> (read-only .ics)</p>",
+         <p class=\"almanac-foot\">Steadholme Almanac · <a href=\"/calendar.ics\">Subscribe to this calendar</a> (read-only .ics)</p>",
         subnav = render::subnav("calendar"),
         title = esc(&event.title),
         when = esc(&when),

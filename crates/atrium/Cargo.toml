@@ -2,7 +2,7 @@
 name = "atrium"
 version = "0.1.0"
 edition = "2021"
-description = "Atrium — unified activity inbox (one pane over chat + notifications + feeds) for the HOLDFAST estate."
+description = "Atrium — unified activity inbox (one pane over chat + notifications + feeds) for the Steadholme estate."
 license = "MIT OR Apache-2.0"
 
 [lib]

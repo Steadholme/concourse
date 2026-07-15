@@ -129,7 +129,7 @@ fn render_page(
 
     format!(
         "<section class=\"card rsvp\">\
-           <div class=\"rsvp__brand\">HOLDFAST Almanac</div>\
+           <div class=\"rsvp__brand\">Steadholme Almanac</div>\
            <h1>You're invited</h1>\
            {event_block}\
            {confirm}\

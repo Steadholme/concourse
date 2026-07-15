@@ -358,7 +358,7 @@ fn unauthorized_page() -> Response {
 <title>Sign in · Murmur</title><style>{css}</style></head>
 <body class="page-chat">{topbar}<main class="chat chat--center">
 <div class="signin-card"><h1>Session required</h1>
-<p>Sign in through the HOLDFAST gateway to use Murmur.</p>
+<p>Sign in through the Steadholme gateway to use Murmur.</p>
 <a class="btn btn-primary" href="/">Reload</a></div>
 </main></body></html>"#,
         css = app_css(),

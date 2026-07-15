@@ -1,6 +1,6 @@
 //! Server-side HTML rendering helpers: escaping, the page shell, the sub-nav, error pages.
 //!
-//! The enterprise HOLDFAST shell (top app-bar with the shield + wordmark + page name, and the
+//! The enterprise Steadholme shell (top app-bar with the shield + wordmark + page name, and the
 //! signed-in email + Logout on the right) and the design-system CSS are embedded via
 //! `include_str!`, so every page is self-contained with no asset round-trips. Each handler
 //! builds only its inner `content` HTML and hands it to [`layout`].
@@ -9,7 +9,7 @@ use crate::auth;
 use axum::http::HeaderMap;
 use std::sync::OnceLock;
 
-/// Embedded service CSS layered after Odyssey's canonical HOLDFAST design system.
+/// Embedded service CSS layered after Odyssey's canonical Steadholme design system.
 const SERVICE_CSS: &str = include_str!("../static/service.css");
 static APP_CSS: OnceLock<String> = OnceLock::new();
 /// Page shell with `{{...}}` slots.
@@ -107,7 +107,7 @@ pub fn userbox(headers: &HeaderMap) -> String {
     )
 }
 
-/// Wrap inner `content` HTML in the full HOLDFAST shell.
+/// Wrap inner `content` HTML in the full Steadholme shell.
 ///
 /// `page_title` is escaped into the `<title>` and the app-bar; `headers` supplies the
 /// gateway-injected signed-in email shown in the app-bar user chip. `content` is already-safe
@@ -140,7 +140,7 @@ pub fn subnav(active: &str) -> String {
     )
 }
 
-/// A standalone HOLDFAST-styled error page (used by [`crate::error::AppError`]).
+/// A standalone Steadholme-styled error page (used by [`crate::error::AppError`]).
 pub fn error_page(status: u16, title: &str, detail: &str) -> String {
     let content = format!(
         "<section class=\"card empty-state\">\
@@ -165,7 +165,7 @@ pub fn public_shell(page_title: &str, content: &str) -> String {
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light\"><meta name=\"robots\" content=\"noindex\">\
-         <title>{title} · Almanac · HOLDFAST</title><style>{css}</style></head>\
+         <title>{title} · Almanac · Steadholme</title><style>{css}</style></head>\
          <body class=\"page-almanac\"><main class=\"wrap wrap--narrow\">{content}</main></body></html>",
         title = esc(page_title),
         css = app_css(),
@@ -216,7 +216,7 @@ mod tests {
         let html = layout("Calendar", &headers, "<p>hi</p>");
         assert!(html.contains("<p>hi</p>"));
         assert!(html.contains("me@holdfast.local"));
-        assert!(html.contains("HOLDFAST"));
+        assert!(html.contains("Steadholme"));
         assert!(html.contains("sso.w33d.xyz/_gw/auth/logout"));
     }
 

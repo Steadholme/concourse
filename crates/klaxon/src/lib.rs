@@ -1,4 +1,4 @@
-//! Klaxon — notification & push fan-out hub for the HOLDFAST stack.
+//! Klaxon — notification & push fan-out hub for the Steadholme stack.
 //!
 //! One owned delivery layer for the whole estate: other internal services POST events to the
 //! ingest API, and users see/manage their notifications + register Web Push in an SSO inbox.

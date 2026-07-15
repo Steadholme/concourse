@@ -1,6 +1,6 @@
 # Atrium — unified activity inbox
 
-Atrium is the HOLDFAST estate's **"what's new for me"** command center: one pane that
+Atrium is the Steadholme estate's **"what's new for me"** command center: one pane that
 aggregates **unread chat** (Murmur), **unread notifications** (Klaxon), and **fresh feed items**
 (Current) for the signed-in user, with deep links out to each service plus quick-links to
 mail / forum / wiki / home.

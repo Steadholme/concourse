@@ -740,7 +740,7 @@ fn render_time_grid(
              <div class=\"tgrid__gutter\">{gutter}</div>{columns}\
            </div>\
          </section>\
-         <p class=\"almanac-foot\">HOLDFAST Almanac · personal calendar &amp; contacts · times shown in {tz}</p>",
+         <p class=\"almanac-foot\">Steadholme Almanac · personal calendar &amp; contacts · times shown in {tz}</p>",
         head = head,
         cols_style = cols_style,
         dayheads = dayheads,
@@ -926,7 +926,7 @@ fn render_calendar(
            <div class=\"cal-weeks\">{weeks}</div>\
          </section>\
          {agenda}\
-         <p class=\"almanac-foot\">HOLDFAST Almanac · personal calendar &amp; contacts · times shown in {tz}</p>",
+         <p class=\"almanac-foot\">Steadholme Almanac · personal calendar &amp; contacts · times shown in {tz}</p>",
         head = head,
         weekdays = weekdays,
         weeks = weeks,
@@ -1083,7 +1083,7 @@ fn render_agenda_view(
            </div>\
          </div>\
          <section class=\"agenda agenda--list\" aria-label=\"Next {days} days\">{body}</section>\
-         <p class=\"almanac-foot\">HOLDFAST Almanac · personal calendar &amp; contacts · times shown in {tz}</p>",
+         <p class=\"almanac-foot\">Steadholme Almanac · personal calendar &amp; contacts · times shown in {tz}</p>",
         switch = view_switch(ViewKind::Agenda, &calendar::fmt_date_input(now)),
         days = days,
         body = body,

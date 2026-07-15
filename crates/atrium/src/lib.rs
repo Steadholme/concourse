@@ -1,4 +1,4 @@
-//! Atrium — unified activity inbox (one pane over chat + notifications + feeds) for the HOLDFAST
+//! Atrium — unified activity inbox (one pane over chat + notifications + feeds) for the Steadholme
 //! estate.
 //!
 //! Library root: defines [`AppState`], wires the routes via [`app`], and provides

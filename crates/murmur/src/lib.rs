@@ -1,4 +1,4 @@
-//! Murmur — real-time team chat / IM server for the HOLDFAST stack.
+//! Murmur — real-time team chat / IM server for the Steadholme stack.
 //!
 //! Library root: defines [`AppState`], wires the routes via [`app`], and provides
 //! [`build_dev_state`] (in-memory store + disabled audit, no database) and

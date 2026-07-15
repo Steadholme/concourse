@@ -1,8 +1,8 @@
 # Almanac · 个人日历与通讯录
 
-Almanac 是 HOLDFAST 主权基础设施中的**个人日历 + 通讯录**服务，部署在 `cal.w33d.xyz`。
+Almanac 是 Steadholme 主权基础设施中的**个人日历 + 通讯录**服务，部署在 `cal.w33d.xyz`。
 它是服务端渲染的 Rust + axum 应用，遵循全estate 统一的 SHARED TEMPLATE：异步 `Store`
-抽象（内存 + PostgreSQL 两种实现）、企业级 HOLDFAST UI、CSRF 防护、健康检查子命令、多阶段
+抽象（内存 + PostgreSQL 两种实现）、企业级 Steadholme UI、CSRF 防护、健康检查子命令、多阶段
 非 root 镜像。
 
 ## 设计要点

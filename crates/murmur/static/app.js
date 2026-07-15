@@ -1,4 +1,4 @@
-/* HOLDFAST — Murmur dashboard client.
+/* Steadholme — Murmur dashboard client.
  *
  * Layers live updates onto the server-rendered shell: opens /ws for the live message/presence
  * stream and uses the JSON API for room switching, history, and sending. All message bodies are

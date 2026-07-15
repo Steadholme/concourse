@@ -30,7 +30,7 @@ pub fn html_with_csrf_cookie(body: String, csrf: &str) -> Response {
     response
 }
 
-/// Router fallback: a HOLDFAST-styled 404 for any unmatched route.
+/// Router fallback: a Steadholme-styled 404 for any unmatched route.
 pub async fn not_found(headers: HeaderMap) -> Response {
     let content = "<section class=\"card empty-state\">\
            <div class=\"empty-state__code\">404</div>\

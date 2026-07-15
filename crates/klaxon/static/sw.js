@@ -1,4 +1,4 @@
-// HOLDFAST Klaxon — minimal Web Push display service worker.
+// Steadholme Klaxon — minimal Web Push display service worker.
 // Registered from the inbox page with scope '/'. On a push message it decodes the (RFC 8291
 // encrypted, JSON) payload sent by Klaxon's fan-out and shows a notification; clicking it focuses
 // an already-open tab for the target URL, or opens one. Everything is defensive: a payload that

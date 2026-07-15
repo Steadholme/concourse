@@ -1,4 +1,4 @@
-//! Concourse — one container hosting the HOLDFAST communication surfaces (chat / calendar /
+//! Concourse — one container hosting the Steadholme communication surfaces (chat / calendar /
 //! notifications / inbox).
 //!
 //! Each surface is its OWN library crate (Murmur/Almanac/Klaxon/Atrium), reused verbatim: same

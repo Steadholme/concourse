@@ -206,7 +206,7 @@ fn wrap_calendar(mut body: Vec<String>, off_min: i32, include_vtimezone: bool) -
     let mut lines = vec![
         "BEGIN:VCALENDAR".to_string(),
         "VERSION:2.0".to_string(),
-        "PRODID:-//HOLDFAST//Almanac//EN".to_string(),
+        "PRODID:-//Steadholme//Almanac//EN".to_string(),
         "CALSCALE:GREGORIAN".to_string(),
         "METHOD:PUBLISH".to_string(),
     ];

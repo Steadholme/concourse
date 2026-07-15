@@ -2,7 +2,7 @@
 name = "concourse"
 version = "0.1.0"
 edition = "2021"
-description = "Concourse — one deployable hosting the HOLDFAST communication surfaces (chat / calendar / notifications / inbox) behind a Host-based vhost demux. Each surface keeps its own database, routes, subdomain and tokens; this binary just composes the four library crates so the estate runs one container instead of four. Klaxon stays reachable BOTH at notify.w33d.xyz (SSO console) and at the bare internal `klaxon` name (Bearer ingest from tempo/pulse/vitals)."
+description = "Concourse — one deployable hosting the Steadholme communication surfaces (chat / calendar / notifications / inbox) behind a Host-based vhost demux. Each surface keeps its own database, routes, subdomain and tokens; this binary just composes the four library crates so the estate runs one container instead of four. Klaxon stays reachable BOTH at notify.w33d.xyz (SSO console) and at the bare internal `klaxon` name (Bearer ingest from tempo/pulse/vitals)."
 license = "MIT OR Apache-2.0"
 
 [[bin]]

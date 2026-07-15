@@ -27,14 +27,14 @@ async fn full_event_lifecycle_scoped_to_owner() {
     let state = build_dev_state();
 
     // Empty calendar for alice.
-    let (status, _h, body) = call(&state, get_as("/", "u_alice", "alice@holdfast.local")).await;
+    let (status, _h, body) = call(&state, get_as("/", "u_alice", "alice@steadholme.local")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Calendar"));
     assert!(body.contains("No upcoming events"));
 
     // Open the new-event form; capture the minted CSRF token (cookie == hidden field).
     let (status, headers, body) =
-        call(&state, get_as("/new", "u_alice", "alice@holdfast.local")).await;
+        call(&state, get_as("/new", "u_alice", "alice@steadholme.local")).await;
     assert_eq!(status, StatusCode::OK);
     let cookie = set_cookie(&headers).expect("form sets a CSRF cookie");
     let csrf = cookie_value(&cookie).expect("csrf cookie value");
@@ -48,7 +48,7 @@ async fn full_event_lifecycle_scoped_to_owner() {
         "/new",
         &cookie,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &csrf),
             ("title", "Quarterly review"),
@@ -68,7 +68,7 @@ async fn full_event_lifecycle_scoped_to_owner() {
     // The event's month shows it in the grid AND the agenda.
     let (status, _h, month) = call(
         &state,
-        get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local"),
+        get_as("/?y=2099&m=6", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -80,7 +80,7 @@ async fn full_event_lifecycle_scoped_to_owner() {
     // Bob sees none of alice's events and cannot open her event.
     let (_s, _h, bob_view) = call(
         &state,
-        get_as("/?y=2099&m=6", "u_bob", "bob@holdfast.local"),
+        get_as("/?y=2099&m=6", "u_bob", "bob@steadholme.local"),
     )
     .await;
     assert!(
@@ -89,7 +89,7 @@ async fn full_event_lifecycle_scoped_to_owner() {
     );
     let (status, _h, _b) = call(
         &state,
-        get_as(&format!("/edit/{id}"), "u_bob", "bob@holdfast.local"),
+        get_as(&format!("/edit/{id}"), "u_bob", "bob@steadholme.local"),
     )
     .await;
     assert_eq!(
@@ -101,7 +101,7 @@ async fn full_event_lifecycle_scoped_to_owner() {
     // Alice edits the event (new CSRF from the edit form).
     let (_s, h2, _b) = call(
         &state,
-        get_as(&format!("/edit/{id}"), "u_alice", "alice@holdfast.local"),
+        get_as(&format!("/edit/{id}"), "u_alice", "alice@steadholme.local"),
     )
     .await;
     let cookie2 = set_cookie(&h2).unwrap();
@@ -110,7 +110,7 @@ async fn full_event_lifecycle_scoped_to_owner() {
         &format!("/edit/{id}"),
         &cookie2,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &csrf2),
             ("title", "Quarterly review (rescheduled)"),
@@ -122,7 +122,7 @@ async fn full_event_lifecycle_scoped_to_owner() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_s, _h, month) = call(
         &state,
-        get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local"),
+        get_as("/?y=2099&m=6", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert!(month.contains("Quarterly review (rescheduled)"));
@@ -132,14 +132,14 @@ async fn full_event_lifecycle_scoped_to_owner() {
         &format!("/delete/{id}"),
         &cookie2,
         "u_bob",
-        "bob@holdfast.local",
+        "bob@steadholme.local",
         &[("csrf_token", &csrf2)],
     );
     let (status, _h, _b) = call(&state, bad_del).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "delete always redirects");
     let (_s, _h, still) = call(
         &state,
-        get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local"),
+        get_as("/?y=2099&m=6", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert!(
@@ -151,14 +151,14 @@ async fn full_event_lifecycle_scoped_to_owner() {
         &format!("/delete/{id}"),
         &cookie2,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[("csrf_token", &csrf2)],
     );
     let (status, _h, _b) = call(&state, del).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_s, _h, gone) = call(
         &state,
-        get_as("/?y=2099&m=6", "u_alice", "alice@holdfast.local"),
+        get_as("/?y=2099&m=6", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert!(!gone.contains("Quarterly review"), "event deleted");
@@ -171,7 +171,7 @@ async fn search_by_title() {
     create_event_as(
         &state,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("title", "Dentist appointment"),
             ("starts_at", &start),
@@ -182,7 +182,7 @@ async fn search_by_title() {
 
     let (status, _h, body) = call(
         &state,
-        get_as("/search?q=dentist", "u_alice", "alice@holdfast.local"),
+        get_as("/search?q=dentist", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -242,7 +242,7 @@ async fn search_is_owner_scoped() {
     create_event_as(
         &state,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("title", "Alice secret sync"),
             ("starts_at", &start),
@@ -253,7 +253,7 @@ async fn search_is_owner_scoped() {
 
     let (status, _h, body) = call(
         &state,
-        get_as("/search?q=secret", "u_bob", "bob@holdfast.local"),
+        get_as("/search?q=secret", "u_bob", "bob@steadholme.local"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -772,7 +772,7 @@ async fn contacts_crud_scoped_to_owner() {
     // Empty address book.
     let (status, headers, body) = call(
         &state,
-        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+        get_as("/contacts", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -785,7 +785,7 @@ async fn contacts_crud_scoped_to_owner() {
         "/contacts/new",
         &cookie,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &csrf),
             ("name", "Grace Hopper"),
@@ -799,7 +799,7 @@ async fn contacts_crud_scoped_to_owner() {
 
     let (_s, _h, list) = call(
         &state,
-        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+        get_as("/contacts", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert!(list.contains("Grace Hopper"));
@@ -808,14 +808,14 @@ async fn contacts_crud_scoped_to_owner() {
     let id = find_between(&list, "/contacts/edit/", "\"").expect("contact id link");
 
     // Bob's address book is empty + he can't open alice's contact.
-    let (_s, _h, bob) = call(&state, get_as("/contacts", "u_bob", "bob@holdfast.local")).await;
+    let (_s, _h, bob) = call(&state, get_as("/contacts", "u_bob", "bob@steadholme.local")).await;
     assert!(!bob.contains("Grace Hopper"));
     let (status, _h, _b) = call(
         &state,
         get_as(
             &format!("/contacts/edit/{id}"),
             "u_bob",
-            "bob@holdfast.local",
+            "bob@steadholme.local",
         ),
     )
     .await;
@@ -827,7 +827,7 @@ async fn contacts_crud_scoped_to_owner() {
         get_as(
             &format!("/contacts/edit/{id}"),
             "u_alice",
-            "alice@holdfast.local",
+            "alice@steadholme.local",
         ),
     )
     .await;
@@ -837,7 +837,7 @@ async fn contacts_crud_scoped_to_owner() {
         &format!("/contacts/edit/{id}"),
         &cookie2,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &csrf2),
             ("name", "Rear Admiral Grace Hopper"),
@@ -848,7 +848,7 @@ async fn contacts_crud_scoped_to_owner() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_s, _h, list) = call(
         &state,
-        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+        get_as("/contacts", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert!(list.contains("Rear Admiral Grace Hopper"));
@@ -857,14 +857,14 @@ async fn contacts_crud_scoped_to_owner() {
         &format!("/contacts/delete/{id}"),
         &cookie2,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[("csrf_token", &csrf2)],
     );
     let (status, _h, _b) = call(&state, del).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let (_s, _h, list) = call(
         &state,
-        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+        get_as("/contacts", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert!(list.contains("No contacts yet"), "contact deleted");
@@ -878,7 +878,7 @@ async fn csrf_required_on_post() {
         "/new",
         "", // no cookie
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", "anything"),
             ("title", "X"),
@@ -891,7 +891,7 @@ async fn csrf_required_on_post() {
     // Nothing was written.
     let (_s, _h, idx) = call(
         &state,
-        get_as("/?y=2099&m=1", "u_alice", "alice@holdfast.local"),
+        get_as("/?y=2099&m=1", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert!(idx.contains("No upcoming events"));

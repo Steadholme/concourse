@@ -82,7 +82,7 @@ async fn pg_store_full_integration() {
         .unwrap();
 
     // --- create an event through the real HTTP flow ------------------------
-    let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "alice@holdfast.local")).await;
+    let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "alice@steadholme.local")).await;
     let cookie = set_cookie(&headers).expect("form sets CSRF cookie");
     let csrf = cookie_value(&cookie).expect("csrf value");
 
@@ -91,7 +91,7 @@ async fn pg_store_full_integration() {
         "/new",
         &cookie,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &csrf),
             ("title", "Launch"),
@@ -107,7 +107,7 @@ async fn pg_store_full_integration() {
     // The owner's month view renders straight out of Postgres.
     let (status, _h, month) = call(
         &state,
-        get_as("/?y=2099&m=7", "u_alice", "alice@holdfast.local"),
+        get_as("/?y=2099&m=7", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -137,7 +137,7 @@ async fn pg_store_full_integration() {
     // --- edit: upsert preserves created_at, updates the fields -------------
     let (_s, h2, _b) = call(
         &state,
-        get_as(&format!("/edit/{id}"), "u_alice", "alice@holdfast.local"),
+        get_as(&format!("/edit/{id}"), "u_alice", "alice@steadholme.local"),
     )
     .await;
     let cookie2 = set_cookie(&h2).unwrap();
@@ -147,7 +147,7 @@ async fn pg_store_full_integration() {
         &format!("/edit/{id}"),
         &cookie2,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &csrf2),
             ("title", "Launch (scrubbed)"),
@@ -185,7 +185,7 @@ async fn pg_store_full_integration() {
         &format!("/delete/{id}"),
         "", // no cookie
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[("csrf_token", "forged")],
     )
     .await;
@@ -205,7 +205,7 @@ async fn pg_store_full_integration() {
         &format!("/delete/{id}"),
         &cookie2,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[("csrf_token", &csrf2)],
     )
     .await;
@@ -222,7 +222,7 @@ async fn pg_store_full_integration() {
     // --- contacts round-trip through Postgres ------------------------------
     let (_s, ch, _b) = call(
         &state,
-        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+        get_as("/contacts", "u_alice", "alice@steadholme.local"),
     )
     .await;
     let ccookie = set_cookie(&ch).unwrap();
@@ -232,7 +232,7 @@ async fn pg_store_full_integration() {
         "/contacts/new",
         &ccookie,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &ccsrf),
             ("name", "Ada Lovelace"),
@@ -251,7 +251,7 @@ async fn pg_store_full_integration() {
     assert_eq!(contact_count, 1);
     let (_s, _h, list) = call(
         &state,
-        get_as("/contacts", "u_alice", "alice@holdfast.local"),
+        get_as("/contacts", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert!(list.contains("Ada Lovelace"));
@@ -259,7 +259,7 @@ async fn pg_store_full_integration() {
     // --- settings round-trip through Postgres ------------------------------
     let (_s, sh, sbody) = call(
         &state,
-        get_as("/settings", "u_alice", "alice@holdfast.local"),
+        get_as("/settings", "u_alice", "alice@steadholme.local"),
     )
     .await;
     assert!(
@@ -273,7 +273,7 @@ async fn pg_store_full_integration() {
         "/settings",
         &scookie,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &scsrf),
             ("timezone", "UTC+08:00"),
@@ -303,7 +303,7 @@ async fn pg_store_full_integration() {
     assert_eq!(settings_count, 1, "one settings row per owner");
 
     // --- attendees + reminders + RSVP + due-scan through Postgres ----------
-    let (_s, ah, _b) = call(&state, get_as("/new", "u_alice", "alice@holdfast.local")).await;
+    let (_s, ah, _b) = call(&state, get_as("/new", "u_alice", "alice@steadholme.local")).await;
     let acookie = set_cookie(&ah).unwrap();
     let acsrf = cookie_value(&acookie).unwrap();
     let ev = post_form(
@@ -311,7 +311,7 @@ async fn pg_store_full_integration() {
         "/new",
         &acookie,
         "u_alice",
-        "alice@holdfast.local",
+        "alice@steadholme.local",
         &[
             ("csrf_token", &acsrf),
             ("title", "Review"),
@@ -325,7 +325,7 @@ async fn pg_store_full_integration() {
     assert_eq!(ev.0, StatusCode::SEE_OTHER);
     let (_s, _h, m9) = call(
         &state,
-        get_as("/?y=2099&m=9", "u_alice", "alice@holdfast.local"),
+        get_as("/?y=2099&m=9", "u_alice", "alice@steadholme.local"),
     )
     .await;
     let eid = find_between(&m9, "/edit/", "\"").expect("event id");
@@ -350,7 +350,7 @@ async fn pg_store_full_integration() {
     // The public RSVP token round-trips and updates the row.
     let (_s, _h, detail) = call(
         &state,
-        get_as(&format!("/event/{eid}"), "u_alice", "alice@holdfast.local"),
+        get_as(&format!("/event/{eid}"), "u_alice", "alice@steadholme.local"),
     )
     .await;
     let token = find_between(&detail, "/rsvp/", "\"").expect("rsvp token");

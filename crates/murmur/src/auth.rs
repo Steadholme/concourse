@@ -405,9 +405,9 @@ mod tests {
         assert!(require_user(&HeaderMap::new()).is_err());
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_SUBJECT, "u_123".parse().unwrap());
-        headers.insert(HEADER_EMAIL, "a@holdfast.local".parse().unwrap());
+        headers.insert(HEADER_EMAIL, "a@steadholme.local".parse().unwrap());
         let (sub, email) = require_user(&headers).unwrap();
         assert_eq!(sub, "u_123");
-        assert_eq!(email, "a@holdfast.local");
+        assert_eq!(email, "a@steadholme.local");
     }
 }

@@ -79,8 +79,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 
 # 构建镜像并冒烟
-docker build -t holdfast/almanac:dev .
-docker run --rm -p 127.0.0.1:8960:8960 holdfast/almanac:dev   # 然后 curl /healthz
+docker build -t steadholme/almanac:dev .
+docker run --rm -p 127.0.0.1:8960:8960 steadholme/almanac:dev   # 然后 curl /healthz
 
 # PostgreSQL 集成测试（需外部 Postgres）
 docker run --rm -d --name almanac-testpg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=almanac \

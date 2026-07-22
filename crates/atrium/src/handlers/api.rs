@@ -1,10 +1,10 @@
 //! `GET /api/inbox` — the JSON feed the dashboard's live auto-refresh poll consumes.
 //!
-//! The client polls this endpoint every ~20 s and swaps the returned, freshly server-rendered
-//! `summary` + `columns` HTML fragments into their slots WITHOUT a full page reload (preserving the
-//! window scroll position). The fragments are produced by the SAME render helpers as the full page
-//! ([`crate::handlers::dashboard`]), so the poll can never drift from the initial render and every
-//! field stays HTML-escaped exactly as on first paint.
+//! The client polls this endpoint every ~20 s and swaps the returned, freshly server-rendered gauge
+//! and river fragments into their legacy-compatible `summary` + `columns` slots WITHOUT a full
+//! page reload (preserving the window scroll position). The fragments are produced by the SAME
+//! render helpers as the full page ([`crate::handlers::dashboard`]), so the poll cannot drift from
+//! the initial render and every field stays HTML-escaped exactly as on first paint.
 //!
 //! Like the page, this is a pure read scoped to the gateway-injected viewer subject, served off the
 //! shared ~10 s inbox cache. It emits NO audit event: unlike the human-initiated page view, a
@@ -18,6 +18,7 @@ use serde::Serialize;
 
 use crate::auth;
 use crate::config::SECTION_LIMIT;
+use crate::csrf;
 use crate::handlers::dashboard::{empty_inbox, render_columns, render_summary};
 use crate::handlers::InboxQuery;
 use crate::inbox::{self, Inbox, ViewFilter};
@@ -31,7 +32,7 @@ pub struct InboxPayload {
     pub total_unread: i64,
     /// Rendered summary-bar HTML (server-escaped) for `#summary-slot`.
     pub summary: String,
-    /// Rendered three-column HTML (server-escaped) for `#columns-slot`.
+    /// Rendered chronological river HTML (server-escaped) for `#columns-slot`.
     pub columns: String,
 }
 
@@ -44,12 +45,13 @@ pub async fn api_inbox(
 ) -> Json<InboxPayload> {
     let now = crate::now_secs();
     let filter = ViewFilter::new(query.q, query.source);
+    let token = csrf::cookie_token(&headers).unwrap_or_default();
 
     // No gateway identity -> nothing to federate; return the calm empty shell (matches the page).
     let Some(sub) = auth::subject(&headers) else {
         let empty = empty_inbox();
         let view = inbox::view(&empty, &Default::default(), &filter);
-        return Json(payload(&view, now));
+        return Json(payload(&view, now, &token, &filter));
     };
 
     let (raw, _fresh) = state.cache.get(&state.engine, &sub, SECTION_LIMIT).await;
@@ -57,15 +59,15 @@ pub async fn api_inbox(
     // the live poll re-renders exactly what the filtered page shows.
     let hidden = state.store.hidden(&sub).await.unwrap_or_default();
     let view = inbox::view(&raw, &hidden, &filter);
-    Json(payload(&view, now))
+    Json(payload(&view, now, &token, &filter))
 }
 
 /// Build the JSON payload by reusing the page's own render helpers.
-fn payload(inbox: &Inbox, now: i64) -> InboxPayload {
+fn payload(inbox: &Inbox, now: i64, token: &str, filter: &ViewFilter) -> InboxPayload {
     InboxPayload {
         total_unread: inbox.total_unread(),
         summary: render_summary(inbox),
-        columns: render_columns(inbox, now),
+        columns: render_columns(inbox, now, token, filter),
     }
 }
 
@@ -82,6 +84,7 @@ mod tests {
         Section {
             total,
             rows: vec![InboxRow {
+                key: "row-1".to_string(),
                 title: title.to_string(),
                 snippet: "preview".to_string(),
                 link: "https://chat.w33d.xyz/r/x".to_string(),
@@ -94,9 +97,15 @@ mod tests {
 
     fn state() -> crate::AppState {
         let engine = Engine::new(
-            Some(Arc::new(InMemorySource::new(SectionKind::Chat, section(2, "#general")))),
+            Some(Arc::new(InMemorySource::new(
+                SectionKind::Chat,
+                section(2, "#general"),
+            ))),
             Some(Arc::new(InMemorySource::down(SectionKind::Notifications))),
-            Some(Arc::new(InMemorySource::new(SectionKind::Feed, Section::empty()))),
+            Some(Arc::new(InMemorySource::new(
+                SectionKind::Feed,
+                Section::empty(),
+            ))),
         );
         crate::build_state_with_engine(engine)
     }
@@ -123,33 +132,97 @@ mod tests {
                 .unwrap_or_default(),
             "application/json"
         );
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         // Chat has 2 unread; down notifications contributes 0; empty feed 0 => grand total 2.
         assert_eq!(json["total_unread"], 2);
         let summary = json["summary"].as_str().unwrap();
         let columns = json["columns"].as_str().unwrap();
-        assert!(summary.contains("summary"), "summary fragment present");
-        assert!(columns.contains("#general"), "chat row rendered in columns fragment");
-        assert!(columns.contains("Source unavailable"), "down column degrades");
-        assert!(columns.contains("No fresh feed items."), "empty feed caught-up state");
+        assert!(summary.contains("gauge"), "gauge fragment present");
+        assert!(
+            columns.contains("#general"),
+            "chat row rendered in columns fragment"
+        );
+        assert!(
+            columns.contains("Notifications unavailable"),
+            "down source degrades explicitly"
+        );
+        assert!(
+            columns.contains(r#"class="river""#),
+            "single river fragment returned"
+        );
     }
 
     #[tokio::test]
     async fn api_inbox_without_identity_is_empty_shell() {
         let app = crate::app(crate::build_dev_state());
         let res = app
-            .oneshot(Request::builder().uri("/api/inbox").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inbox")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["total_unread"], 0);
-        // Every column degrades to its empty "caught up" state.
         assert!(json["columns"]
             .as_str()
             .unwrap()
-            .contains("all caught up on chat."));
+            .contains("You're all caught up."));
+    }
+
+    #[tokio::test]
+    async fn api_inbox_retains_exact_payload_keys() {
+        let res = crate::app(state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inbox")
+                    .header("x-auth-subject", "u_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let object = json.as_object().expect("payload object");
+        assert_eq!(object.len(), 3);
+        for key in ["summary", "columns", "total_unread"] {
+            assert!(object.contains_key(key), "missing frozen payload key {key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn api_poll_river_carries_native_forms_and_existing_cookie_token() {
+        let res = crate::app(state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inbox?q=general&source=chat")
+                    .header("x-auth-subject", "u_1")
+                    .header("cookie", "atrium_csrf=poll-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let columns = json["columns"].as_str().unwrap();
+        assert!(columns.contains(r#"class="river__actform""#));
+        assert!(columns.contains(r#"name="csrf" value="poll-token""#));
+        assert!(columns.contains(r#"name="return_q" value="general""#));
+        assert!(columns.contains(r#"name="return_source" value="chat""#));
     }
 }

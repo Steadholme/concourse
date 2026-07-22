@@ -54,7 +54,10 @@ pub fn cookie_token(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     for part in raw.split(';') {
         let part = part.trim();
-        if let Some(v) = part.strip_prefix(COOKIE_NAME).and_then(|r| r.strip_prefix('=')) {
+        if let Some(v) = part
+            .strip_prefix(COOKIE_NAME)
+            .and_then(|r| r.strip_prefix('='))
+        {
             let v = v.trim();
             if !v.is_empty() {
                 return Some(v.to_string());
@@ -81,6 +84,19 @@ pub fn valid(headers: &HeaderMap) -> bool {
         return false;
     };
     ct_eq(cookie.as_bytes(), header.as_bytes())
+}
+
+/// Double-submit check for a native HTML form. The form carries the echoed token in its body
+/// because a no-JS browser cannot set the `X-CSRF-Token` header.
+pub fn form_valid(headers: &HeaderMap, form_token: &str) -> bool {
+    let Some(cookie) = cookie_token(headers) else {
+        return false;
+    };
+    let form_token = form_token.trim();
+    if form_token.is_empty() {
+        return false;
+    }
+    ct_eq(cookie.as_bytes(), form_token.as_bytes())
 }
 
 /// Length-checked constant-time byte comparison (no early return on the first differing byte).
@@ -138,6 +154,22 @@ mod tests {
 
     #[test]
     fn cookie_token_is_parsed_out_of_a_cookie_jar() {
-        assert_eq!(cookie_token(&with(Some("xyz"), None)).as_deref(), Some("xyz"));
+        assert_eq!(
+            cookie_token(&with(Some("xyz"), None)).as_deref(),
+            Some("xyz")
+        );
+    }
+
+    #[test]
+    fn form_valid_matches_cookie_and_body_token() {
+        assert!(form_valid(&with(Some("tok-abc"), None), "tok-abc"));
+    }
+
+    #[test]
+    fn form_valid_rejects_missing_mismatched_or_empty_values() {
+        assert!(!form_valid(&with(None, None), "tok-abc"));
+        assert!(!form_valid(&with(Some("tok-abc"), None), "tok-xyz"));
+        assert!(!form_valid(&with(Some("tok-abc"), None), ""));
+        assert!(!form_valid(&with(Some("tok-abc"), None), "   "));
     }
 }

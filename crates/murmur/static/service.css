@@ -1,295 +1,1379 @@
-/* Murmur service components layered on Odyssey. */
+/* ============================================================================
+   Murmur · The Talkback Patchbay — service layer on Odyssey Foundation.
 
-:root {
-  --accent-border: var(--accent-soft-2);
+   A digital patchbay: the left rail is a blackened-aluminum Jackfield of room
+   ports; the selected jack bridges onto cream cue paper where the conversation
+   runs as a continuous punched tape; the composer is a cue strip with a mono
+   receipt; transport truth is one segmented meter; search/mentions/pins share
+   the Patch Ledger; moderation lives in the vermilion Cutout Bay.
+
+   Grammar: room = port (nickel ring), conversation = tape (hairline rows on a
+   time rail), reply = loop (copper notch + left rule), evidence = strip
+   (square, mono, cool gray), destructive = cut (vermilion double rule + glyph,
+   always with text). No gradients, glass, neon, pills, bubbles, or hover-only
+   actions. Colour is never the only channel — every state also carries a
+   label or a distinct geometry.
+   ========================================================================= */
+
+.page-chat {
+  /* Material tokens (light) — scoped, never written back to Odyssey. */
+  --pb-field: #17191d;        /* blackened aluminum instrument face */
+  --pb-field-2: #1f2227;
+  --pb-field-edge: #2c3037;
+  --pb-field-ink: #e8e6df;
+  --pb-field-ink-2: #a7adb6;
+  --pb-paper: #f3eee1;        /* cue paper */
+  --pb-paper-ink: #23211c;
+  --pb-paper-ink-2: #55503f;
+  --pb-paper-edge: #d8d1bd;
+  --pb-nickel: #c9ccd3;       /* jack rings, full meter segments */
+  --pb-copper: #3f8f7a;       /* routing / lineage marks (non-text, >=3:1) */
+  --pb-copper-ink: #2e6e5f;   /* copper text on paper (>=4.5:1) */
+  --pb-copper-on-field: #5fa893;
+  --pb-vermilion: #b83a2a;    /* destructive / attention cut, always with text */
+  --pb-evidence: #5d6672;     /* cool gray receipt / cursor / transport strip */
+  --pb-evidence-ink: #3f4650;
+  --pb-evidence-bg: #e3e6ea;
+  --pb-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --pb-condensed: "Arial Narrow", "Helvetica Neue", system-ui, sans-serif;
   --topbar-h: 56px;
+  background: var(--bg);
 }
 
-.page-chat { background: var(--bg); }
-.chat {
-  max-width: 1120px; margin: 0 auto;
-  height: calc(100vh - var(--topbar-h));
-  display: grid; grid-template-columns: 300px 1fr; gap: 22px;
-  padding: 22px 28px;
+:root[data-theme="dark"] .page-chat {
+  --pb-field: #121417;
+  --pb-field-2: #181b1f;
+  --pb-field-edge: #23272d;
+  --pb-field-ink: #e8e2d2;
+  --pb-field-ink-2: #9aa3ad;
+  --pb-paper: #1d1f23;
+  --pb-paper-ink: #e8e2d2;
+  --pb-paper-ink-2: #a7a293;
+  --pb-paper-edge: #2e3238;
+  --pb-nickel: #8f959e;
+  --pb-copper: #5fa893;
+  --pb-copper-ink: #7cc0aa;
+  --pb-copper-on-field: #5fa893;
+  --pb-vermilion: #e0685a;
+  --pb-evidence: #9aa3ad;
+  --pb-evidence-ink: #c6ccd4;
+  --pb-evidence-bg: #26292f;
 }
-.chat--center { display: flex; align-items: center; justify-content: center; }
 
-.murmur-sidebar {
-  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); box-shadow: var(--sh-sm);
-}
-.murmur-sidebar__head {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 15px 18px; border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-.murmur-sidebar__title { margin: 0; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .12em; color: var(--ink-3); }
-.murmur-sidebar__actions { display: flex; align-items: center; gap: 8px; }
+/* --- utilities ----------------------------------------------------------- */
 
-.dm-picker {
-  position: fixed; inset: 0; z-index: 50;
+.mono { font-family: var(--pb-mono); }
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  clip: rect(0 0 0 0); clip-path: inset(50%);
+  overflow: hidden; white-space: nowrap;
+}
+
+/* The first focus stop bypasses the persistent topbar and room bank. The target
+   stays out of the natural tab order while remaining a real focus destination. */
+.skip-link {
+  position: fixed;
+  inset-inline-start: 16px;
+  top: -72px;
+  z-index: 1000;
+  padding: 10px 14px;
+  border: 2px solid var(--pb-nickel);
+  background: var(--pb-field);
+  color: var(--pb-field-ink);
+  font-family: var(--pb-condensed);
+  font-size: 14px;
+  font-weight: 700;
+  text-decoration: none;
+}
+.skip-link:focus { top: 0; }
+#pb-deck { scroll-margin-top: calc(var(--topbar-h) + 12px); }
+
+/* Rust-rendered fallback pages (session required / forbidden / not found)
+   still reference these chrome classes — keep them working. */
+.chat--center {
+  min-height: calc(100vh - var(--topbar-h));
   display: flex; align-items: center; justify-content: center;
-  padding: 24px; background: rgba(15, 18, 34, .48);
+  padding: 24px;
 }
-.dm-picker__panel {
-  width: 100%; max-width: 420px; max-height: 70vh; display: flex; flex-direction: column;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); box-shadow: var(--sh-lg); overflow: hidden;
-}
-.dm-picker__head {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 15px 18px; border-bottom: 1px solid var(--border);
-}
-.dm-picker__title { margin: 0; font-size: 15px; font-weight: 600; color: var(--ink); }
-.dm-picker__list { list-style: none; margin: 0; padding: 8px; overflow-y: auto; flex: 1 1 auto; }
-.dm-picker__person {
-  display: block; width: 100%; text-align: left;
-  padding: 10px 12px; margin: 2px 0; border: 0; border-radius: var(--radius-md);
-  background: transparent; color: var(--ink-2); font: inherit; font-size: 14px; font-weight: 500;
-  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  transition: background .1s, color .1s;
-}
-.dm-picker__person:hover { background: var(--surface-2); color: var(--ink); }
-.dm-picker__empty { color: var(--ink-3); font-size: 13px; padding: 14px; }
-
-.room-list { list-style: none; margin: 0; padding: 8px; overflow-y: auto; flex: 1 1 auto; }
-.room { margin: 0; display: flex; align-items: center; gap: 6px; }
-.room__btn {
-  display: block; width: 100%; text-align: left; flex: 1 1 auto;
-  padding: 10px 12px; margin: 2px 0;
-  border: 0; border-radius: var(--radius-md);
-  background: transparent; color: var(--ink-2);
-  font: inherit; font-size: 14px; font-weight: 500;
-  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  transition: background .1s, color .1s;
-}
-.room__btn:hover { background: var(--surface-2); color: var(--ink); }
-.room.is-active .room__btn { background: var(--accent-soft); color: var(--accent-ink); }
-.room-list__empty { color: var(--ink-3); font-size: 13px; padding: 14px; }
-
-.room-view {
-  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); box-shadow: var(--sh-sm);
-  position: relative;
-}
-.room-view__head {
-  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
-  padding: 16px 20px; border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-.room-view__heading { min-width: 0; }
-.room-view__title { margin: 0; font-size: 16px; font-weight: 600; color: var(--ink); }
-.room-view__presence {
-  font-size: 11px; color: var(--ok-ink); font-weight: 600;
-  text-transform: uppercase; letter-spacing: .04em;
-}
-.room-view__topic {
-  margin-top: 3px; color: var(--ink-3); font-size: 12.5px; line-height: 1.4;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60ch;
-}
-.room-view__topic:empty { display: none; }
-.room-view__meta { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-
-.timeline { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 18px 20px; background: var(--surface-2); }
-.timeline__empty { color: var(--ink-3); text-align: center; padding: 48px 16px; font-size: 14px; }
-.msg { padding: 9px 0; }
-.msg + .msg { border-top: 1px solid var(--border); }
-.msg__head { display: flex; align-items: baseline; gap: 10px; }
-.msg__author { font-size: 13px; font-weight: 600; color: var(--ink); }
-.msg__time { font-size: 11px; color: var(--ink-3); }
-.msg__body { margin-top: 3px; color: var(--ink-2); font-size: 14px; line-height: 1.6; word-wrap: break-word; overflow-wrap: anywhere; white-space: normal; }
-.msg__body a { color: var(--accent-ink); text-decoration: underline; text-underline-offset: 2px; }
-.msg__body pre { background: var(--surface-2, rgba(127,127,127,.12)); border-radius: 8px; padding: 10px 12px; margin: 6px 0; overflow-x: auto; }
-.msg__body pre code { background: none; padding: 0; font-family: ui-monospace, monospace; font-size: 12.5px; white-space: pre; }
-.msg__body code { font-family: ui-monospace, monospace; font-size: 12.5px; background: color-mix(in srgb, var(--ink-2) 14%, transparent); border-radius: 4px; padding: 1px 5px; }
-.msg__body blockquote { border-left: 3px solid var(--border); margin: 4px 0; padding: 2px 0 2px 10px; color: var(--ink-2); }
-.msg__body del { opacity: .7; }
-.msg__body .mention { color: var(--accent-ink); background: color-mix(in srgb, var(--accent-ink) 14%, transparent); border-radius: 4px; padding: 0 3px; font-weight: 600; }
-.msg__edited { font-size: 11px; color: var(--ink-3); font-style: italic; }
-.msg__deleted { color: var(--ink-3); font-style: italic; }
-.msg__replies { font-size: 11px; color: var(--accent-ink); font-weight: 600; }
-
-.msg__quote {
-  display: flex; gap: 8px; align-items: baseline;
-  margin: 0 0 4px; padding: 4px 10px;
-  border-left: 3px solid var(--accent-border);
-  background: var(--accent-soft); border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  font-size: 12.5px; color: var(--ink-3);
-}
-.msg__quote-author { font-weight: 600; color: var(--accent-ink); flex: 0 0 auto; }
-.msg__quote-body { color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.msg__reactions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.reaction {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 2px 8px; border-radius: 999px;
-  border: 1px solid var(--border-2); background: var(--surface);
-  color: var(--ink-2); font-size: 12.5px; line-height: 1.4; cursor: pointer;
-  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
-}
-.reaction:hover { border-color: var(--accent-border); background: var(--bg-2); }
-.reaction.is-mine { background: var(--accent-soft); border-color: var(--accent-2); color: var(--accent-ink); font-weight: 600; }
-.reaction__count { font-size: 11.5px; color: inherit; }
-.msg__tools { display: inline-flex; gap: 8px; margin-left: auto; opacity: 0; transition: opacity .12s ease; }
-.msg:hover .msg__tools { opacity: 1; }
-.msg__tool { font-size: 11px; color: var(--ink-3); background: transparent; border: none; cursor: pointer; padding: 0; }
-.msg__tool:hover { color: var(--accent-ink); }
-
-.reply-banner {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 8px 20px; border-top: 1px solid var(--border);
-  background: var(--accent-soft); font-size: 12.5px;
-}
-.reply-banner__label { color: var(--accent-ink); font-weight: 600; }
-.reply-banner__cancel { background: transparent; border: none; color: var(--ink-3); cursor: pointer; font-size: 12px; }
-.reply-banner__cancel:hover { color: var(--accent-ink); }
-
-.composer {
-  display: flex; align-items: flex-end; gap: 12px;
-  padding: 16px 20px; border-top: 1px solid var(--border);
-  background: var(--surface);
-}
-.composer__input {
-  flex: 1 1 auto;
-  padding: 10px 12px;
-  background: var(--surface);
-  border: 1px solid var(--border-2);
-  border-radius: var(--radius-sm);
-  color: var(--ink);
-  font: inherit; font-size: 14px; line-height: 1.5;
-  resize: none; min-height: 0; max-height: 200px; overflow-y: auto;
-  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
-}
-.composer__input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
-.composer .btn.is-sending { opacity: .8; cursor: progress; }
-
 .signin-card {
   max-width: 420px; text-align: center;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); box-shadow: var(--sh-sm);
+  background: var(--pb-paper); color: var(--pb-paper-ink);
+  border: 1px solid var(--pb-paper-edge);
   padding: 40px 32px;
 }
 .signin-card h1 { margin: 0 0 8px; font-size: 22px; font-weight: 600; }
-.signin-card p { margin: 0 0 24px; color: var(--ink-2); }
+.signin-card p { margin: 0 0 24px; color: var(--pb-paper-ink-2); }
 
-@media (max-width: 720px) {
-  .chat { grid-template-columns: 1fr; padding: 16px; }
-  .murmur-sidebar { display: none; }
+/* Focus: one visible geometry in every mode. */
+.page-chat :focus-visible {
+  outline: 2px solid var(--pb-copper-ink);
+  outline-offset: 2px;
+}
+.jackfield :focus-visible,
+.patchbar :focus-visible {
+  outline-color: var(--pb-nickel);
 }
 
-.admin { max-width: 1000px; margin: 0 auto; padding: 32px 24px 64px; }
-.admin__card { padding: 8px 0 0; overflow: hidden; }
-.admin__head { padding: 20px 24px 14px; border-bottom: 1px solid var(--border); }
-.admin__title { margin: 6px 0 2px; font-size: 20px; font-weight: 600; }
-.admin__sub { color: var(--ink-3); font-size: 12.5px; }
-.admin__section { margin: 24px 24px 0; font-size: 13px; font-weight: 600; color: var(--ink-2); }
-.admin__col-actions { text-align: right; }
-.admin__actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
-.admin__actions form { margin: 0; }
-.admin__body { max-width: 42ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ============================================================================
+   Layout skeleton
+   ========================================================================= */
 
-.murmur-sidebar__search { display: flex; align-items: center; gap: 8px; padding: 10px 14px 4px; }
-.input-sm { height: 32px; font-size: 13px; }
-.murmur-sidebar__search .btn { flex: 0 0 auto; white-space: nowrap; }
-
-.room__badge { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; padding-right: 8px; }
-.room__mention {
-  width: 7px; height: 7px; border-radius: 999px; background: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-soft);
+.patchbay {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr) 300px;
+  gap: 22px;
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 22px 28px;
 }
+/* JS mode locks the shell to the viewport and scrolls regions internally;
+   no-JS keeps natural document flow so every region stays reachable. */
+html.js .patchbay {
+  height: calc(100dvh - var(--topbar-h));
+  min-height: 0;
+}
+html.js .jackfield,
+html.js .deck {
+  min-height: 0;
+}
+
+.patchbar { display: none; }
+
+/* ============================================================================
+   Jackfield — the room port panel
+   ========================================================================= */
+
+.jackfield {
+  display: flex; flex-direction: column;
+  background: var(--pb-field);
+  border: 1px solid var(--pb-field-edge);
+  color: var(--pb-field-ink);
+  /* No overflow:hidden here — the selected jack's copper bridge must cross the
+     22px grid gap into the deck. The bank scrolls itself. */
+}
+.jackfield__head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--pb-field-edge);
+  background: var(--pb-field-2);
+}
+.jackfield__title {
+  margin: 0;
+  font-family: var(--pb-condensed); font-stretch: condensed;
+  font-size: 12px; font-weight: 700;
+  letter-spacing: .18em; text-transform: uppercase;
+  color: var(--pb-field-ink-2);
+}
+.jackfield__actions { display: flex; gap: 6px; }
+.jackfield__new {
+  font: inherit; font-size: 11.5px; font-weight: 600;
+  font-family: var(--pb-condensed); font-stretch: condensed;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--pb-field-ink);
+  background: transparent;
+  border: 1px solid var(--pb-field-edge);
+  border-radius: 0;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+.jackfield__new:hover { border-color: var(--pb-nickel); }
+.jackfield__new[hidden] { display: none; }
+
+.jackfield__bank {
+  list-style: none; margin: 0; padding: 8px 0 12px;
+  overflow-y: auto; flex: 1 1 auto; min-height: 0;
+}
+.jackfield__bank-label,
+.room-bank__label { /* transitional: current renderer class */
+  padding: 12px 16px 4px;
+  font-family: var(--pb-mono); font-size: 10.5px;
+  letter-spacing: .14em; text-transform: uppercase;
+  color: var(--pb-field-ink-2);
+}
+.jackfield__note {
+  padding: 8px 16px;
+  font-family: var(--pb-mono); font-size: 11px;
+  color: var(--pb-field-ink-2);
+  border-top: 1px dashed var(--pb-field-edge);
+}
+.room-list__empty { padding: 14px 16px; font-size: 13px; color: var(--pb-field-ink-2); }
+
+/* One jack row. Contract shape: li.jack > a.jack__link; the transitional
+   renderer emits li.room > button.room__btn — both share the port geometry. */
+.jack { margin: 0; }
+.jack__link,
+.room__btn {
+  position: relative;
+  display: flex; align-items: center; gap: 10px;
+  width: 100%;
+  padding: 9px 14px 9px 16px;
+  border: 0; border-radius: 0;
+  background: transparent;
+  color: var(--pb-field-ink);
+  font: inherit; font-size: 14px; text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+.jack__link:hover,
+.room__btn:hover { background: var(--pb-field-2); }
+
+/* The nickel port ring. Contract rows carry a .jack__ring element; the
+   transitional .room__btn grows the same ring from ::before. */
+.jack__ring,
+.room__btn::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 18px; height: 18px;
+  border: 2px solid var(--pb-nickel);
+  border-radius: 50%;
+  background: transparent;
+}
+/* DM jack: double-contact ring (inner contact). */
+.jack__link[data-room-kind="dm"] .jack__ring,
+.room[data-room-kind="dm"] .room__btn::before {
+  box-shadow: inset 0 0 0 3px var(--pb-field), inset 0 0 0 5px var(--pb-nickel);
+}
+/* Archived jack: capped port (horizontal line across the ring). The cap is a
+   real border line on ::after — gradient functions are forbidden even as
+   hard-stop fills. Transitional .room__btn rows have no second pseudo left, so
+   they degrade to the plain ring plus the bank's "Archive — read only" label. */
+.jack__link[data-room-state="archived"] .jack__ring { position: relative; }
+.jack__link[data-room-state="archived"] .jack__ring::after {
+  content: "";
+  position: absolute;
+  left: 1px; right: 1px; top: 50%;
+  margin-top: -1px;
+  border-top: 2px solid var(--pb-nickel);
+}
+/* Unavailable jack: dashed ring. */
+.jack__link[data-room-state="unavailable"] .jack__ring,
+.room[data-room-state="unavailable"] .room__btn::before {
+  border-style: dashed;
+}
+
+.jack__label {
+  flex: 1 1 auto; min-width: 0;
+  font-family: var(--pb-condensed); font-stretch: condensed;
+  font-size: 14.5px; font-weight: 600; letter-spacing: .02em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* Selected jack: filled ring + the oxidized-copper patch bridge that crosses
+   the 22px gap into the deck at the row's own height — the one-line answer to
+   "which room am I in". */
+.jack__link[aria-current="page"],
+.room.is-active .room__btn,
+.room[aria-current="page"] .room__btn {
+  background: var(--pb-field-2);
+  font-weight: 700;
+}
+.jack__link[aria-current="page"] .jack__ring,
+.room.is-active .room__btn::before,
+.room[aria-current="page"] .room__btn::before {
+  background: var(--pb-nickel);
+}
+.jack__link[aria-current="page"]::after,
+.room.is-active::after,
+.room[aria-current="page"]::after {
+  content: "";
+  position: absolute;
+  top: 50%; right: -22px;
+  width: 22px; height: 3px;
+  margin-top: -1.5px;
+  background: var(--pb-copper-on-field);
+}
+.jack__link[aria-current="page"]::before,
+.room.is-active .room__btn::after,
+.room[aria-current="page"] .room__btn::after {
+  /* in-row copper stub so the selected state survives narrow/no-bridge layouts */
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--pb-copper-on-field);
+}
+
+/* State marks: square tick = unread, diamond = mention. Never count-exact. */
+.jack__marks,
+.room__badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  flex: 0 0 auto;
+}
+.jack__mark--unread,
 .room__unread {
-  min-width: 18px; height: 18px; padding: 0 6px; border-radius: 999px;
-  display: inline-flex; align-items: center; justify-content: center;
-  background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; line-height: 1;
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--pb-mono); font-size: 10px;
+  letter-spacing: .1em; text-transform: uppercase;
+  color: var(--pb-field-ink);
+}
+.jack__mark--unread::before,
+.room__unread::before {
+  content: "";
+  width: 8px; height: 8px;
+  background: var(--pb-field-ink);
 }
 .room__unread[hidden] { display: none; }
+.jack__mark--mention,
+.room__mention {
+  width: 8px; height: 8px;
+  background: var(--pb-copper-on-field);
+  transform: rotate(45deg);
+}
+.jack__sys {
+  font-family: var(--pb-mono); font-size: 9.5px; letter-spacing: .12em;
+  color: var(--pb-field-ink-2);
+  border: 1px solid var(--pb-field-edge);
+  padding: 1px 4px;
+}
+.jack__kind {
+  font-family: var(--pb-mono); font-size: 10px;
+  color: var(--pb-field-ink-2);
+}
 
-.pinned-panel { border-bottom: 1px solid var(--border); background: var(--surface); max-height: 240px; overflow-y: auto; }
-.pinned-panel[hidden] { display: none; }
-.pinned-panel__head {
-  padding: 8px 20px; font-size: 11px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: .1em; color: var(--ink-3); border-bottom: 1px solid var(--border);
+/* The deck-side socket the bridge lands on. */
+.deck__head::before {
+  content: "";
+  flex: 0 0 auto;
+  align-self: center;
+  width: 16px; height: 16px;
+  border: 2px solid var(--pb-nickel);
+  border-radius: 50%;
+  background: var(--pb-paper);
+  box-shadow: inset 0 0 0 3px var(--pb-paper), inset 0 0 0 5px var(--pb-copper);
 }
-.pinned-panel__list { padding: 6px 12px 10px; }
-.pinned-panel__empty { color: var(--ink-3); font-size: 13px; padding: 12px 8px; }
-.pinned-item { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
-.pinned-item__jump {
-  flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px;
-  padding: 6px 8px; border: 0; border-radius: var(--radius-sm); background: transparent;
-  color: var(--ink-2); font: inherit; text-align: left; cursor: pointer;
+/* Bridge only spans the gap at widths where jackfield and deck are adjacent. */
+@media (max-width: 767px) {
+  .jack__link[aria-current="page"]::after,
+  .room.is-active::after,
+  .room[aria-current="page"]::after { display: none; }
 }
-.pinned-item__jump:hover { background: var(--surface-2); }
-.pinned-item__author { flex: 0 0 auto; font-size: 12.5px; font-weight: 600; color: var(--ink); }
-.pinned-item__body { flex: 1 1 auto; min-width: 0; font-size: 12.5px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pinned-item__unpin { flex: 0 0 auto; background: transparent; border: none; color: var(--ink-3); cursor: pointer; font-size: 11px; }
-.pinned-item__unpin:hover { color: var(--down-ink); }
 
-.result-row {
-  display: flex; flex-direction: column; gap: 2px; width: 100%; text-align: left;
-  padding: 10px 12px; margin: 2px 0; border: 0; border-radius: var(--radius-md);
-  background: transparent; color: var(--ink-2); font: inherit; cursor: pointer;
-  transition: background .1s;
+/* Mobile drawer (JS only). No-JS keeps the jackfield in normal flow. */
+@media (max-width: 767px) {
+  html.js .jackfield {
+    display: none;
+    position: fixed;
+    top: var(--topbar-h); left: 0; bottom: 0;
+    width: min(85vw, 340px);
+    z-index: 60;
+  }
+  html.js .jackfield.is-open { display: flex; }
 }
-.result-row:hover { background: var(--surface-2); }
-.result-row__room { font-size: 13px; font-weight: 600; color: var(--accent-ink); }
-.result-row__meta { font-size: 11px; color: var(--ink-3); }
-.result-row__body {
-  font-size: 13px; color: var(--ink-2);
+.jackfield-scrim {
+  position: fixed; inset: 0; z-index: 55;
+  background: rgba(12, 13, 16, .5);
+  border: 0; padding: 0; cursor: default;
+}
+
+/* ============================================================================
+   Deck — cue paper, conversation tape, cue strip
+   ========================================================================= */
+
+.deck {
+  display: flex; flex-direction: column;
+  min-width: 0;
+  background: var(--pb-paper);
+  border: 1px solid var(--pb-paper-edge);
+  color: var(--pb-paper-ink);
+}
+.deck__head {
+  display: flex; align-items: flex-start; gap: 14px;
+  padding: 14px 18px;
+  border-bottom: 2px solid var(--pb-paper-ink);
+  background: var(--pb-paper);
+}
+.deck__heading { flex: 1 1 auto; min-width: 0; }
+.deck__title {
+  margin: 0;
+  font-size: 18px; font-weight: 700; line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.deck__tag {
+  display: none;
+  margin: 4px 0 0;
+  font-family: var(--pb-mono); font-size: 11px;
+  letter-spacing: .08em; text-transform: uppercase;
+  color: var(--pb-evidence-ink);
+  border: 1px solid var(--pb-evidence);
+  padding: 2px 6px;
+  width: max-content; max-width: 100%;
+}
+.deck--archived .deck__tag--archived { display: block; }
+.deck__topic {
+  margin: 4px 0 0;
+  color: var(--pb-paper-ink-2);
+  font-size: 12.5px; line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.deck__topic:empty { display: none; }
+.deck__meta {
+  display: flex; align-items: center; gap: 12px;
+  flex: 0 0 auto;
+}
+.deck__nojs {
+  margin: 0;
+  font-family: var(--pb-mono); font-size: 11px;
+  color: var(--pb-evidence-ink);
+  max-width: 32ch;
+}
+.deck__ledger-toggle { display: none; }
+.deck__ledger-toggle,
+.patchbar__rooms {
+  font: inherit; font-size: 12px; font-weight: 600;
+  color: var(--pb-paper-ink);
+  background: transparent;
+  border: 1px solid var(--pb-paper-ink);
+  border-radius: 0;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+/* --- transport meter: one honest segmented cell --------------------------- */
+
+.meter {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--pb-paper-edge);
+  background: var(--pb-paper);
+}
+.meter__segments { display: inline-flex; gap: 2px; }
+.meter__segments i {
+  width: 5px; height: 14px;
+  background: transparent;
+  border: 1px solid var(--pb-evidence);
+}
+.meter.is-connected .meter__segments i { background: var(--pb-nickel); }
+.meter.is-reconnecting .meter__segments i:nth-child(-n+2) { background: var(--pb-nickel); }
+.meter.is-unknown .meter__segments i:nth-child(-n+1) { background: var(--pb-nickel); }
+.meter__label {
+  font-family: var(--pb-mono); font-size: 11px;
+  color: var(--pb-evidence-ink);
+  white-space: nowrap;
+}
+.meter__catchup {
+  font-family: var(--pb-mono); font-size: 10.5px;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--pb-copper-ink);
+  border-left: 2px solid var(--pb-copper);
+  padding-left: 6px;
+}
+.meter__catchup[hidden] { display: none; }
+.meter__reconnect {
+  font: inherit; font-family: var(--pb-mono); font-size: 11px;
+  color: var(--pb-paper-ink);
+  background: transparent;
+  border: 1px solid var(--pb-paper-ink);
+  border-radius: 0;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.meter__reconnect[hidden] { display: none; }
+
+/* --- conversation tape ----------------------------------------------------- */
+
+.tape {
+  list-style: none;
+  margin: 0; padding: 6px 0 10px;
+  flex: 1 1 auto;
+  background: var(--pb-paper);
+}
+html.js .tape { min-height: 0; overflow-y: auto; }
+
+.tape__splice {
+  display: flex; align-items: center; gap: 10px;
+  margin: 8px 18px;
+  font-family: var(--pb-mono); font-size: 11px;
+  letter-spacing: .06em;
+  color: var(--pb-evidence-ink);
+}
+.tape__splice::after {
+  content: "";
+  flex: 1 1 auto;
+  border-top: 1px solid var(--pb-paper-edge);
+}
+.tape__splice--status { text-transform: none; }
+.tape__splice--date { color: var(--pb-paper-ink-2); }
+
+.tape__empty,
+.timeline__empty { /* transitional: current renderer class */
+  margin: 24px 18px;
+  font-size: 13.5px;
+  color: var(--pb-paper-ink-2);
+}
+
+/* One punched row on the time rail. */
+.msg {
+  position: relative;
+  margin: 0; padding: 10px 18px 10px 92px;
+  border-top: 1px solid var(--pb-paper-edge);
+  overflow-wrap: anywhere;
+}
+.msg::before { /* rail tick */
+  content: "";
+  position: absolute;
+  left: 64px; top: 16px;
+  width: 8px;
+  border-top: 2px solid var(--pb-paper-edge);
+}
+.msg__head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+}
+.msg__time {
+  position: absolute;
+  left: 0; top: 12px;
+  width: 56px;
+  text-align: right;
+  font-family: var(--pb-mono); font-size: 11px;
+  color: var(--pb-evidence-ink);
+}
+.msg__author {
+  font-size: 13px; font-weight: 700;
+  color: var(--pb-paper-ink);
+  overflow-wrap: anywhere;
+}
+.msg__edited { font-size: 11px; font-style: italic; color: var(--pb-paper-ink-2); }
+.msg__replies,
+.msg__loops {
+  font-size: 11px; font-weight: 600;
+  color: var(--pb-copper-ink);
+}
+.msg__body {
+  margin-top: 3px;
+  color: var(--pb-paper-ink);
+  font-size: 14px; line-height: 1.6;
+  max-width: 68ch;
+  overflow-wrap: anywhere;
+}
+.msg__body a { color: var(--pb-copper-ink); text-decoration: underline; text-underline-offset: 2px; }
+.msg__body pre {
+  margin: 6px 0; padding: 10px 12px;
+  border: 1px solid var(--pb-paper-edge);
+  background: var(--pb-evidence-bg);
+  overflow-x: auto;
+}
+.msg__body pre code {
+  background: none; padding: 0;
+  font-family: var(--pb-mono); font-size: 12.5px; white-space: pre;
+}
+.msg__body code {
+  font-family: var(--pb-mono); font-size: 12.5px;
+  background: var(--pb-evidence-bg);
+  padding: 1px 5px;
+}
+.msg__body blockquote {
+  margin: 4px 0; padding: 2px 0 2px 10px;
+  border-left: 3px solid var(--pb-copper);
+  color: var(--pb-paper-ink-2);
+}
+.msg__body del { opacity: .7; }
+.msg__body .mention {
+  color: var(--pb-copper-ink);
+  border-bottom: 2px solid var(--pb-copper);
+  font-weight: 600;
+}
+
+/* Tombstones: deletion-rule geometry + italic, no old body, no actions. */
+.msg[data-lifecycle="deleted"],
+.msg[data-lifecycle="redacted"] {
+  border-top-style: double;
+}
+.msg__deleted { color: var(--pb-paper-ink-2); font-style: italic; }
+.msg[data-lifecycle="deleted"] .msg__tools,
+.msg[data-lifecycle="redacted"] .msg__tools { display: none; }
+
+/* Reply loop: copper notch + left rule, plain-text lineage. */
+.msg__quote,
+.loop {
+  display: flex; align-items: baseline; gap: 8px;
+  margin: 0 0 4px;
+  padding: 4px 0 4px 10px;
+  border-left: 3px solid var(--pb-copper);
+  font-size: 12.5px;
+  color: var(--pb-paper-ink-2);
+  max-width: 68ch;
+}
+.msg__quote::before,
+.loop::before {
+  content: "\21A9"; /* ↩ */
+  color: var(--pb-copper-ink);
+  font-size: 12px;
+}
+.msg__quote-author,
+.loop__author { font-weight: 700; color: var(--pb-copper-ink); flex: 0 0 auto; }
+.msg__quote-body,
+.loop__snippet {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0;
+}
+.loop__link { color: inherit; text-decoration: none; }
+.loop__link:hover { text-decoration: underline; }
+
+/* Reaction chips: square-backed tallies, pressed state is text + geometry. */
+.msg__reactions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.reaction {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--pb-paper-edge);
+  border-radius: 0;
+  background: var(--pb-paper);
+  color: var(--pb-paper-ink);
+  font: inherit; font-size: 12.5px; line-height: 1.4;
+  cursor: pointer;
+}
+.reaction:hover { border-color: var(--pb-copper); }
+.reaction.is-mine,
+.reaction[aria-pressed="true"] {
+  border-color: var(--pb-copper);
+  border-bottom-width: 3px;
+  color: var(--pb-copper-ink);
+  font-weight: 700;
+}
+.reaction__count { font-family: var(--pb-mono); font-size: 11px; color: inherit; }
+
+/* Message tools: always visible — hover only brightens, never reveals. */
+.msg__tools {
+  display: inline-flex; gap: 10px;
+  margin-left: auto;
+}
+.msg__tool {
+  background: transparent; border: 0; border-radius: 0;
+  padding: 2px 0;
+  font: inherit; font-size: 11px; font-weight: 600;
+  color: var(--pb-evidence-ink);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 3px;
+}
+.msg__tool:hover,
+.msg__tool:focus-visible {
+  color: var(--pb-copper-ink);
+  text-decoration-color: var(--pb-copper-ink);
+}
+.msg__tool[aria-expanded="true"] { color: var(--pb-copper-ink); text-decoration-color: var(--pb-copper-ink); }
+html:not(.js) .msg__tools { display: none; } /* no dead controls without JS */
+
+/* Archived rooms are read-only: SSR rows never show write tools or live reaction chips,
+   even before (or without) the app.js guards. Active rooms are untouched. */
+.deck--archived .msg__tools,
+.deck--archived .reaction { display: none; }
+
+.msg__note {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--pb-vermilion);
 }
 
-.msg--flash { animation: msg-flash 1.2s ease; border-radius: var(--radius-sm); }
-@keyframes msg-flash {
-  0% { background: var(--accent-soft); }
+/* Two-stage inline delete: a real second deliberate action, never confirm(). */
+.msg__confirm {
+  display: inline-flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.msg__confirm-label { font-size: 11px; color: var(--pb-paper-ink-2); }
+.msg__tool--danger,
+.msg__tool--danger:hover,
+.msg__tool--danger:focus-visible {
+  color: var(--pb-vermilion);
+  text-decoration-color: var(--pb-vermilion);
+}
+
+/* React emoji popover: common patches plus a free input — no prompt(). */
+.msg__reactpop {
+  display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  border-left: 1px solid var(--pb-paper-edge);
+  padding-left: 8px;
+}
+.msg__reactpop-emoji {
+  background: transparent;
+  border: 1px solid transparent; border-radius: 0;
+  padding: 2px 4px;
+  font: inherit; font-size: 14px; line-height: 1.2;
+  cursor: pointer;
+}
+.msg__reactpop-emoji:hover,
+.msg__reactpop-emoji:focus-visible { border-color: var(--pb-copper); }
+.msg__reactpop-input {
+  width: 7em;
+  padding: 2px 6px;
+  background: var(--pb-paper);
+  border: 1px solid var(--pb-evidence); border-radius: 0;
+  color: var(--pb-paper-ink);
+  font: inherit; font-size: 12px;
+}
+.msg__reactpop-add {
+  background: transparent; border: 0; border-radius: 0;
+  padding: 2px 0;
+  font: inherit; font-size: 11px; font-weight: 600;
+  color: var(--pb-copper-ink);
+  cursor: pointer;
+  text-decoration: underline; text-underline-offset: 3px;
+}
+
+/* Located / flash geometry (static outline is the state; pulse is garnish). */
+.msg.is-located,
+.msg.msg--flash {
+  outline: 2px solid var(--pb-copper);
+  outline-offset: -2px;
+}
+.msg.msg--flash { animation: pb-flash 1.2s ease-out; }
+@keyframes pb-flash {
+  0% { background: var(--pb-evidence-bg); }
   100% { background: transparent; }
 }
 
-.jump-latest {
-  position: absolute; left: 50%; transform: translateX(-50%);
-  bottom: 84px; z-index: 5;
-  display: inline-flex; align-items: center; gap: 6px;
-  height: 32px; padding: 0 14px;
-  font: inherit; font-size: 12.5px; font-weight: 600;
-  color: var(--ink); background: var(--surface);
-  border: 1px solid var(--border-2); border-radius: var(--r-pill);
-  box-shadow: var(--sh-pop); cursor: pointer;
-  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), transform var(--dur) var(--ease);
+/* Skeleton rows while a tape loads. */
+.msg--skel {
+  border-top: 1px solid var(--pb-paper-edge);
+  padding: 12px 18px 12px 92px;
 }
-.jump-latest[hidden] { display: none; }
-.jump-latest:hover { background: var(--surface-2); }
-.jump-latest.has-new { color: #fff; background: var(--accent); border-color: var(--accent); }
-.jump-latest::after { content: "\2193"; font-size: 13px; line-height: 1; }
+.msg--skel span {
+  display: block; height: 10px; margin: 4px 0;
+  background: var(--pb-evidence-bg);
+}
+.msg--skel span:first-child { width: 38%; }
+.msg--skel span:last-child { width: 72%; }
 
-.toast-host {
-  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
-  z-index: 60; display: flex; flex-direction: column; gap: 8px; align-items: center;
+/* "N new — jump to latest" cue tab. JS mounts it inside .cue (position:
+   relative), so it floats just above the composer over the tape's tail. */
+.cue-tab {
+  position: absolute;
+  left: 50%; bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  z-index: 5;
+  font: inherit; font-family: var(--pb-mono); font-size: 11.5px;
+  color: var(--pb-paper-ink);
+  background: var(--pb-paper);
+  border: 1px solid var(--pb-paper-ink);
+  border-left: 4px solid var(--pb-copper);
+  border-radius: 0;
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cue-tab[hidden] { display: none; }
+
+/* --- cue strip composer ----------------------------------------------------- */
+
+.cue {
+  position: relative;
+  border-top: 2px solid var(--pb-paper-ink);
+  background: var(--pb-paper);
+  padding: 8px 18px 10px;
+}
+.cue__authority {
+  margin: 0 0 6px;
+  font-family: var(--pb-mono); font-size: 11px;
+  letter-spacing: .04em;
+  color: var(--pb-evidence-ink);
+}
+.cue__authority b { color: var(--pb-paper-ink); font-weight: 700; overflow-wrap: anywhere; }
+.cue__authority-archived,
+.cue__authority-unavailable { display: none; }
+.deck--archived .cue__authority-active,
+.deck--unavailable .cue__authority-active { display: none; }
+.deck--archived .cue__authority-archived { display: inline; }
+.deck--unavailable .cue__authority-unavailable { display: inline; }
+
+.cue__loop {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border-left: 3px solid var(--pb-copper);
+  background: var(--pb-evidence-bg);
+  font-size: 12.5px;
+  color: var(--pb-paper-ink-2);
+}
+.cue__loop:has(.cue__loop-text:empty) { display: none; }
+.cue__loop-notch { color: var(--pb-copper-ink); }
+.cue__loop-text { min-width: 0; overflow-wrap: anywhere; }
+.cue__loop-cancel {
+  margin-left: auto;
+  font-size: 11.5px; font-weight: 600;
+  color: var(--pb-copper-ink);
+}
+
+.cue__field { display: block; }
+.cue__label {
+  display: block;
+  font-size: 12px; font-weight: 600;
+  color: var(--pb-paper-ink-2);
+  margin-bottom: 4px;
+}
+.cue__input {
+  display: block; width: 100%; box-sizing: border-box;
+  padding: 10px 12px;
+  background: var(--pb-paper);
+  border: 1px solid var(--pb-evidence);
+  border-radius: 0;
+  color: var(--pb-paper-ink);
+  font: inherit; font-size: 14px; line-height: 1.5;
+  resize: none;
+  min-height: 2.75em; max-height: 12em;
+  overflow-y: auto;
+}
+.cue__input:focus { outline: 2px solid var(--pb-copper-ink); outline-offset: 1px; }
+.cue__input[disabled] {
+  border-style: dashed;
+  color: var(--pb-paper-ink-2);
+  background: var(--pb-evidence-bg);
+}
+.cue__foot {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 6px;
+}
+.cue__budget {
+  margin-right: auto;
+  font-family: var(--pb-mono); font-size: 11px;
+  color: var(--pb-evidence-ink);
+}
+.cue__send {
+  font: inherit; font-size: 13px; font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--pb-paper);
+  background: var(--pb-paper-ink);
+  border: 1px solid var(--pb-paper-ink);
+  border-radius: 0;
+  padding: 8px 22px;
+  cursor: pointer;
+}
+.cue__send:hover { background: var(--pb-copper-ink); border-color: var(--pb-copper-ink); }
+.cue__send[disabled] {
+  background: var(--pb-evidence-bg);
+  border-color: var(--pb-evidence);
+  color: var(--pb-evidence-ink);
+  cursor: not-allowed;
+}
+
+/* The receipt strip: square, mono, cool gray; error states turn the rule
+   vermilion — the text always carries the meaning. */
+.cue__receipt {
+  margin: 8px 0 0;
+  padding: 5px 10px;
+  border-left: 3px solid var(--pb-evidence);
+  background: var(--pb-evidence-bg);
+  font-family: var(--pb-mono); font-size: 11.5px;
+  color: var(--pb-evidence-ink);
+  overflow-wrap: anywhere;
+}
+.cue__receipt:empty { display: none; }
+.cue__receipt.is-error { border-left-color: var(--pb-vermilion); color: var(--pb-vermilion); }
+
+/* --- ephemeral presence cues (transient, never a roster) -------------------- */
+
+.pb-presence {
+  position: fixed;
+  left: 16px; bottom: 16px;
+  z-index: 40;
+  display: flex; flex-direction: column; gap: 6px;
   pointer-events: none;
 }
-.toast-host .toast {
-  opacity: 0; transform: translateY(6px);
-  transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
-}
-.toast-host .toast.is-in { opacity: 1; transform: translateY(0); }
-.toast--err { background: var(--down-ink); }
-
-@media (max-width: 720px) {
-  .jump-latest { bottom: 92px; }
-  .toast-host { left: 12px; right: 12px; transform: none; }
-  .toast-host .toast { width: 100%; justify-content: center; }
+.pb-presence__cue {
+  padding: 4px 10px;
+  border-left: 3px solid var(--pb-evidence);
+  background: var(--pb-field);
+  color: var(--pb-field-ink);
+  font-family: var(--pb-mono); font-size: 11px;
 }
 
-/* ── Dark ramp ──────────────────────────────────────────────────────────────
-   Murmur cedes its whole accent / surface / ink palette to Odyssey's canonical
-   dark ramp — it defines no brand accent of its own (the green is only the
-   app-tile's local --app), so accent/accent-2/accent-ink/accent-soft/
-   accent-soft-2/ring all dark-remap upstream and need no service override. The
-   one bespoke colour token this service adds to :root is --accent-border, a live
-   alias of --accent-soft-2 which Odyssey already remaps under dark; re-affirming
-   the alias keeps Murmur's reaction / quote / composer borders on the dark
-   accent-soft value in every dark state. --topbar-h is layout, not colour, so it
-   is untouched — and the light :root is left byte-identical. */
-:root[data-theme="dark"] {
-  --accent-border: var(--accent-soft-2);
+/* ============================================================================
+   Patch Ledger — search / mentions / pins
+   ========================================================================= */
+
+.ledger {
+  display: flex; flex-direction: column;
+  min-width: 0;
+  background: var(--pb-paper);
+  border: 1px solid var(--pb-paper-edge);
+  color: var(--pb-paper-ink);
+  overflow: hidden;
+}
+.ledger__head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--pb-paper-edge);
+}
+.ledger__title {
+  margin: 0;
+  font-family: var(--pb-condensed); font-stretch: condensed;
+  font-size: 12px; font-weight: 700;
+  letter-spacing: .18em; text-transform: uppercase;
+  color: var(--pb-paper-ink-2);
+}
+.ledger__close {
+  display: none;
+  font: inherit; font-size: 12px; font-weight: 600;
+  color: var(--pb-paper-ink);
+  background: transparent;
+  border: 1px solid var(--pb-paper-ink);
+  border-radius: 0;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.ledger__tabs {
+  display: flex;
+  border-bottom: 1px solid var(--pb-paper-edge);
+}
+.ledger__tab {
+  flex: 1 1 0;
+  padding: 8px 6px;
+  text-align: center;
+  font-size: 12.5px; font-weight: 600;
+  color: var(--pb-paper-ink-2);
+  text-decoration: none;
+  border-bottom: 3px solid transparent;
+}
+.ledger__tab:hover { color: var(--pb-paper-ink); }
+.ledger__tab[aria-current="true"] {
+  color: var(--pb-copper-ink);
+  border-bottom-color: var(--pb-copper);
+  font-weight: 700;
+}
+.ledger__search { padding: 10px 16px 6px; }
+.ledger__search-label {
+  display: block;
+  font-size: 12px; font-weight: 600;
+  color: var(--pb-paper-ink-2);
+  margin-bottom: 4px;
+}
+.ledger__search-row { display: flex; gap: 8px; }
+.ledger__q {
+  flex: 1 1 auto; min-width: 0;
+  padding: 7px 10px;
+  background: var(--pb-paper);
+  border: 1px solid var(--pb-evidence);
+  border-radius: 0;
+  color: var(--pb-paper-ink);
+  font: inherit; font-size: 13px;
+}
+.ledger__go {
+  flex: 0 0 auto;
+  font: inherit; font-size: 12.5px; font-weight: 700;
+  color: var(--pb-paper);
+  background: var(--pb-paper-ink);
+  border: 1px solid var(--pb-paper-ink);
+  border-radius: 0;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+.ledger__results {
+  flex: 1 1 auto; min-height: 0;
+  overflow-y: auto;
+  padding: 6px 0 12px;
+}
+.pb-ledger__status {
+  margin: 8px 16px;
+  font-family: var(--pb-mono); font-size: 11px;
+  color: var(--pb-evidence-ink);
+}
+.pb-ledger__item {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--pb-paper-edge);
+  color: var(--pb-paper-ink);
+  text-decoration: none;
+  font-size: 12.5px;
+}
+.pb-ledger__item:hover { background: var(--pb-evidence-bg); }
+.pb-ledger__item > span:first-child {
+  font-family: var(--pb-mono); font-size: 11px;
+  color: var(--pb-copper-ink);
+  overflow-wrap: anywhere;
+}
+.pb-ledger__item > b { font-size: 12px; overflow-wrap: anywhere; }
+.pb-ledger__item > span:last-child {
+  flex-basis: 100%;
+  color: var(--pb-paper-ink-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pb-ledger__item::after {
+  content: "Locate";
+  margin-left: auto;
+  font-size: 11px; font-weight: 700;
+  color: var(--pb-copper-ink);
+}
+
+/* Ledger below 1024px is a genuine modal sheet (JS only): a right sheet at
+   768–1023 and a bottom sheet under 768 — always with scrim, focus trap,
+   Escape, and Close, so it never half-covers the cue strip. No-JS keeps the
+   ledger in normal flow after the deck; its tabs stay real GET anchors. */
+@media (max-width: 1023px) {
+  html.js .ledger { display: none; }
+  html.js .ledger.is-open {
+    display: flex;
+    position: fixed;
+    top: var(--topbar-h); right: 0; bottom: 0;
+    width: min(88vw, 360px);
+    z-index: 60;
+    border-left: 2px solid var(--pb-paper-ink);
+  }
+  html.js .ledger__close { display: inline-block; }
+  html.js .deck__ledger-toggle { display: inline-block; }
+}
+@media (max-width: 767px) {
+  html.js .ledger.is-open {
+    top: auto; left: 0; right: 0; bottom: 0;
+    width: auto; max-height: 65dvh;
+    border-left: 0; border-top: 2px solid var(--pb-paper-ink);
+  }
+}
+.ledger-scrim {
+  position: fixed; inset: 0; z-index: 55;
+  background: rgba(12, 13, 16, .5);
+  border: 0; padding: 0; cursor: default;
+}
+
+/* ============================================================================
+   Dialogs (JS-built): new room / new DM — genuine labelled dialogs
+   ========================================================================= */
+
+.pb-dialog {
+  position: fixed; inset: 0; z-index: 70;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  background: rgba(12, 13, 16, .5);
+}
+.pb-dialog__panel {
+  width: 100%; max-width: 420px; max-height: 74vh;
+  display: flex; flex-direction: column;
+  background: var(--pb-paper);
+  color: var(--pb-paper-ink);
+  border: 1px solid var(--pb-paper-ink);
+  overflow: hidden;
+}
+.pb-dialog__head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 2px solid var(--pb-paper-ink);
+}
+.pb-dialog__title { margin: 0; font-size: 15px; font-weight: 700; }
+.pb-dialog__close {
+  font: inherit; font-size: 12px; font-weight: 600;
+  color: var(--pb-paper-ink);
+  background: transparent;
+  border: 1px solid var(--pb-paper-ink);
+  border-radius: 0;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.pb-dialog__body { padding: 14px 18px; overflow-y: auto; }
+.pb-dialog__label { display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 4px; }
+.pb-dialog__input {
+  display: block; width: 100%; box-sizing: border-box;
+  padding: 8px 10px;
+  background: var(--pb-paper);
+  border: 1px solid var(--pb-evidence);
+  border-radius: 0;
+  color: var(--pb-paper-ink);
+  font: inherit; font-size: 14px;
+}
+.pb-dialog__error { margin: 6px 0 0; font-size: 12.5px; color: var(--pb-vermilion); }
+.pb-dialog__error[hidden] { display: none; }
+.pb-dialog__actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+.pb-dialog__submit {
+  font: inherit; font-size: 13px; font-weight: 700;
+  color: var(--pb-paper);
+  background: var(--pb-paper-ink);
+  border: 1px solid var(--pb-paper-ink);
+  border-radius: 0;
+  padding: 8px 18px;
+  cursor: pointer;
+}
+.pb-dialog__list { list-style: none; margin: 0; padding: 0; }
+.pb-dialog__person {
+  display: block; width: 100%;
+  padding: 9px 10px;
+  border: 0; border-top: 1px solid var(--pb-paper-edge); border-radius: 0;
+  background: transparent;
+  color: var(--pb-paper-ink);
+  font: inherit; font-size: 13.5px; text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.pb-dialog__person:hover { background: var(--pb-evidence-bg); }
+.pb-dialog__empty { padding: 14px 4px; font-size: 13px; color: var(--pb-paper-ink-2); }
+
+/* ============================================================================
+   Cutout Bay — moderation cut sheets
+   ========================================================================= */
+
+.cutout {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 28px 24px 64px;
+}
+.cutout__sheet {
+  background: var(--pb-paper);
+  color: var(--pb-paper-ink);
+  border: 1px solid var(--pb-paper-edge);
+  padding: 0 0 8px;
+}
+.cutout__head {
+  padding: 20px 24px 14px;
+  border-bottom: 2px solid var(--pb-paper-ink);
+}
+.cutout__back { font-size: 12.5px; color: var(--pb-copper-ink); }
+.cutout__title { margin: 6px 0 2px; font-size: 20px; font-weight: 700; overflow-wrap: anywhere; }
+.cutout__sub { margin: 0; color: var(--pb-paper-ink-2); font-size: 12.5px; overflow-wrap: anywhere; }
+.cutout__section {
+  margin: 24px 24px 0;
+  font-size: 13px; font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--pb-paper-ink);
+}
+.cutout__note {
+  margin: 4px 24px 0;
+  font-size: 12px;
+  color: var(--pb-paper-ink-2);
+}
+
+.cut-sheet {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 13.5px;
+}
+.cut-sheet th {
+  text-align: left;
+  font-family: var(--pb-mono); font-size: 10.5px; font-weight: 700;
+  letter-spacing: .12em; text-transform: uppercase;
+  color: var(--pb-paper-ink-2);
+  padding: 8px 12px;
+  border-bottom: 2px solid var(--pb-paper-ink);
+}
+.cut-sheet td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--pb-paper-edge);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.cut-sheet__col-actions { text-align: right; }
+.cut-sheet__actions {
+  display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap;
+  border-left: 3px solid var(--pb-vermilion);
+  padding-left: 10px;
+}
+.cut-sheet__actions form { margin: 0; }
+.cut-sheet__room { color: var(--pb-copper-ink); font-weight: 600; }
+.cut-sheet__id { display: block; font-size: 11px; color: var(--pb-paper-ink-2); }
+.cut-sheet__state { font-size: 12.5px; color: var(--pb-paper-ink-2); }
+.cut-sheet button {
+  font: inherit; font-size: 12.5px; font-weight: 600;
+  color: var(--pb-paper-ink);
+  background: transparent;
+  border: 1px solid var(--pb-paper-ink);
+  border-radius: 0;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+/* transitional layout for the current renderer's admin rows */
+.admin__actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+.admin__actions form { margin: 0; }
+.admin__sub { color: var(--pb-paper-ink-2); font-size: 12.5px; }
+.admin__body { max-width: 42ch; }
+
+.cut-link {
+  display: inline-block;
+  padding: 5px 0;
+  font-size: 12.5px; font-weight: 700;
+  color: var(--pb-vermilion);
+}
+.cut-link::before { content: "\2702 "; }
+
+.consequence {
+  margin: 20px 24px 4px;
+  padding: 14px 18px;
+  border: 2px solid var(--pb-vermilion);
+  outline: 1px solid var(--pb-vermilion);
+  outline-offset: 3px;
+  background: var(--pb-paper);
+}
+.consequence__title {
+  margin: 0 0 6px;
+  font-size: 15px; font-weight: 700;
+  color: var(--pb-vermilion);
+}
+.consequence__glyph { margin-right: 4px; }
+.consequence__scope { margin: 0 0 12px; font-size: 13.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.consequence__form { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.cut-btn {
+  font: inherit; font-size: 13px; font-weight: 700;
+  color: var(--pb-vermilion);
+  background: var(--pb-paper);
+  border: 2px solid var(--pb-vermilion);
+  border-radius: 0;
+  padding: 8px 18px;
+  cursor: pointer;
+}
+.cut-btn::before { content: "\2702 "; }
+.cut-btn:hover { background: var(--pb-vermilion); color: var(--pb-paper); }
+.consequence__cancel { font-size: 12.5px; color: var(--pb-paper-ink-2); }
+
+/* ============================================================================
+   Responsive composition
+   ========================================================================= */
+
+@media (max-width: 1279px) {
+  .patchbay { grid-template-columns: 220px minmax(0, 1fr) 280px; }
+}
+@media (max-width: 1023px) {
+  .patchbay { grid-template-columns: 200px minmax(0, 1fr); }
+  /* No-JS flow position (JS hides the rail until it opens as a sheet). */
+  html:not(.js) .ledger { grid-column: 1 / -1; min-height: 200px; }
+}
+@media (max-width: 767px) {
+  .page-chat .appbar {
+    gap: 8px;
+    padding-inline: 12px;
+  }
+  .page-chat .appbar__name { display: none; }
+  .page-chat .appbar__right { gap: 4px; }
+  .patchbay {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+    padding: 14px 12px 24px;
+  }
+  html:not(.js) .deck__head { flex-direction: column; }
+  html:not(.js) .deck__meta {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  html:not(.js) .deck__nojs {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+  html.js .patchbay { padding-top: 8px; }
+  html.js .patchbar {
+    position: sticky;
+    top: var(--topbar-h);
+    z-index: 30;
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 12px;
+    background: var(--pb-field);
+    border: 1px solid var(--pb-field-edge);
+    color: var(--pb-field-ink);
+  }
+  .patchbar__rooms {
+    color: var(--pb-field-ink);
+    border-color: var(--pb-field-ink-2);
+    flex: 0 0 auto;
+  }
+  .patchbar__current {
+    min-width: 0;
+    font-family: var(--pb-condensed); font-stretch: condensed;
+    font-size: 14px; font-weight: 700;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* Keep the deck usable above the virtual keyboard; the cue strip stays in
+     normal flow at the tail. */
+  html.js .patchbay { height: auto; min-height: calc(100dvh - var(--topbar-h)); }
+  html.js .tape { max-height: calc(100dvh - var(--topbar-h) - 320px); min-height: 220px; }
+  .msg { padding-left: 76px; }
+  .msg::before { left: 56px; }
+  .msg__time { width: 48px; font-size: 10px; }
+  .deck__meta { flex-wrap: wrap; justify-content: flex-end; }
+
+  /* Cut sheets become stacked rows with generated labels. */
+  .cut-sheet thead { position: absolute; left: -9999px; }
+  .cut-sheet,
+  .cut-sheet tbody,
+  .cut-sheet tr,
+  .cut-sheet td { display: block; width: 100%; box-sizing: border-box; }
+  .cut-sheet tr { border-bottom: 2px solid var(--pb-paper-ink); padding: 6px 0; }
+  .cut-sheet td { border-bottom: 0; padding: 4px 12px; }
+  .cut-sheet td::before {
+    content: attr(data-label);
+    display: block;
+    font-family: var(--pb-mono); font-size: 10px;
+    letter-spacing: .12em; text-transform: uppercase;
+    color: var(--pb-paper-ink-2);
+    margin-bottom: 2px;
+  }
+  .cut-sheet td:empty::before { content: none; }
+  .cut-sheet__col-actions { text-align: left; }
+  .cut-sheet__actions { justify-content: flex-start; border-left-width: 2px; }
+}
+
+/* ============================================================================
+   Forced colors: every mark becomes a border or a system colour
+   ========================================================================= */
+
+@media (forced-colors: active) {
+  .page-chat :focus-visible { outline: 2px solid Highlight; }
+  .skip-link {
+    border-color: Highlight;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: none;
+  }
+  .jack__ring,
+  .room__btn::before {
+    border-color: ButtonText;
+    background: transparent !important;
+    box-shadow: none;
+  }
+  .jack__link[aria-current="page"] .jack__ring,
+  .room.is-active .room__btn::before,
+  .room[aria-current="page"] .room__btn::before { background: ButtonText !important; }
+  .jack__link[aria-current="page"],
+  .room.is-active .room__btn,
+  .room[aria-current="page"] .room__btn {
+    background: Highlight;
+    color: HighlightText;
+    forced-color-adjust: none;
+  }
+  .jack__link[aria-current="page"]::after,
+  .room.is-active::after,
+  .room[aria-current="page"]::after,
+  .jack__link[aria-current="page"]::before,
+  .room.is-active .room__btn::after,
+  .room[aria-current="page"] .room__btn::after { background: Highlight; }
+  .jack__link[aria-current="page"] .jack__label,
+  .jack__link[aria-current="page"] .jack__marks,
+  .room.is-active .room__btn,
+  .room[aria-current="page"] .room__btn { color: HighlightText; }
+  .jack__mark--unread::before,
+  .room__unread::before { background: ButtonText; }
+  .jack__mark--mention,
+  .room__mention { background: ButtonText; }
+  .jack__link[data-room-state="archived"] .jack__ring::after { border-top-color: ButtonText; }
+  .deck__head::before { border-color: CanvasText; box-shadow: none; }
+  .meter__segments i { border-color: CanvasText; }
+  .meter.is-connected .meter__segments i,
+  .meter.is-reconnecting .meter__segments i:nth-child(-n+2),
+  .meter.is-unknown .meter__segments i:nth-child(-n+1) { background: CanvasText; }
+  .msg__quote, .loop, .cue__loop { border-left-color: CanvasText; }
+  .reaction.is-mine,
+  .reaction[aria-pressed="true"] { border-color: CanvasText; }
+  .cue__receipt { border-left-color: CanvasText; }
+  .cue__receipt.is-error { border-left-color: CanvasText; color: CanvasText; }
+  .ledger__tab[aria-current="true"] { border-bottom-color: Highlight; color: CanvasText; }
+  .consequence,
+  .cut-btn,
+  .cut-sheet__actions { border-color: CanvasText; }
+  .consequence { outline-color: CanvasText; }
+  .cut-link, .cut-btn, .consequence__title { color: CanvasText; }
+  .msg.is-located, .msg.msg--flash { outline-color: Highlight; }
+  .msg--skel span { background: Canvas; border: 1px solid CanvasText; }
+  .jackfield-scrim, .ledger-scrim, .pb-dialog { background: transparent; }
+}
+
+/* ============================================================================
+   Reduced motion: final states render instantly; animation is never the only
+   carrier of meaning.
+   ========================================================================= */
+
+@media (prefers-reduced-motion: reduce) {
+  .page-chat *,
+  .page-chat *::before,
+  .page-chat *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .msg.msg--flash { animation: none; }
 }

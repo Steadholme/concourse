@@ -8,6 +8,7 @@
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
+use murmur::store::{Message, Room};
 use murmur::{app, build_dev_state, AppState};
 use tower::ServiceExt;
 
@@ -68,6 +69,74 @@ fn extract_id(body: &str) -> String {
     body[start..end].to_string()
 }
 
+#[tokio::test]
+async fn tuple_cursor_http_paginates_same_second_messages() {
+    let state = build_dev_state();
+    let room = Room {
+        id: "room_cursor_http".to_string(),
+        name: "#cursor".to_string(),
+        kind: "room".to_string(),
+        created_by: "u_alice".to_string(),
+        created_at: 1,
+        archived: false,
+        topic: String::new(),
+    };
+    state.store.ensure_room(&room).await.unwrap();
+    state
+        .store
+        .ensure_membership(&room.id, "u_bob", "bob@hf", 1)
+        .await
+        .unwrap();
+    for index in 0..51 {
+        state
+            .store
+            .create_message(&Message {
+                id: format!("msg_http_{index:03}"),
+                room_id: room.id.clone(),
+                sender_sub: "u_alice".to_string(),
+                sender_email: "alice@hf".to_string(),
+                body: "same second".to_string(),
+                created_at: 100,
+                edited_at: 0,
+                deleted: false,
+                reply_to_id: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let (status, first_body) = call(
+        &state,
+        get_auth(
+            "/api/rooms/room_cursor_http/messages",
+            "u_bob",
+            "bob@hf",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first: serde_json::Value = serde_json::from_str(&first_body).unwrap();
+    assert_eq!(first["messages"].as_array().unwrap().len(), 50);
+    let cursor = first["next_cursor"].as_str().expect("next cursor");
+
+    let (status, second_body) = call(
+        &state,
+        get_auth(
+            &format!("/api/rooms/room_cursor_http/messages?before={cursor}"),
+            "u_bob",
+            "bob@hf",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second: serde_json::Value = serde_json::from_str(&second_body).unwrap();
+    assert_eq!(second["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(second["messages"][0]["id"], "msg_http_000");
+    assert!(second["next_cursor"].is_null());
+}
+
 // ---------------------------------------------------------------------------
 // Room topic
 // ---------------------------------------------------------------------------
@@ -106,7 +175,11 @@ async fn topic_edit_is_mod_gated_and_rendered() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "mod topic edit bad CSRF -> 401");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "mod topic edit bad CSRF -> 403"
+    );
 
     // An admin sets the topic (note the embedded markup, to prove escaping on render).
     let (status, body) = call(
@@ -122,14 +195,26 @@ async fn topic_edit_is_mod_gated_and_rendered() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "mod topic edit -> 200");
-    assert!(body.contains("Daily <b>standup</b>"), "topic echoed in JSON (client escapes)");
+    assert!(
+        body.contains("Daily <b>standup</b>"),
+        "topic echoed in JSON (client escapes)"
+    );
 
     // The dashboard renders the topic in the room header — ESCAPED, never as live markup.
     let (status, page) = call(&state, get_auth("/", "u_alice", "alice@hf", None)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("room-view__topic"), "topic element present");
-    assert!(page.contains("Daily &lt;b&gt;standup&lt;/b&gt;"), "topic escaped in header");
-    assert!(!page.contains("Daily <b>standup</b>"), "raw topic markup must not survive");
+    assert!(
+        page.contains(r#"id="pb-room-topic""#),
+        "topic element present"
+    );
+    assert!(
+        page.contains("Daily &lt;b&gt;standup&lt;/b&gt;"),
+        "topic escaped in header"
+    );
+    assert!(
+        !page.contains("Daily <b>standup</b>"),
+        "raw topic markup must not survive"
+    );
 }
 
 #[tokio::test]
@@ -147,7 +232,11 @@ async fn topic_on_missing_room_is_404() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "topic on unknown room -> 404");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "topic on unknown room -> 404"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +279,7 @@ async fn pin_unpin_gate_and_panel() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "non-mod pin -> 403");
 
-    // Admin pin with a bad CSRF token -> 401.
+    // Admin pin with a bad CSRF token -> 403.
     let (status, _) = call(
         &state,
         post(
@@ -203,7 +292,7 @@ async fn pin_unpin_gate_and_panel() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "mod pin bad CSRF -> 401");
+    assert_eq!(status, StatusCode::FORBIDDEN, "mod pin bad CSRF -> 403");
 
     // Admin pins it -> 200, the returned panel lists the message.
     let (status, body) = call(
@@ -229,11 +318,27 @@ async fn pin_unpin_gate_and_panel() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(panel.contains("PINME distinctive body"), "pinned body in panel read");
+    assert!(
+        panel.contains("PINME distinctive body"),
+        "pinned body in panel read"
+    );
 
-    // The dashboard server-renders the pinned panel (for the mod, with an Unpin control).
-    let (_, page) = call(&state, get_auth("/", "u_adm", "adm@hf", Some("admins"))).await;
-    assert!(page.contains("class=\"pinned-item\""), "pinned panel item rendered");
+    // The dashboard server-renders pins through the bounded Patch Ledger view.
+    let (_, page) = call(
+        &state,
+        get_auth(
+            "/?room=lobby&ledger=pins",
+            "u_adm",
+            "adm@hf",
+            Some("admins"),
+        ),
+    )
+    .await;
+    assert!(
+        page.contains("class=\"pb-ledger__item\""),
+        "pinned ledger item rendered"
+    );
+    assert!(page.contains(&msg_id));
 
     // Admin unpins it -> the panel is empty again.
     let (status, body) = call(
@@ -300,10 +405,19 @@ async fn pinned_read_is_membership_scoped() {
     // A non-member cannot read the room's pinned panel.
     let (status, _) = call(
         &state,
-        get_auth(&format!("/api/rooms/{room_id}/pinned"), "u_carol", "carol@hf", None),
+        get_auth(
+            &format!("/api/rooms/{room_id}/pinned"),
+            "u_carol",
+            "carol@hf",
+            None,
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-member pinned read -> 403");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "non-member pinned read -> generic 404"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -343,17 +457,35 @@ _snake_\n\
 
     let (status, page) = call(&state, get_auth("/", "u_alice", "alice@hf", None)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains(r#"<pre><code class="lang-rust">"#), "fenced block rendered");
+    assert!(
+        page.contains(r#"<pre><code class="lang-rust">"#),
+        "fenced block rendered"
+    );
     assert!(page.contains("<code>code</code>"), "inline code rendered");
     assert!(page.contains("<strong>bold</strong>"), "bold rendered");
     assert!(page.contains("<em>italic</em>"), "italic rendered");
     assert!(page.contains("<del>strike</del>"), "strike rendered");
-    assert!(page.contains(r#"<span class="mention">@bob</span>"#), "mention chip rendered");
-    assert!(page.contains("<blockquote>quote</blockquote>"), "quote rendered");
-    assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "script payload escaped");
-    assert!(page.contains("&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"), "img payload escaped");
+    assert!(
+        page.contains(r#"<span class="mention">@bob</span>"#),
+        "mention chip rendered"
+    );
+    assert!(
+        page.contains("<blockquote>quote</blockquote>"),
+        "quote rendered"
+    );
+    assert!(
+        page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "script payload escaped"
+    );
+    assert!(
+        page.contains("&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"),
+        "img payload escaped"
+    );
     assert!(!page.contains("<img"), "img payload must not become markup");
-    assert!(!page.contains("<script>alert(1)</script>"), "script payload must not become markup");
+    assert!(
+        !page.contains("<script>alert(1)</script>"),
+        "script payload must not become markup"
+    );
 
     // Render-only guard: the membership gate is unchanged for rooms Alice did not join.
     let (status, body) = call(
@@ -372,10 +504,19 @@ _snake_\n\
     let room_id = extract_id(&body);
     let (status, _) = call(
         &state,
-        get_auth(&format!("/api/rooms/{room_id}/messages"), "u_alice", "alice@hf", None),
+        get_auth(
+            &format!("/api/rooms/{room_id}/messages"),
+            "u_alice",
+            "alice@hf",
+            None,
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-member room read -> 403");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "non-member room read -> generic 404"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -436,8 +577,14 @@ async fn search_is_scoped_to_member_rooms() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!results.contains("secret sauce recipe"), "non-member must not see vault content");
-    assert!(results.contains("\"results\":[]"), "no hits for a non-member");
+    assert!(
+        !results.contains("secret sauce recipe"),
+        "non-member must not see vault content"
+    );
+    assert!(
+        results.contains("\"results\":[]"),
+        "no hits for a non-member"
+    );
 
     // Bob (a member of the vault) DOES find it.
     let (status, results) = call(
@@ -446,7 +593,10 @@ async fn search_is_scoped_to_member_rooms() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(results.contains("secret sauce recipe"), "member finds their room's message (case-insensitive)");
+    assert!(
+        results.contains("secret sauce recipe"),
+        "member finds their room's message (case-insensitive)"
+    );
 
     // Alice finds her own lobby message.
     let (_, results) = call(
@@ -454,7 +604,10 @@ async fn search_is_scoped_to_member_rooms() {
         get_auth("/api/search?q=public", "u_alice", "alice@hf", None),
     )
     .await;
-    assert!(results.contains("public lobby note"), "member finds lobby content");
+    assert!(
+        results.contains("public lobby note"),
+        "member finds lobby content"
+    );
 
     // A too-short query is rejected.
     let (status, _) = call(
@@ -477,7 +630,7 @@ async fn mentions_and_unread_marker_math() {
     let _ = call(&state, get_auth("/api/rooms", "u_bob", "bob@hf", None)).await;
 
     // Alice @mentions Bob (his email local-part is "bob").
-    let _ = call(
+    let (_, mention_send) = call(
         &state,
         post(
             "/api/rooms/lobby/messages",
@@ -489,6 +642,7 @@ async fn mentions_and_unread_marker_math() {
         ),
     )
     .await;
+    let mut last_message_id = extract_id(&mention_send);
 
     // Bob's room list shows the lobby unread (1, from Alice) and the mention marker lit.
     let (status, rooms) = call(&state, get_auth("/api/rooms", "u_bob", "bob@hf", None)).await;
@@ -499,16 +653,25 @@ async fn mentions_and_unread_marker_math() {
     // The global mentions view carries the mentioning message + its room name.
     let (status, mentions) = call(&state, get_auth("/api/mentions", "u_bob", "bob@hf", None)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(mentions.contains("hey @bob please review"), "mention message present");
-    assert!(mentions.contains("#lobby"), "mention tagged with its room name");
+    assert!(
+        mentions.contains("hey @bob please review"),
+        "mention message present"
+    );
+    assert!(
+        mentions.contains("#lobby"),
+        "mention tagged with its room name"
+    );
 
     // Alice's OWN room list never counts her own posts as unread.
     let (_, alice_rooms) = call(&state, get_auth("/api/rooms", "u_alice", "alice@hf", None)).await;
-    assert!(alice_rooms.contains("\"unread\":0"), "own posts do not mark unread");
+    assert!(
+        alice_rooms.contains("\"unread\":0"),
+        "own posts do not mark unread"
+    );
 
     // Alice posts two more plain messages -> Bob's unread climbs to 3.
     for _ in 0..2 {
-        let _ = call(
+        let (_, sent) = call(
             &state,
             post(
                 "/api/rooms/lobby/messages",
@@ -520,18 +683,32 @@ async fn mentions_and_unread_marker_math() {
             ),
         )
         .await;
+        last_message_id = extract_id(&sent);
     }
     let (_, rooms) = call(&state, get_auth("/api/rooms", "u_bob", "bob@hf", None)).await;
-    assert!(rooms.contains("\"unread\":3"), "unread reflects all of Alice's messages");
+    assert!(
+        rooms.contains("\"unread\":3"),
+        "unread reflects all of Alice's messages"
+    );
 
     // Bob opens the room (advances his read cursor) -> unread + mention markers clear.
     let (status, _) = call(
         &state,
-        post("/api/rooms/lobby/read", "{}", "u_bob", "bob@hf", None, Some(CSRF)),
+        post(
+            "/api/rooms/lobby/read",
+            &format!(r#"{{"message_id":"{last_message_id}"}}"#),
+            "u_bob",
+            "bob@hf",
+            None,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let (_, rooms) = call(&state, get_auth("/api/rooms", "u_bob", "bob@hf", None)).await;
     assert!(rooms.contains("\"unread\":0"), "read cursor clears unread");
-    assert!(rooms.contains("\"mentioned\":false"), "read cursor clears mention marker");
+    assert!(
+        rooms.contains("\"mentioned\":false"),
+        "read cursor clears mention marker"
+    );
 }

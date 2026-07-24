@@ -34,7 +34,9 @@ fn post_json(
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, format!("__Host-csrf={CSRF}"));
     if let Some((sub, email)) = auth {
-        b = b.header("x-auth-subject", sub).header("x-auth-email", email);
+        b = b
+            .header("x-auth-subject", sub)
+            .header("x-auth-email", email);
     }
     if let Some(tok) = csrf_header {
         b = b.header("x-csrf-token", tok);
@@ -71,7 +73,10 @@ async fn directory_lists_known_people_excluding_self() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("bob@hf"), "peer present in directory");
     assert!(!body.contains("alice@hf"), "self excluded from directory");
-    assert!(!body.contains("\"user_sub\":\"u_alice\""), "self subject excluded");
+    assert!(
+        !body.contains("\"user_sub\":\"u_alice\""),
+        "self subject excluded"
+    );
 }
 
 #[tokio::test]
@@ -99,7 +104,7 @@ async fn open_dm_requires_csrf() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "CSRF mismatch -> 401");
+    assert_eq!(status, StatusCode::FORBIDDEN, "CSRF mismatch -> 403");
 }
 
 #[tokio::test]
@@ -127,7 +132,12 @@ async fn open_dm_is_deterministic_and_bidirectional() {
     // Alice opens a DM with Bob.
     let (status, body) = call(
         &state,
-        post_json("/api/dms", r#"{"subject":"u_bob","email":"bob@hf"}"#, alice, Some(CSRF)),
+        post_json(
+            "/api/dms",
+            r#"{"subject":"u_bob","email":"bob@hf"}"#,
+            alice,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -138,11 +148,20 @@ async fn open_dm_is_deterministic_and_bidirectional() {
     // Bob opens the DM with Alice from the other side -> SAME room id.
     let (status, body2) = call(
         &state,
-        post_json("/api/dms", r#"{"subject":"u_alice","email":"alice@hf"}"#, bob, Some(CSRF)),
+        post_json(
+            "/api/dms",
+            r#"{"subject":"u_alice","email":"alice@hf"}"#,
+            bob,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(extract_room_id(&body2), room_id, "same DM room from either side");
+    assert_eq!(
+        extract_room_id(&body2),
+        room_id,
+        "same DM room from either side"
+    );
 
     // The DM shows up in BOTH users' room lists.
     let (_, alice_rooms) = call(&state, get_auth("/api/rooms", "u_alice", "alice@hf")).await;
@@ -158,7 +177,12 @@ async fn dm_messages_flow_and_third_party_locked_out() {
 
     let (_, body) = call(
         &state,
-        post_json("/api/dms", r#"{"subject":"u_bob","email":"bob@hf"}"#, alice, Some(CSRF)),
+        post_json(
+            "/api/dms",
+            r#"{"subject":"u_bob","email":"bob@hf"}"#,
+            alice,
+            Some(CSRF),
+        ),
     )
     .await;
     let room_id = extract_room_id(&body);
@@ -188,10 +212,14 @@ async fn dm_messages_flow_and_third_party_locked_out() {
     // A third party is NOT a member and is locked out.
     let (status, _) = call(
         &state,
-        get_auth(&format!("/api/rooms/{room_id}/messages"), "u_carol", "carol@hf"),
+        get_auth(
+            &format!("/api/rooms/{room_id}/messages"),
+            "u_carol",
+            "carol@hf",
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-member -> 403");
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-member -> generic 404");
 
     // And cannot send, either.
     let (status, _) = call(
@@ -204,5 +232,5 @@ async fn dm_messages_flow_and_third_party_locked_out() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-member cannot post");
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-member cannot post");
 }

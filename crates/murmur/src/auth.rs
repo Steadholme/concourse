@@ -123,6 +123,8 @@ pub fn is_admin(headers: &HeaderMap) -> bool {
 /// authenticated user carries no admin group — an ordinary signed-in user gets 403 and never
 /// sees the panel. `admin` overrides ownership: it does NOT consult `created_by`.
 pub fn require_admin(headers: &HeaderMap) -> Result<(), AppError> {
+    // Groups never stand on their own: an authenticated subject must be present first.
+    require_user(headers)?;
     if is_admin(headers) {
         Ok(())
     } else {
@@ -147,38 +149,60 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 use std::sync::OnceLock;
 
-/// The shared gateway HMAC key, read once from `GATEWAY_HMAC_KEY`. Empty (unset) disables
-/// verification — the pre-signature behavior, fully backward compatible.
-fn gateway_key() -> &'static str {
-    static KEY: OnceLock<String> = OnceLock::new();
-    KEY.get_or_init(|| std::env::var("GATEWAY_HMAC_KEY").unwrap_or_default())
-        .as_str()
-}
-
-/// Verify the gateway-injected identity is authentic. When `GATEWAY_HMAC_KEY` is set AND an
+/// Verify the gateway-injected identity is authentic. When a production key is configured, an
 /// identity (`X-Auth-Subject`) is present, a valid `X-Auth-Sig` — HMAC-SHA256 over
 /// `subject "\n" groups "\n" minute` for the current OR previous minute — is REQUIRED; a rogue
-/// peer that POSTs `X-Auth-Subject` directly (bypassing Sluice) cannot forge it. Returns:
-/// - `true` when the key is unset (verification off), or no identity header is present
-///   (public/dev path), or the signature is valid;
-/// - `false` when an identity is present but the signature is missing or invalid (=> 401).
-pub fn gateway_identity_ok(headers: &HeaderMap) -> bool {
-    let key = gateway_key();
-    if key.is_empty() {
-        return true;
-    }
+/// peer that POSTs `X-Auth-Subject` directly (bypassing Sluice) cannot forge it. `None` is an
+/// explicit [`crate::config::Config::dev`] relaxation, never an env-driven fallback.
+pub fn gateway_identity_ok(headers: &HeaderMap, key: Option<&str>) -> bool {
+    gateway_identity_ok_at(headers, key, now_unix())
+}
+
+fn gateway_identity_ok_at(headers: &HeaderMap, key: Option<&str>, now: i64) -> bool {
+    let key = match key {
+        None => return true,
+        Some("") => return false,
+        Some(key) => key,
+    };
     let Some(subject) = header_value(headers, HEADER_SUBJECT) else {
-        return true; // no injected identity to verify (public route / local dev)
+        return false;
     };
     let groups = header_value(headers, HEADER_GROUPS).unwrap_or_default();
     let Some(sig) = header_value(headers, HEADER_SIG) else {
         return false; // identity present but unsigned — reject
     };
-    let win = now_unix() / 60;
+    let win = now / 60;
     // Accept the current and previous minute (clock skew + minute-boundary tolerance).
-    [win, win - 1]
-        .iter()
-        .any(|&w| ct_eq(sig.as_bytes(), sign_identity(key, &subject, &groups, w).as_bytes()))
+    [win, win - 1].iter().any(|&w| {
+        ct_eq(
+            sig.as_bytes(),
+            sign_identity(key, &subject, &groups, w).as_bytes(),
+        )
+    })
+}
+
+/// Production WebSocket upgrades require one exact HTTPS Origin. Dev config passes `None`
+/// explicitly so in-process harnesses can exercise the upgrade without manufacturing a browser
+/// Origin.
+pub fn verify_websocket_origin(
+    headers: &HeaderMap,
+    expected: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if actual == Some(expected) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "websocket origin is not allowed".to_string(),
+        ))
+    }
 }
 
 /// Recompute the gateway signature — byte-identical to Sluice's `auth.SignIdentity` (Go).
@@ -270,7 +294,7 @@ pub fn verify_csrf(headers: &HeaderMap) -> Result<(), AppError> {
     if ok {
         Ok(())
     } else {
-        Err(AppError::Unauthorized("CSRF token mismatch".to_string()))
+        Err(AppError::CsrfInvalid)
     }
 }
 
@@ -285,7 +309,7 @@ pub fn verify_csrf_field(headers: &HeaderMap, submitted: &str) -> Result<(), App
     if ok {
         Ok(())
     } else {
-        Err(AppError::Unauthorized("CSRF token mismatch".to_string()))
+        Err(AppError::CsrfInvalid)
     }
 }
 
@@ -369,11 +393,66 @@ mod tests {
     }
 
     #[test]
-    fn gateway_ok_when_key_unset() {
-        // No GATEWAY_HMAC_KEY in the test env => verification disabled => always ok.
+    fn gateway_dev_relaxation_is_explicit() {
         let mut h = HeaderMap::new();
         h.insert(HEADER_SUBJECT, "user-42".parse().unwrap());
-        assert!(gateway_identity_ok(&h));
+        assert!(gateway_identity_ok(&h, None));
+        assert!(!gateway_identity_ok(&h, Some("")));
+    }
+
+    #[test]
+    fn gateway_signature_binds_subject_groups_and_time_window() {
+        let key = "test-key";
+        let now = 120;
+        let mut h = HeaderMap::new();
+        h.insert(HEADER_SUBJECT, "usr_bob".parse().unwrap());
+        h.insert(HEADER_GROUPS, "".parse().unwrap());
+        h.insert(
+            HEADER_SIG,
+            sign_identity(key, "usr_bob", "", now / 60).parse().unwrap(),
+        );
+        assert!(gateway_identity_ok_at(&h, Some(key), now));
+
+        h.insert(
+            HEADER_SIG,
+            sign_identity(key, "usr_bob", "", now / 60 - 1)
+                .parse()
+                .unwrap(),
+        );
+        assert!(gateway_identity_ok_at(&h, Some(key), now));
+        h.insert(
+            HEADER_SIG,
+            sign_identity(key, "usr_bob", "", now / 60 - 2)
+                .parse()
+                .unwrap(),
+        );
+        assert!(!gateway_identity_ok_at(&h, Some(key), now));
+
+        h.insert(
+            HEADER_SIG,
+            sign_identity(key, "usr_bob", "", now / 60).parse().unwrap(),
+        );
+        h.insert(HEADER_GROUPS, "admins".parse().unwrap());
+        assert!(!gateway_identity_ok_at(&h, Some(key), now));
+        h.remove(HEADER_SUBJECT);
+        assert!(!gateway_identity_ok_at(&h, Some(key), now));
+    }
+
+    #[test]
+    fn websocket_origin_is_exact_in_production() {
+        let mut h = HeaderMap::new();
+        assert!(verify_websocket_origin(&h, None).is_ok());
+        assert!(verify_websocket_origin(&h, Some("https://chat.w33d.xyz")).is_err());
+        h.insert(header::ORIGIN, "https://chat.w33d.xyz".parse().unwrap());
+        assert!(verify_websocket_origin(&h, Some("https://chat.w33d.xyz")).is_ok());
+        h.insert(header::ORIGIN, "null".parse().unwrap());
+        assert!(verify_websocket_origin(&h, Some("https://chat.w33d.xyz")).is_err());
+        h.insert(header::ORIGIN, "https://chat.w33d.xyz/".parse().unwrap());
+        assert!(verify_websocket_origin(&h, Some("https://chat.w33d.xyz")).is_err());
+        h.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        assert!(verify_websocket_origin(&h, Some("https://chat.w33d.xyz")).is_err());
+        h.insert(header::ORIGIN, "not-an-origin".parse().unwrap());
+        assert!(verify_websocket_origin(&h, Some("https://chat.w33d.xyz")).is_err());
     }
 
     #[test]

@@ -9,28 +9,78 @@
 </head>
 <body class="page-chat">
 {{TOPBAR}}
-<main class="admin">
-  <section class="card admin__card">
-    <header class="admin__head">
-      <a class="btn-link" href="/admin">&larr; All rooms</a>
-      <h1 class="admin__title">{{ROOM_TITLE}}</h1>
-      <span class="admin__sub mono">{{ROOM_ID}}</span>
+
+<!--
+  Murmur · Cutout Bay — room detail (K3-owned template).
+
+    {{ROOM_TITLE}} / {{ROOM_ID}}  escaped room identity
+    {{MEMBERS}}   <tr> rows: email / mono subject / plain-text status (Member|Banned, no pill)
+                  / actions. Every td carries data-label for the stacked mobile layout.
+                  Remove and Ban forms POST with hidden csrf.
+    {{MESSAGES}}  <tr> rows: time / author / escaped body preview / Redact form (hidden csrf).
+                  Already-deleted or redacted rows render their tombstone and NO Redact form.
+    {{CONSEQUENCE}}  NEW SLOT — the hard-delete consequence section, emitted by the renderer
+                  ONLY when the current room may be deleted (never for #lobby — the server
+                  refuses and the panel must not offer it). Required markup:
+
+                  <section class="consequence" id="cut-delete" aria-labelledby="cut-delete-title">
+                    <h2 class="consequence__title" id="cut-delete-title">
+                      <span class="consequence__glyph" aria-hidden="true">&#9986;</span>
+                      Delete this room</h2>
+                    <p class="consequence__scope">Permanently deletes <b>{name}</b>
+                      (<span class="mono">{id}</span>) — every message, member, reaction, pin,
+                      and mention. <b>This cannot be undone.</b></p>
+                    <form class="consequence__form" method="post" action="/admin/rooms/{id}/delete">
+                      <input type="hidden" name="confirm" value="delete">
+                      <input type="hidden" name="consequence_token" value="{one-time token}">
+                      <input type="hidden" name="csrf" value="{csrf}">
+                      <button class="cut-btn" type="submit">Delete permanently</button>
+                      <a class="consequence__cancel" href="/admin/rooms/{id}">Cancel</a>
+                    </form>
+                  </section>
+
+                  The two-step boundary is: Delete… link on the registry row navigates here
+                  (#cut-delete), then this form submits confirm=delete + csrf + one actor/room/
+                  csrf-bound consequence token. The Store consumes that token in the same
+                  transaction as the purge; the 303 back to /admin is the acknowledgement.
+-->
+
+<main class="cutout">
+  <section class="cutout__sheet" aria-labelledby="cutout-title">
+    <header class="cutout__head">
+      <a class="cutout__back" href="/admin">&larr; Cutout Bay</a>
+      <h1 class="cutout__title" id="cutout-title">{{ROOM_TITLE}}</h1>
+      <p class="cutout__sub mono">{{ROOM_ID}}</p>
     </header>
 
-    <h2 class="admin__section">Members</h2>
-    <table>
+    {{CONSEQUENCE}}
+
+    <h2 class="cutout__section">Members</h2>
+    <p class="cutout__note">Remove: the member may rejoin later. Ban: persistent — blocks rejoin.</p>
+    <table class="cut-sheet">
       <thead>
-        <tr><th>Email</th><th>Subject</th><th>Status</th><th class="admin__col-actions">Actions</th></tr>
+        <tr>
+          <th scope="col">Email</th>
+          <th scope="col">Subject</th>
+          <th scope="col">Status</th>
+          <th scope="col" class="cut-sheet__col-actions">Actions</th>
+        </tr>
       </thead>
       <tbody>
         {{MEMBERS}}
       </tbody>
     </table>
 
-    <h2 class="admin__section">Messages</h2>
-    <table>
+    <h2 class="cutout__section">Messages</h2>
+    <p class="cutout__note">Redaction replaces the body for everyone; copies already seen cannot be erased.</p>
+    <table class="cut-sheet">
       <thead>
-        <tr><th>Time</th><th>Author</th><th>Body</th><th class="admin__col-actions">Actions</th></tr>
+        <tr>
+          <th scope="col">Time</th>
+          <th scope="col">Author</th>
+          <th scope="col">Body</th>
+          <th scope="col" class="cut-sheet__col-actions">Actions</th>
+        </tr>
       </thead>
       <tbody>
         {{MESSAGES}}
@@ -38,5 +88,6 @@
     </table>
   </section>
 </main>
+
 </body>
 </html>

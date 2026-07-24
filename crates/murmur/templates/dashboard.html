@@ -8,60 +8,166 @@
   <style>{{CSS}}</style>
 </head>
 <body class="page-chat">
+<a class="skip-link" href="#pb-deck">Skip to conversation</a>
 {{TOPBAR}}
-<main class="chat">
-  <aside class="murmur-sidebar">
-    <div class="murmur-sidebar__head">
-      <h1 class="murmur-sidebar__title">Rooms</h1>
-      <div class="murmur-sidebar__actions">
-        <button id="new-dm" class="btn btn-secondary btn-sm" type="button">New DM</button>
-        <button id="new-room" class="btn btn-secondary btn-sm" type="button">New</button>
+
+<!--
+  Murmur · The Talkback Patchbay — dashboard shell (K3-owned template).
+
+  Slot contract consumed from the Codex renderer (handlers/dashboard.rs). Every slot is
+  substituted with a plain string; {{BOOT_JSON}} is a full JSON document, escaped for inline
+  <script type="application/json"> use, and {{JS}} is replaced LAST.
+
+    {{CSS}} {{THEME}} {{COLOR_SCHEME}} {{TOPBAR}}  chrome (unchanged)
+    {{ROOMS}}        <li> rows inside #pb-jack-list. REQUIRED row shape (frozen DOM):
+                       <li class="jack">
+                         <a class="jack__link" href="/?room={id}"
+                            data-room-id="{id}" data-room-kind="room|dm"
+                            data-room-state="active|archived" [aria-current="page"]>
+                           <span class="jack__ring" aria-hidden="true"></span>
+                           <span class="jack__label">{name}</span> …state marks…
+                         </a>
+                       </li>
+                     Bank separators: <li class="jackfield__bank-label" role="presentation">
+                     Patched / Archive — read only</li>; a trailing
+                     <li class="jackfield__note">Showing 500 rooms · older rooms not listed</li>
+                     is emitted only when the server truncates.
+                     Jacks are real GET anchors (no-JS room selection). Only the four frozen
+                     attributes above; no data-epoch / data-position / membership epoch.
+    {{ROOM_TITLE}}   escaped selected room name (generic "Room unavailable" shape never leaks
+                     a protected name)
+    {{TOPIC}}        escaped topic (may be empty)
+    {{DECK_STATE}}   NEW SLOT — "" | " deck--archived" | " deck--unavailable"; drives the
+                     archived tag + composer authority copy via CSS only.
+    {{TAPE_STATUS}}  window/boundary truth line, e.g. "Latest window · up to 50 messages",
+                     "No messages in the latest window", safe unavailable copy, and the
+                     locator note "Message is not in the latest window" (never "located"
+                     unless it is inside the loaded latest-50 window).
+    {{MESSAGES}}     tape rows. REQUIRED row shape (frozen DOM):
+                       <li class="msg" id="msg-{id}" data-msg-id="{id}"
+                           data-created-at="{epoch}" data-lifecycle="live|deleted|redacted"
+                           data-own="true|false">…</li>
+                     Located target also gets class "is-located" and tabindex="-1".
+                     Empty/unavailable states surface through {{TAPE_STATUS}} only — this
+                     slot emits rows or nothing. Date separators:
+                     <li class="tape__splice tape__splice--date" role="separator">Tue 21 Jul 2026</li>
+    {{RECEIPT}}      SSR send receipt for ?receipt_message=, rendered only after the server
+                     confirms the message belongs to this room AND sender == signed subject:
+                     "Saved · HH:MM UTC". Empty otherwise.
+    {{REPLY_CONTEXT}} escaped one-line reply context ("Replying to {author} · {snippet}") or
+                     "Loop unavailable"; empty when not replying.
+    {{REPLY_TO_ID}}  hidden reply target id (empty when none)
+    {{COMPOSER_DISABLED}} "disabled" or "" (applied to BOTH textarea and Send)
+    {{LEDGER}}       Ledger partial: <p class="pb-ledger__status">…</p> plus
+                     <a class="pb-ledger__item" href="/?room={id}&message={mid}#msg-{mid}">…
+                     rows; empty when no ledger view is active. One bounded set, never a
+                     cursor / end / full-history claim.
+    {{LEDGER_Q}}     NEW SLOT — escaped current search query for the ledger search input
+                     ("" when none); keeps the query across recoverable failures.
+    {{SELECTED}}     selected room id (server-generated safe id; used in URLs/form action)
+    {{CSRF}}         double-submit token for the no-JS composer form (hex)
+    {{BOOT_JSON}}    full boot document: {"csrf","me":{"display_email"},"selected":
+                     {"room_id","authority","kind"},"isMod","limits":{"messagePage","body",
+                     "searchMin","searchMax"},"transport":{"initial":"unknown"}}
+    {{JS}}           inlined app.js — ALWAYS replaced last.
+-->
+
+<div class="patchbar" id="pb-patchbar">
+  <button class="patchbar__rooms" id="pb-rooms-open" type="button" aria-expanded="false" aria-controls="pb-jackfield">Rooms</button>
+  <span class="patchbar__current" id="pb-patchbar-current">{{ROOM_TITLE}}</span>
+</div>
+
+<div class="patchbay">
+  <nav class="jackfield" id="pb-jackfield" aria-label="Jackfield — rooms">
+    <div class="jackfield__head">
+      <h2 class="jackfield__title">Jackfield</h2>
+      <div class="jackfield__actions">
+        <button class="jackfield__new" id="pb-new-room" type="button" hidden>New room</button>
+        <button class="jackfield__new" id="pb-new-dm" type="button" hidden>New DM</button>
       </div>
     </div>
-    <form id="search-form" class="murmur-sidebar__search" autocomplete="off">
-      <input id="search-input" class="input input-sm" type="search" placeholder="Search messages&hellip;" maxlength="200" aria-label="Search messages">
-      <button id="mentions-btn" class="btn btn-ghost btn-sm" type="button" title="Your mentions" aria-label="Your mentions">@ Mentions</button>
-    </form>
-    <ul id="room-list" class="room-list">
-      {{ROOMS}}
-    </ul>
-  </aside>
-  <section class="room-view">
-    <header class="room-view__head">
-      <div class="room-view__heading">
-        <h2 id="room-title" class="room-view__title">{{ROOM_TITLE}}</h2>
-        <div id="room-topic" class="room-view__topic">{{TOPIC}}</div>
+    <ul class="jackfield__bank" id="pb-jack-list">{{ROOMS}}</ul>
+  </nav>
+
+  <main class="deck{{DECK_STATE}}" id="pb-deck" tabindex="-1">
+    <header class="deck__head">
+      <div class="deck__heading">
+        <h1 class="deck__title" id="pb-room-title">{{ROOM_TITLE}}</h1>
+        <p class="deck__tag deck__tag--archived">Archived — read only</p>
+        <p class="deck__topic" id="pb-room-topic">{{TOPIC}}</p>
       </div>
-      <div class="room-view__meta">
-        <button id="topic-edit" class="btn btn-ghost btn-sm" type="button" hidden>Edit topic</button>
-        <button id="pin-toggle" class="btn btn-ghost btn-sm" type="button" aria-expanded="false">Pinned</button>
-        <span id="presence" class="room-view__presence"></span>
+      <div class="deck__meta">
+        <div class="meter is-unknown" id="pb-transport" aria-live="polite">
+          <span class="meter__segments" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+          <span class="meter__label" id="pb-transport-label">Unknown</span>
+          <span class="meter__catchup" id="pb-catchup" hidden>Catching up</span>
+          <button class="meter__reconnect" id="pb-reconnect" type="button" hidden>Reconnect</button>
+        </div>
+        <noscript><p class="deck__nojs">Live updates need JavaScript — reload to refresh</p></noscript>
+        <button class="deck__ledger-toggle" id="pb-ledger-toggle" type="button" aria-expanded="false" aria-controls="pb-ledger">Ledger</button>
       </div>
     </header>
-    <div id="pinned-panel" class="pinned-panel" hidden>
-      <div class="pinned-panel__head">Pinned messages</div>
-      <div id="pinned-list" class="pinned-panel__list">
-        {{PINNED}}
-      </div>
-    </div>
-    <div id="timeline" class="timeline">
+
+    <ol class="tape" id="pb-tape" aria-label="Conversation tape">
+      <li class="tape__splice tape__splice--status" id="pb-tape-status" role="separator">{{TAPE_STATUS}}</li>
       {{MESSAGES}}
-    </div>
-    <form id="composer" class="composer" autocomplete="off">
-      <textarea id="composer-input" class="composer__input" rows="1" maxlength="8192"
-        placeholder="Message {{ROOM_TITLE}}&hellip;"></textarea>
-      <button class="btn btn-primary" type="submit">Send</button>
+      <li class="tape__splice tape__splice--newest" role="separator">Newest</li>
+    </ol>
+
+    <form class="cue" id="pb-cue" method="post" action="/api/rooms/{{SELECTED}}/messages" aria-label="Message composer">
+      <p class="cue__authority" id="pb-cue-authority">
+        <span class="cue__authority-active">Patched into <b id="pb-cue-room">{{ROOM_TITLE}}</b></span>
+        <span class="cue__authority-archived">Archived — read only</span>
+        <span class="cue__authority-unavailable">Room unavailable</span>
+      </p>
+      <p class="cue__loop" id="pb-cue-loop">
+        <span class="cue__loop-notch" aria-hidden="true">&#8617;</span>
+        <span class="cue__loop-text" id="pb-cue-loop-text">{{REPLY_CONTEXT}}</span>
+        <a class="cue__loop-cancel" id="pb-cue-loop-cancel" href="/?room={{SELECTED}}">Cancel</a>
+      </p>
+      <div class="cue__field">
+        <label class="cue__label" for="pb-cue-input">Message</label>
+        <textarea class="cue__input" id="pb-cue-input" name="body" rows="2" maxlength="8192" required
+          placeholder="Type a message" aria-describedby="pb-cue-budget"{{COMPOSER_DISABLED}}></textarea>
+      </div>
+      <input type="hidden" name="csrf" value="{{CSRF}}">
+      <input type="hidden" name="reply_to_id" id="pb-reply-to" value="{{REPLY_TO_ID}}">
+      <div class="cue__foot">
+        <span class="cue__budget" id="pb-cue-budget">8,192 max</span>
+        <button class="cue__send" id="pb-cue-send" type="submit"{{COMPOSER_DISABLED}}>Send</button>
+      </div>
+      <p class="cue__receipt" id="pb-receipt" aria-live="polite">{{RECEIPT}}</p>
     </form>
-  </section>
-</main>
-<script>
-  window.MURMUR = {
-    csrf: "{{CSRF}}",
-    me: "{{ME}}",
-    selected: "{{SELECTED}}",
-    isMod: {{IS_MOD}}
-  };
-</script>
+  </main>
+
+  <aside class="ledger" id="pb-ledger" aria-label="Patch Ledger">
+    <div class="ledger__head">
+      <h2 class="ledger__title">Patch Ledger</h2>
+      <button class="ledger__close" id="pb-ledger-close" type="button">Close</button>
+    </div>
+    <nav class="ledger__tabs" aria-label="Ledger views">
+      <a class="ledger__tab" id="pb-tab-search" href="/?room={{SELECTED}}&amp;ledger=search">Search</a>
+      <a class="ledger__tab" id="pb-tab-mentions" href="/?room={{SELECTED}}&amp;ledger=mentions">Mentions</a>
+      <a class="ledger__tab" id="pb-tab-pins" href="/?room={{SELECTED}}&amp;ledger=pins">Pins</a>
+    </nav>
+    <form class="ledger__search" id="pb-ledger-search" method="get" action="/">
+      <input type="hidden" name="room" id="pb-ledger-room" value="{{SELECTED}}">
+      <input type="hidden" name="ledger" value="search">
+      <label class="ledger__search-label" for="pb-ledger-q">Search messages you can read</label>
+      <div class="ledger__search-row">
+        <input class="ledger__q" id="pb-ledger-q" name="q" type="search" minlength="2" maxlength="200"
+          value="{{LEDGER_Q}}" autocomplete="off">
+        <button class="ledger__go" type="submit">Search</button>
+      </div>
+    </form>
+    <div class="ledger__results" id="pb-ledger-results">{{LEDGER}}</div>
+  </aside>
+</div>
+
+<div class="pb-presence" id="pb-presence" aria-hidden="true"></div>
+<div class="visually-hidden" id="pb-live-polite" aria-live="polite"></div>
+
+<script type="application/json" id="pb-boot">{{BOOT_JSON}}</script>
 <script>{{JS}}</script>
 </body>
 </html>

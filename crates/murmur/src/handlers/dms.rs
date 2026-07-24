@@ -3,15 +3,16 @@
 //! A DM is just a `kind = "dm"` room keyed by the SORTED pair of the two participants' gateway
 //! subjects, so it is deterministic and auto-created (idempotently) on the first DM — no separate
 //! DM tables. Once created it reuses the existing rooms/messages/membership machinery verbatim:
-//! the timeline, keyset pagination, unread `last_read_at` cursor, and the live Hub fan-out all
+//! the timeline, keyset pagination, tuple read marker, and the live Hub fan-out all
 //! work unchanged, and it shows up in `GET /api/rooms` for both members.
 //!
 //! Identity is ALWAYS the gateway-injected `X-Auth-*` subject/email, never a client field. The
 //! request body only names WHO to DM (a subject + email picked from `GET /api/directory`).
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -38,7 +39,7 @@ pub async fn directory(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let (sub, _email) = auth::require_user(&headers)?;
-    let people = state.store.list_directory(&sub).await;
+    let people = state.store.list_directory(&sub).await?;
     Ok(Json(json!({ "people": people })).into_response())
 }
 
@@ -48,15 +49,19 @@ pub async fn directory(
 pub async fn open(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<OpenDmReq>,
+    payload: Result<Json<OpenDmReq>, JsonRejection>,
 ) -> Result<Response, AppError> {
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
+    let Json(req) =
+        payload.map_err(|_| AppError::InvalidRequest("invalid JSON body".to_string()))?;
 
     let peer_sub = req.subject.trim();
     let peer_email = req.email.trim();
     if peer_sub.is_empty() {
-        return Err(AppError::InvalidRequest("peer subject is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "peer subject is required".to_string(),
+        ));
     }
     if peer_sub == sub {
         return Err(AppError::InvalidRequest("cannot DM yourself".to_string()));
@@ -74,16 +79,10 @@ pub async fn open(
         archived: false,
         topic: String::new(),
     };
-    // Idempotent: `ensure_room` no-ops if the DM already exists (first-creator's row wins).
-    state.store.ensure_room(&room).await?;
-    state.store.ensure_membership(&id, &sub, &email, now).await?;
-    state
+    let room = state
         .store
-        .ensure_membership(&id, peer_sub, peer_email, now)
+        .open_dm_authorized(&room, &sub, &email, peer_sub, peer_email, now)
         .await?;
-
-    // Re-read so the response reflects the persisted row exactly (name from the first creator).
-    let room = state.store.get_room(&id).await.unwrap_or(room);
 
     state.audit.emit(AuditEvent::info(
         "chat.dm.open",
@@ -107,8 +106,16 @@ fn dm_room_id(a: &str, b: &str) -> String {
 /// SAME label no matter which side opens it first. Falls back to the subject when an email is
 /// blank. The name is stored/escaped by the render layers like any other room name.
 fn dm_room_name(self_sub: &str, self_email: &str, peer_sub: &str, peer_email: &str) -> String {
-    let self_label = if self_email.is_empty() { self_sub } else { self_email };
-    let peer_label = if peer_email.is_empty() { peer_sub } else { peer_email };
+    let self_label = if self_email.is_empty() {
+        self_sub
+    } else {
+        self_email
+    };
+    let peer_label = if peer_email.is_empty() {
+        peer_sub
+    } else {
+        peer_email
+    };
     let (lo, hi) = if self_sub <= peer_sub {
         (self_label, peer_label)
     } else {

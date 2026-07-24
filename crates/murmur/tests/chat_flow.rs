@@ -44,7 +44,9 @@ fn post_json(
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, format!("__Host-csrf={CSRF}"));
     if let Some((sub, email)) = auth {
-        b = b.header("x-auth-subject", sub).header("x-auth-email", email);
+        b = b
+            .header("x-auth-subject", sub)
+            .header("x-auth-email", email);
     }
     if let Some(tok) = csrf_header {
         b = b.header("x-csrf-token", tok);
@@ -82,7 +84,10 @@ async fn full_chat_flow_in_memory() {
         .get(header::SET_COOKIE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    assert!(set_cookie.contains("__Host-csrf="), "dashboard mints CSRF cookie");
+    assert!(
+        set_cookie.contains("__Host-csrf="),
+        "dashboard mints CSRF cookie"
+    );
 
     // --- GET /api/rooms: lobby auto-joined --------------------------------
     let (status, body) = call(&state, get_auth("/api/rooms", "u_alice", "alice@hf")).await;
@@ -94,13 +99,18 @@ async fn full_chat_flow_in_memory() {
     let (status, _) = call(&state, get("/api/rooms")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // --- send with bad CSRF -> 401 ----------------------------------------
+    // --- send with bad CSRF -> 403 ----------------------------------------
     let (status, _) = call(
         &state,
-        post_json("/api/rooms/lobby/messages", r#"{"body":"hi"}"#, alice, Some("WRONG")),
+        post_json(
+            "/api/rooms/lobby/messages",
+            r#"{"body":"hi"}"#,
+            alice,
+            Some("WRONG"),
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "CSRF mismatch -> 401");
+    assert_eq!(status, StatusCode::FORBIDDEN, "CSRF mismatch -> 403");
 
     // --- send to lobby (member via auto-join) -----------------------------
     let (status, body) = call(
@@ -123,14 +133,22 @@ async fn full_chat_flow_in_memory() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("hello <b>world</b>"), "raw body in JSON (client escapes)");
+    assert!(
+        body.contains("hello <b>world</b>"),
+        "raw body in JSON (client escapes)"
+    );
 
     // --- non-member cannot read another room ------------------------------
     // Bob creates a private room; Alice is not a member.
     let bob = Some(("u_bob", "bob@hf"));
     let (status, body) = call(
         &state,
-        post_json("/api/rooms", r#"{"name":"secret","kind":"room"}"#, bob, Some(CSRF)),
+        post_json(
+            "/api/rooms",
+            r#"{"name":"secret","kind":"room"}"#,
+            bob,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -144,13 +162,19 @@ async fn full_chat_flow_in_memory() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-member -> 403");
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-member -> generic 404");
 
     // --- dashboard timeline sanitizes the body ----------------------------
     let (status, page) = call(&state, get_auth("/", "u_alice", "alice@hf")).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!page.contains("hello <b>world</b>"), "raw tag must not survive in HTML");
-    assert!(page.contains("hello &lt;b&gt;world&lt;/b&gt;"), "body escaped in timeline");
+    assert!(
+        !page.contains("hello <b>world</b>"),
+        "raw tag must not survive in HTML"
+    );
+    assert!(
+        page.contains("hello &lt;b&gt;world&lt;/b&gt;"),
+        "body escaped in timeline"
+    );
     assert!(
         page.contains("<a href=\"https://example.com\""),
         "url autolinked in timeline"
@@ -162,7 +186,12 @@ async fn join_unknown_room_is_404() {
     let state = build_dev_state();
     let (status, _) = call(
         &state,
-        post_json("/api/rooms/nope/join", "{}", Some(("u_x", "x@hf")), Some(CSRF)),
+        post_json(
+            "/api/rooms/nope/join",
+            "{}",
+            Some(("u_x", "x@hf")),
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -175,7 +204,12 @@ async fn empty_body_rejected() {
     let _ = call(&state, get_auth("/api/rooms", "u_a", "a@hf")).await;
     let (status, _) = call(
         &state,
-        post_json("/api/rooms/lobby/messages", r#"{"body":"   "}"#, Some(("u_a", "a@hf")), Some(CSRF)),
+        post_json(
+            "/api/rooms/lobby/messages",
+            r#"{"body":"   "}"#,
+            Some(("u_a", "a@hf")),
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -210,13 +244,18 @@ async fn edit_and_delete_flow() {
     // Alice posts a message and we capture its id.
     let (status, body) = call(
         &state,
-        post_json("/api/rooms/lobby/messages", r#"{"body":"first draft"}"#, alice, Some(CSRF)),
+        post_json(
+            "/api/rooms/lobby/messages",
+            r#"{"body":"first draft"}"#,
+            alice,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
     let msg_id = extract_message_id(&body);
 
-    // --- bad CSRF -> 401 ---------------------------------------------------
+    // --- bad CSRF -> 403 ---------------------------------------------------
     let (status, _) = call(
         &state,
         post_json(
@@ -227,7 +266,7 @@ async fn edit_and_delete_flow() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "edit CSRF mismatch -> 401");
+    assert_eq!(status, StatusCode::FORBIDDEN, "edit CSRF mismatch -> 403");
 
     // --- non-author cannot edit -> 403 ------------------------------------
     let (status, _) = call(
@@ -265,7 +304,12 @@ async fn edit_and_delete_flow() {
     // --- non-author cannot delete -> 403 ----------------------------------
     let (status, _) = call(
         &state,
-        post_json(&format!("/api/rooms/lobby/messages/{msg_id}/delete"), "{}", bob, Some(CSRF)),
+        post_json(
+            &format!("/api/rooms/lobby/messages/{msg_id}/delete"),
+            "{}",
+            bob,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "non-author delete -> 403");
@@ -273,12 +317,20 @@ async fn edit_and_delete_flow() {
     // --- author soft-deletes own message ----------------------------------
     let (status, body) = call(
         &state,
-        post_json(&format!("/api/rooms/lobby/messages/{msg_id}/delete"), "{}", alice, Some(CSRF)),
+        post_json(
+            &format!("/api/rooms/lobby/messages/{msg_id}/delete"),
+            "{}",
+            alice,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("\"deleted\":true"), "message flagged deleted");
-    assert!(!body.contains("edited body"), "deleted body cleared in response");
+    assert!(
+        !body.contains("edited body"),
+        "deleted body cleared in response"
+    );
 
     // The API list no longer carries the original content.
     let (_, list) = call(
@@ -287,7 +339,10 @@ async fn edit_and_delete_flow() {
     )
     .await;
     assert!(list.contains("\"deleted\":true"));
-    assert!(!list.contains("edited body"), "deleted body absent from list");
+    assert!(
+        !list.contains("edited body"),
+        "deleted body absent from list"
+    );
 
     // The timeline renders the [deleted] tombstone, not the old text.
     let (_, page) = call(&state, get_auth("/", "u_alice", "alice@hf")).await;
@@ -305,7 +360,11 @@ async fn edit_and_delete_flow() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "cannot edit a deleted message");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "cannot edit a deleted message"
+    );
 }
 
 #[tokio::test]

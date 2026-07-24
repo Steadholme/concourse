@@ -3,21 +3,35 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[derive(Clone)]
-pub struct KlaxonNotifier { url: String, token: String }
+pub struct KlaxonNotifier {
+    url: String,
+    token: String,
+}
 
 impl KlaxonNotifier {
     /// KLAXON_NOTIFY_URL(完整 http:// URL)+ KLAXON_INGEST_TOKEN;任一缺失 => None(禁用,完全向后兼容)。
     pub fn from_env() -> Option<KlaxonNotifier> {
-        let url = std::env::var("KLAXON_NOTIFY_URL").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
-        let token = std::env::var("KLAXON_INGEST_TOKEN").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+        let url = std::env::var("KLAXON_NOTIFY_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        let token = std::env::var("KLAXON_INGEST_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
         Some(KlaxonNotifier { url, token })
     }
 
     /// fire-and-forget:spawn 一个 detached、带 5s 超时的任务;失败只 warn,绝不冒泡/阻塞调用方。
     pub fn notify(&self, source: &str, user_sub: &str, title: &str, body: &str, url: &str) {
         let this = self.clone();
-        let (source, user_sub, title, body, url) =
-            (source.to_string(), user_sub.to_string(), title.to_string(), body.to_string(), url.to_string());
+        let (source, user_sub, title, body, url) = (
+            source.to_string(),
+            user_sub.to_string(),
+            title.to_string(),
+            body.to_string(),
+            url.to_string(),
+        );
         tokio::spawn(async move {
             if let Err(e) = this.post(&source, &user_sub, &title, &body, &url).await {
                 tracing::warn!(error = %e, source = %source, "klaxon notify failed");
@@ -25,7 +39,14 @@ impl KlaxonNotifier {
         });
     }
 
-    async fn post(&self, source: &str, user_sub: &str, title: &str, body: &str, url: &str) -> Result<(), String> {
+    async fn post(
+        &self,
+        source: &str,
+        user_sub: &str,
+        title: &str,
+        body: &str,
+        url: &str,
+    ) -> Result<(), String> {
         let (host, port, path) = parse_http_url(&self.url)
             .ok_or_else(|| format!("KLAXON_NOTIFY_URL 不是 http:// URL: {}", self.url))?;
         let json = format!(
@@ -37,8 +58,12 @@ impl KlaxonNotifier {
             token = self.token, len = json.len(),
         );
         let fut = async {
-            let mut s = TcpStream::connect((host.as_str(), port)).await.map_err(|e| e.to_string())?;
-            s.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+            let mut s = TcpStream::connect((host.as_str(), port))
+                .await
+                .map_err(|e| e.to_string())?;
+            s.write_all(req.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
             let mut buf = Vec::with_capacity(256);
             s.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
             Ok::<Vec<u8>, String>(buf)
@@ -48,7 +73,11 @@ impl KlaxonNotifier {
             .map_err(|_| "klaxon ingest timed out".to_string())??;
         let head = String::from_utf8_lossy(&buf);
         let status = head.lines().next().unwrap_or("");
-        if status.contains(" 20") { Ok(()) } else { Err(format!("klaxon ingest 返回: {status}")) }
+        if status.contains(" 20") {
+            Ok(())
+        } else {
+            Err(format!("klaxon ingest 返回: {status}"))
+        }
     }
 }
 
@@ -80,6 +109,8 @@ fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
         Some((h, p)) => (h.to_string(), p.parse().ok()?),
         None => (authority.to_string(), 80u16),
     };
-    if host.is_empty() { return None; }
+    if host.is_empty() {
+        return None;
+    }
     Some((host, port, path))
 }

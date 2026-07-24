@@ -64,8 +64,12 @@ async fn main() {
 
     // Each owned surface connects to its OWN database and migrates idempotently — exactly what the
     // standalone service did. A failure here is fatal (the surface cannot serve without its DB).
-    let chat = build_chat().await.unwrap_or_else(|e| fatal("chat (murmur)", e));
-    let cal = build_cal().await.unwrap_or_else(|e| fatal("cal (almanac)", e));
+    let chat = build_chat()
+        .await
+        .unwrap_or_else(|e| fatal("chat (murmur)", e));
+    let cal = build_cal()
+        .await
+        .unwrap_or_else(|e| fatal("cal (almanac)", e));
     let notify = build_notify()
         .await
         .unwrap_or_else(|e| fatal("notify (klaxon)", e));
@@ -146,9 +150,12 @@ async fn build_chat() -> Result<Router, String> {
         &murmur::config::env_nonempty("WATCHTOWER_URL").unwrap_or_default(),
         murmur::config::env_nonempty("AUDIT_INGEST_TOKEN").as_deref(),
     );
+    let config = murmur::config::Config::from_env().map_err(|error| format!("config: {error}"))?;
+    let store: Arc<dyn murmur::store::Store> = Arc::new(pg);
+    murmur::start_room_delete_audit_poller(store.clone(), audit.clone());
     let state = murmur::AppState {
-        config: Arc::new(murmur::config::Config::from_env()),
-        store: Arc::new(pg),
+        config: Arc::new(config),
+        store,
         hub: Arc::new(murmur::hub::Hub::new()),
         audit,
         klaxon: murmur::KlaxonNotifier::from_env().map(Arc::new),

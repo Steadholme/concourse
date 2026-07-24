@@ -9,15 +9,45 @@
 </head>
 <body class="page-chat">
 {{TOPBAR}}
-<main class="admin">
-  <section class="card admin__card">
-    <header class="admin__head">
-      <h1 class="admin__title">Rooms</h1>
-      <span class="admin__sub">Moderator control — admin overrides ownership.</span>
+
+<!--
+  Murmur · Cutout Bay — room registry sheet (K3-owned template).
+
+    {{ROOMS}}  <tr> rows. REQUIRED row shape:
+                 <tr>
+                   <td data-label="Room"><a class="cut-sheet__room" href="/admin/rooms/{id}">{name}</a>
+                       <span class="mono cut-sheet__id">{id}</span></td>
+                   <td data-label="Kind">{kind}</td>
+                   <td data-label="Created by">{creator}</td>
+                   <td data-label="Status"><span class="cut-sheet__state">Active|Archived|System room</span></td>
+                   <td data-label="Actions"><div class="cut-sheet__actions">
+                     <form method="post" action="/admin/rooms/{id}/archive">…csrf…
+                       <button type="submit">Archive</button></form>
+                     <a class="cut-link" href="/admin/rooms/{id}#cut-delete">Delete…</a>
+                   </div></td>
+                 </tr>
+               Delete is a LINK to the detail page's consequence section (two-step, server
+               verifies confirm=delete + csrf) — never an inline form, never onsubmit/confirm().
+               #lobby rows render NO archive/delete control (the server refuses both; the panel
+               must not offer consequences it would immediately reverse).
+               Status is plain text — no pill badge.
+-->
+
+<main class="cutout">
+  <section class="cutout__sheet" aria-labelledby="cutout-title">
+    <header class="cutout__head">
+      <h1 class="cutout__title" id="cutout-title">Cutout Bay</h1>
+      <p class="cutout__sub">Room registry — moderator control overrides ownership. Destructive actions are cut-marked and verified again on the server.</p>
     </header>
-    <table>
+    <table class="cut-sheet">
       <thead>
-        <tr><th>Room</th><th>Kind</th><th>Created by</th><th>Status</th><th class="admin__col-actions">Actions</th></tr>
+        <tr>
+          <th scope="col">Room</th>
+          <th scope="col">Kind</th>
+          <th scope="col">Created by</th>
+          <th scope="col">Status</th>
+          <th scope="col" class="cut-sheet__col-actions">Actions</th>
+        </tr>
       </thead>
       <tbody>
         {{ROOMS}}
@@ -25,5 +55,6 @@
     </table>
   </section>
 </main>
+
 </body>
 </html>

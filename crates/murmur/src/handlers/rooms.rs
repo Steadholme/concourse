@@ -5,12 +5,14 @@
 //! they belong to. A successful send persists the message, fans it out to the live [`Hub`], and
 //! best-effort audits `chat.message.send` to Watchtower.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use axum::body::to_bytes;
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::response::{IntoResponse, Response};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
@@ -21,8 +23,8 @@ use crate::config::{
     MAX_BODY_CHARS, MAX_EMOJI_CHARS, MAX_ROOM_NAME_CHARS, MAX_TOPIC_CHARS, MESSAGE_PAGE_LIMIT,
 };
 use crate::error::AppError;
-use crate::handlers::{message_frame, reaction_frame};
-use crate::store::{Member, Message, Person, Room};
+use crate::handlers::{message_frame, path_or_invalid, query_or_invalid, reaction_frame};
+use crate::store::{Member, Message, MessageCursor, Person, Room};
 use crate::text::parse_mentions;
 use crate::{ensure_lobby, now_nanos, now_secs, AppState, KlaxonNotifier};
 
@@ -43,6 +45,18 @@ pub struct SendReq {
     /// Optional threaded-reply parent (a message id in the SAME room). Omitted/empty => top-level.
     #[serde(default)]
     pub reply_to_id: Option<String>,
+}
+
+#[derive(Debug)]
+enum SendMode {
+    Json,
+    Form { csrf: String },
+}
+
+#[derive(Debug)]
+enum ReadMode {
+    Json,
+    Form,
 }
 
 /// Body for `POST /api/rooms/{id}/messages/{msg_id}/react`.
@@ -69,21 +83,28 @@ pub struct SetTopicReq {
 /// Query for `GET /api/rooms/{id}/messages` — keyset cursor (messages strictly older than this).
 #[derive(Debug, Deserialize)]
 pub struct MessagesQuery {
-    pub before: Option<i64>,
+    pub before: Option<String>,
 }
 
-/// Query for `POST /api/rooms/{id}/read` — mark read up to this `created_at` (defaults to now).
+/// Legacy query for `POST /api/rooms/{id}/read`. `at` is parsed for compatibility but never used
+/// as read authority.
 #[derive(Debug, Deserialize)]
 pub struct ReadQuery {
     pub at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReadReq {
+    #[serde(default)]
+    pub message_id: String,
 }
 
 /// `GET /api/rooms` — rooms this user belongs to. Ensures the `#lobby` exists and the caller is
 /// a member of it (first-visit auto-join), so the list is never empty.
 pub async fn list(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
     let (sub, email) = auth::require_user(&headers)?;
-    ensure_lobby(&state, &sub, &email).await;
-    let rooms = state.store.list_user_rooms(&sub).await;
+    ensure_lobby(&state, &sub, &email).await?;
+    let rooms = state.store.list_user_rooms(&sub).await?;
     Ok(Json(json!({ "rooms": rooms })).into_response())
 }
 
@@ -91,24 +112,29 @@ pub async fn list(State(state): State<AppState>, headers: HeaderMap) -> Result<R
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<CreateRoomReq>,
+    payload: Result<Json<CreateRoomReq>, JsonRejection>,
 ) -> Result<Response, AppError> {
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
+    let Json(req) =
+        payload.map_err(|_| AppError::InvalidRequest("invalid JSON body".to_string()))?;
 
     let name = req.name.trim();
     if name.is_empty() {
-        return Err(AppError::InvalidRequest("room name is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "room name is required".to_string(),
+        ));
     }
     if name.chars().count() > MAX_ROOM_NAME_CHARS {
         return Err(AppError::InvalidRequest("room name too long".to_string()));
     }
-    // Only `room` and `dm` are valid kinds; anything else falls back to `room`.
-    let kind = match req.kind.as_deref().map(str::trim) {
-        Some("dm") => "dm",
-        _ => "room",
+    // DMs are created only by the dedicated `/api/dms` authority.
+    if req.kind.as_deref().is_some_and(|kind| kind.trim() == "dm") {
+        return Err(AppError::InvalidRequest(
+            "generic room creation cannot create a DM".to_string(),
+        ));
     }
-    .to_string();
+    let kind = "room".to_string();
 
     let now = now_secs();
     let room = Room {
@@ -141,19 +167,15 @@ pub async fn create(
 pub async fn join(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
 
     let room = state
         .store
-        .get_room(&id)
-        .await
-        .ok_or_else(|| AppError::NotFound("no such room".to_string()))?;
-    state
-        .store
-        .ensure_membership(&room.id, &sub, &email, now_secs())
+        .join_active_room(&id, &sub, &email, now_secs())
         .await?;
     tracing::info!(room_id = %room.id, "user joined room");
 
@@ -164,85 +186,167 @@ pub async fn join(
 pub async fn messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(q): Query<MessagesQuery>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<MessagesQuery>, QueryRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
+    let q = query_or_invalid(query)?;
     let (sub, _email) = auth::require_user(&headers)?;
-    require_membership(&state, &id, &sub).await?;
-
-    let messages = state
+    let before = parse_message_cursor(q.before.as_deref())?;
+    let mut messages = state
         .store
-        .list_messages(&id, q.before, MESSAGE_PAGE_LIMIT)
-        .await;
-    Ok(Json(json!({ "room_id": id, "messages": messages })).into_response())
+        .list_messages_authorized(&id, &sub, before, MESSAGE_PAGE_LIMIT + 1)
+        .await?;
+    let has_more = messages.len() > MESSAGE_PAGE_LIMIT as usize;
+    messages.truncate(MESSAGE_PAGE_LIMIT as usize);
+    let next_cursor = has_more.then(|| {
+        messages
+            .last()
+            .map(MessageCursor::from_message)
+            .map(|cursor| cursor.encode())
+    });
+    Ok(Json(json!({
+        "room_id": id,
+        "messages": messages,
+        "next_cursor": next_cursor.flatten(),
+    }))
+    .into_response())
 }
 
 /// `POST /api/rooms/{id}/messages` — send a message: persist, fan out over the hub, audit.
 pub async fn send(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(req): Json<SendReq>,
-) -> Result<Response, AppError> {
-    let (sub, email) = auth::require_user(&headers)?;
-    auth::verify_csrf(&headers)?;
-    let room = require_membership(&state, &id, &sub).await?;
-
-    let body = req.body.trim();
-    if body.is_empty() {
-        return Err(AppError::InvalidRequest("message body is required".to_string()));
-    }
-    if body.chars().count() > MAX_BODY_CHARS {
-        return Err(AppError::InvalidRequest("message body too long".to_string()));
-    }
-
-    // A threaded reply must point at an EXISTING message IN THIS ROOM (a reply can never cross
-    // rooms or dangle). An empty/blank id is treated as "no reply".
-    let reply_parent = match req.reply_to_id.as_deref().map(str::trim) {
-        Some(pid) if !pid.is_empty() => {
-            let parent = state
-                .store
-                .get_message(pid)
-                .await
-                .filter(|m| m.room_id == id)
-                .ok_or_else(|| AppError::InvalidRequest("reply target not found".to_string()))?;
-            Some(parent)
+    path: Result<Path<String>, PathRejection>,
+    request: axum::extract::Request,
+) -> Response {
+    let id = match path_or_invalid(path) {
+        Ok(id) => id,
+        Err(error) => return error.into_response(),
+    };
+    let is_form = is_form_content_type(&headers);
+    let (sub, email) = match auth::require_user(&headers) {
+        Ok(identity) => identity,
+        Err(error) => return error.into_response(),
+    };
+    let (req, mode) = match decode_send_request(&headers, request).await {
+        Ok(decoded) => decoded,
+        Err((error, draft, csrf)) => {
+            return if is_form {
+                send_form_error(&id, &draft, &csrf, &error)
+            } else {
+                error.into_response()
+            };
         }
-        _ => None,
+    };
+    let form_csrf = match &mode {
+        SendMode::Json => String::new(),
+        SendMode::Form { csrf } => csrf.clone(),
     };
 
-    let message = Message {
-        id: format!("msg_{}", now_nanos()),
-        room_id: id.clone(),
-        sender_sub: sub.clone(),
-        sender_email: email.clone(),
-        body: body.to_string(),
-        created_at: now_secs(),
-        edited_at: 0,
-        deleted: false,
-        reply_to_id: reply_parent.as_ref().map(|m| m.id.clone()),
-    };
-    state.store.create_message(&message).await?;
+    let result = async {
+        let room = require_membership(&state, &id, &sub).await?;
+        require_active_room(&room)?;
 
-    // Resolve @mentions in the body to members of THIS room and record one mention per hit. Only
-    // current room members can be mentioned (a mention never reaches a non-member), and the author
-    // never mentions themselves.
-    let mentioned = record_mentions(&state, &message).await;
-    spawn_message_notifications(&state, &room, &message, reply_parent.as_ref(), mentioned);
+        let body = req.body.trim();
+        if body.is_empty() {
+            return Err(AppError::InvalidRequest(
+                "message body is required".to_string(),
+            ));
+        }
+        if body.chars().count() > MAX_BODY_CHARS {
+            return Err(AppError::InvalidRequest(
+                "message body too long".to_string(),
+            ));
+        }
 
-    // Fan out to every WebSocket currently subscribed to this room (single-process; the DB is the
-    // source of truth, so a missed live frame is recovered on the next GET).
-    state.hub.publish(&id, message_frame(&message));
+        // The Store validates this parent against the same room inside the message transaction.
+        let reply_to_id = req
+            .reply_to_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
 
-    // Best-effort audit — the body NEVER rides the event, only its length.
-    state.audit.emit(AuditEvent::info(
-        "chat.message.send",
-        &actor(&email, &sub),
-        &id,
-        &format!("len={}", body.chars().count()),
-    ));
+        let message = Message {
+            id: format!("msg_{}", now_nanos()),
+            room_id: id.clone(),
+            sender_sub: sub.clone(),
+            sender_email: email.clone(),
+            body: body.to_string(),
+            created_at: now_secs(),
+            edited_at: 0,
+            deleted: false,
+            reply_to_id,
+        };
+        let mention_tokens = parse_mentions(&message.body);
+        let mentioned = state
+            .store
+            .create_message_authorized(&message, &mention_tokens)
+            .await?;
+        // Notification projection is best-effort after the durable transaction. It cannot turn a
+        // persisted send into an ambiguous 5xx.
+        let reply_parent = match message.reply_to_id.as_deref() {
+            Some(parent_id) => match state.store.get_message(parent_id).await {
+                Ok(parent) => parent.filter(|parent| parent.room_id == id),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        room_id = %id,
+                        message_id = %parent_id,
+                        "resolve reply notification context failed"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        spawn_message_notifications(&state, &room, &message, reply_parent.as_ref(), mentioned);
 
-    Ok((StatusCode::CREATED, Json(json!({ "message": message }))).into_response())
+        state.hub.publish(&id, message_frame(&message));
+        state.audit.emit(AuditEvent::info(
+            "chat.message.send",
+            &actor(&email, &sub),
+            &id,
+            &format!("len={}", body.chars().count()),
+        ));
+        Ok::<Message, AppError>(message)
+    }
+    .await;
+
+    match result {
+        Ok(message) => match mode {
+            SendMode::Json => {
+                let message_id = message.id.clone();
+                let created_at = message.created_at;
+                (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "message": message,
+                        "receipt": {
+                            "state": "persisted",
+                            "message_id": message_id,
+                            "created_at": created_at,
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+            SendMode::Form { .. } => {
+                let location = format!(
+                    "/?room={}&receipt_message={}#msg-{}",
+                    url_query_escape(&id),
+                    url_query_escape(&message.id),
+                    url_fragment_escape(&message.id),
+                );
+                Redirect::to(&location).into_response()
+            }
+        },
+        Err(error) => match mode {
+            SendMode::Json => error.into_response(),
+            SendMode::Form { .. } => send_form_error(&id, &req, &form_csrf, &error),
+        },
+    }
 }
 
 /// `POST /api/rooms/{id}/messages/{msg_id}/edit` — the AUTHOR edits their own message body.
@@ -251,38 +355,32 @@ pub async fn send(
 pub async fn edit_message(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, msg_id)): Path<(String, String)>,
-    Json(req): Json<EditReq>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    payload: Result<Json<EditReq>, JsonRejection>,
 ) -> Result<Response, AppError> {
+    let (id, msg_id) = path_or_invalid(path)?;
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
-    require_membership(&state, &id, &sub).await?;
-
-    let existing = require_own_message(&state, &id, &msg_id, &sub).await?;
-    if existing.deleted {
-        return Err(AppError::InvalidRequest("message is deleted".to_string()));
-    }
+    let Json(req) =
+        payload.map_err(|_| AppError::InvalidRequest("invalid JSON body".to_string()))?;
 
     let body = req.body.trim();
     if body.is_empty() {
-        return Err(AppError::InvalidRequest("message body is required".to_string()));
+        return Err(AppError::InvalidRequest(
+            "message body is required".to_string(),
+        ));
     }
     if body.chars().count() > MAX_BODY_CHARS {
-        return Err(AppError::InvalidRequest("message body too long".to_string()));
+        return Err(AppError::InvalidRequest(
+            "message body too long".to_string(),
+        ));
     }
 
     let edited_at = now_secs();
-    state
-        .store
-        .edit_message(&msg_id, body, edited_at)
-        .await?;
-
-    // Re-read so the fan-out frame reflects the persisted row exactly.
     let updated = state
         .store
-        .get_message(&msg_id)
-        .await
-        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
+        .edit_message_authorized(&id, &msg_id, &sub, body, edited_at)
+        .await?;
     state.hub.publish(&id, message_frame(&updated));
 
     state.audit.emit(AuditEvent::info(
@@ -301,21 +399,15 @@ pub async fn edit_message(
 pub async fn delete_message(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, msg_id)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Response, AppError> {
+    let (id, msg_id) = path_or_invalid(path)?;
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
-    require_membership(&state, &id, &sub).await?;
-
-    require_own_message(&state, &id, &msg_id, &sub).await?;
-
-    state.store.delete_message(&msg_id).await?;
-
     let updated = state
         .store
-        .get_message(&msg_id)
-        .await
-        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
+        .delete_message_authorized(&id, &msg_id, &sub)
+        .await?;
     state.hub.publish(&id, message_frame(&updated));
 
     // Destructive action -> `notice` severity (value-free: which message, by whom).
@@ -336,20 +428,14 @@ pub async fn delete_message(
 pub async fn react(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, msg_id)): Path<(String, String)>,
-    Json(req): Json<ReactReq>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    payload: Result<Json<ReactReq>, JsonRejection>,
 ) -> Result<Response, AppError> {
+    let (id, msg_id) = path_or_invalid(path)?;
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
-    require_membership(&state, &id, &sub).await?;
-
-    // The target must exist AND belong to this room (defense in depth: no cross-room reactions).
-    state
-        .store
-        .get_message(&msg_id)
-        .await
-        .filter(|m| m.room_id == id)
-        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
+    let Json(req) =
+        payload.map_err(|_| AppError::InvalidRequest("invalid JSON body".to_string()))?;
 
     let emoji = req.emoji.trim();
     if emoji.is_empty() {
@@ -359,26 +445,33 @@ pub async fn react(
         return Err(AppError::InvalidRequest("emoji too long".to_string()));
     }
 
-    let added = state.store.toggle_reaction(&msg_id, &sub, emoji).await?;
-    let reactions = state.store.list_reactions(&msg_id).await;
-    let mine = state.store.list_user_reactions(&msg_id, &sub).await;
+    let mutation = state
+        .store
+        .toggle_reaction_authorized(&id, &msg_id, &sub, emoji)
+        .await?;
 
     // Fan the new tallies out to everyone watching the room so live chips update in place.
-    state.hub.publish(&id, reaction_frame(&id, &msg_id, &reactions));
+    state
+        .hub
+        .publish(&id, reaction_frame(&id, &msg_id, &mutation.reactions));
 
     // Best-effort audit — the emoji length + toggle direction only, never who-reacted-with-what text.
     state.audit.emit(AuditEvent::info(
         "chat.message.react",
         &actor(&email, &sub),
         &msg_id,
-        &format!("added={} emoji_len={}", added, emoji.chars().count()),
+        &format!(
+            "added={} emoji_len={}",
+            mutation.added,
+            emoji.chars().count()
+        ),
     ));
 
     Ok(Json(json!({
         "message_id": msg_id,
-        "added": added,
-        "reactions": reactions,
-        "mine": mine,
+        "added": mutation.added,
+        "reactions": mutation.reactions,
+        "mine": mutation.mine,
     }))
     .into_response())
 }
@@ -388,41 +481,62 @@ pub async fn react(
 pub async fn reactions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, msg_id)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Response, AppError> {
+    let (id, msg_id) = path_or_invalid(path)?;
     let (sub, _email) = auth::require_user(&headers)?;
-    require_membership(&state, &id, &sub).await?;
-
-    state
+    let projection = state
         .store
-        .get_message(&msg_id)
-        .await
-        .filter(|m| m.room_id == id)
-        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
-
-    let reactions = state.store.list_reactions(&msg_id).await;
-    let mine = state.store.list_user_reactions(&msg_id, &sub).await;
+        .reaction_projection_authorized(&id, &msg_id, &sub)
+        .await?;
     Ok(Json(json!({
         "message_id": msg_id,
-        "reactions": reactions,
-        "mine": mine,
+        "reactions": projection.reactions,
+        "mine": projection.mine,
     }))
     .into_response())
 }
 
-/// `POST /api/rooms/{id}/read` — advance the caller's read cursor (no CSRF; non-destructive).
+/// `POST /api/rooms/{id}/read` — advance the caller's read cursor to a server-owned message
+/// timestamp. The legacy `?at=` value is parsed but never trusted as authority.
 pub async fn read(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(q): Query<ReadQuery>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<ReadQuery>, QueryRejection>,
+    request: axum::extract::Request,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
+    let _legacy = query_or_invalid(query)?;
     let (sub, _email) = auth::require_user(&headers)?;
-    require_membership(&state, &id, &sub).await?;
-
-    let at = q.at.unwrap_or_else(now_secs);
-    state.store.update_last_read(&id, &sub, at).await?;
-    Ok(Json(json!({ "room_id": id, "last_read_at": at })).into_response())
+    let (req, mode) = decode_read_request(&headers, request).await?;
+    let message_id = req.message_id.trim();
+    if message_id.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "message_id is required".to_string(),
+        ));
+    }
+    let message = state
+        .store
+        .update_last_read_authorized(&id, message_id, &sub)
+        .await?;
+    Ok(match mode {
+        ReadMode::Json => Json(json!({
+            "room_id": id,
+            "message_id": message.id,
+            "last_read_at": message.created_at,
+            "last_read_cursor": MessageCursor::from_message(&message).encode(),
+            "persisted": true,
+        }))
+        .into_response(),
+        ReadMode::Form => Redirect::to(&format!(
+            "/?room={}&message={}#msg-{}",
+            url_query_escape(&id),
+            url_query_escape(&message.id),
+            url_fragment_escape(&message.id),
+        ))
+        .into_response(),
+    })
 }
 
 /// `POST /api/rooms/{id}/topic` — set the room's topic. Gated to room admins/mods (reuse the
@@ -430,25 +544,22 @@ pub async fn read(
 pub async fn set_topic(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(req): Json<SetTopicReq>,
+    path: Result<Path<String>, PathRejection>,
+    payload: Result<Json<SetTopicReq>, JsonRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
     // Moderation gate: only admins/mods may edit a room topic (reuses admin_groups()).
     auth::require_admin(&headers)?;
-
-    let room = state
-        .store
-        .get_room(&id)
-        .await
-        .ok_or_else(|| AppError::NotFound("no such room".to_string()))?;
+    let Json(req) =
+        payload.map_err(|_| AppError::InvalidRequest("invalid JSON body".to_string()))?;
 
     let topic = req.topic.trim();
     if topic.chars().count() > MAX_TOPIC_CHARS {
         return Err(AppError::InvalidRequest("topic too long".to_string()));
     }
-    state.store.set_room_topic(&id, topic).await?;
+    let updated = state.store.set_room_topic_authorized(&id, topic).await?;
 
     state.audit.emit(AuditEvent::info(
         "chat.room.topic",
@@ -458,11 +569,6 @@ pub async fn set_topic(
     ));
     tracing::info!(room_id = %id, "room topic set");
 
-    // Re-read so the response reflects the persisted row exactly.
-    let updated = state.store.get_room(&id).await.unwrap_or(Room {
-        topic: topic.to_string(),
-        ..room
-    });
     Ok(Json(json!({ "room": updated })).into_response())
 }
 
@@ -471,25 +577,16 @@ pub async fn set_topic(
 pub async fn pin(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, msg_id)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Response, AppError> {
+    let (id, msg_id) = path_or_invalid(path)?;
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
     auth::require_admin(&headers)?;
-
-    // The target must exist AND belong to this room (no cross-room pins).
-    state
+    let pinned = state
         .store
-        .get_message(&msg_id)
-        .await
-        .filter(|m| m.room_id == id)
-        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
-
-    state
-        .store
-        .pin_message(&id, &msg_id, &sub, now_secs())
+        .pin_message_authorized(&id, &msg_id, &sub, now_secs())
         .await?;
-    let pinned = state.store.list_pinned(&id).await;
 
     state.audit.emit(AuditEvent::notice(
         "chat.message.pin",
@@ -507,14 +604,13 @@ pub async fn pin(
 pub async fn unpin(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, msg_id)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Response, AppError> {
+    let (id, msg_id) = path_or_invalid(path)?;
     let (sub, email) = auth::require_user(&headers)?;
     auth::verify_csrf(&headers)?;
     auth::require_admin(&headers)?;
-
-    state.store.unpin_message(&id, &msg_id).await?;
-    let pinned = state.store.list_pinned(&id).await;
+    let pinned = state.store.unpin_message_authorized(&id, &msg_id).await?;
 
     state.audit.emit(AuditEvent::notice(
         "chat.message.unpin",
@@ -532,11 +628,11 @@ pub async fn unpin(
 pub async fn pinned(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
     let (sub, _email) = auth::require_user(&headers)?;
-    require_membership(&state, &id, &sub).await?;
-    let messages = state.store.list_pinned(&id).await;
+    let messages = state.store.list_pinned_authorized(&id, &sub).await?;
     Ok(Json(json!({ "room_id": id, "messages": messages })).into_response())
 }
 
@@ -544,37 +640,205 @@ pub async fn pinned(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the `@mentions` in `message` against the room's CURRENT members and record one mention
-/// per matched member (never the author themselves). A token matches a member whose email
-/// local-part OR full email equals it (case-insensitive). Best-effort: a store hiccup only warns.
-async fn record_mentions(state: &AppState, message: &Message) -> Vec<Member> {
-    let tokens = parse_mentions(&message.body);
-    if tokens.is_empty() {
-        return Vec::new();
-    }
-    let members = state.store.list_room_members(&message.room_id).await;
-    let mut mentioned = Vec::new();
-    for m in members.iter() {
-        if m.banned || m.user_sub == message.sender_sub {
-            continue;
+const MUTATION_BODY_LIMIT: usize = 128 * 1024;
+
+fn content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or("")
+}
+
+fn is_form_content_type(headers: &HeaderMap) -> bool {
+    content_type(headers).eq_ignore_ascii_case("application/x-www-form-urlencoded")
+}
+
+async fn decode_send_request(
+    headers: &HeaderMap,
+    request: axum::extract::Request,
+) -> Result<(SendReq, SendMode), (AppError, SendReq, String)> {
+    let empty = || SendReq {
+        body: String::new(),
+        reply_to_id: None,
+    };
+    let bytes = to_bytes(request.into_body(), MUTATION_BODY_LIMIT)
+        .await
+        .map_err(|_| {
+            (
+                AppError::InvalidRequest("request body too large".to_string()),
+                empty(),
+                String::new(),
+            )
+        })?;
+    match content_type(headers) {
+        value if value.eq_ignore_ascii_case("application/json") => {
+            auth::verify_csrf(headers).map_err(|error| (error, empty(), String::new()))?;
+            let request = serde_json::from_slice(&bytes).map_err(|_| {
+                (
+                    AppError::InvalidRequest("invalid JSON body".to_string()),
+                    empty(),
+                    String::new(),
+                )
+            })?;
+            Ok((request, SendMode::Json))
         }
-        let email = m.user_email.to_lowercase();
-        let local = email.split('@').next().unwrap_or("");
-        let matched = tokens
-            .iter()
-            .any(|t| t == &email || (!local.is_empty() && t == local));
-        if matched {
-            mentioned.push(m.clone());
-            if let Err(e) = state
-                .store
-                .add_mention(&message.id, &message.room_id, &m.user_sub, message.created_at)
-                .await
-            {
-                tracing::warn!(error = %e, "record mention failed");
+        value if value.eq_ignore_ascii_case("application/x-www-form-urlencoded") => {
+            let mut fields =
+                decode_form(&bytes).map_err(|error| (error, empty(), String::new()))?;
+            let csrf = fields.remove("csrf").unwrap_or_default();
+            let request = SendReq {
+                body: fields.remove("body").unwrap_or_default(),
+                reply_to_id: fields
+                    .remove("reply_to_id")
+                    .filter(|value| !value.trim().is_empty()),
+            };
+            if let Err(error) = auth::verify_csrf_field(headers, &csrf) {
+                return Err((error, request, String::new()));
+            }
+            Ok((request, SendMode::Form { csrf }))
+        }
+        _ => Err((
+            AppError::InvalidRequest(
+                "content type must be application/json or form-urlencoded".to_string(),
+            ),
+            empty(),
+            String::new(),
+        )),
+    }
+}
+
+async fn decode_read_request(
+    headers: &HeaderMap,
+    request: axum::extract::Request,
+) -> Result<(ReadReq, ReadMode), AppError> {
+    let bytes = to_bytes(request.into_body(), MUTATION_BODY_LIMIT)
+        .await
+        .map_err(|_| AppError::InvalidRequest("request body too large".to_string()))?;
+    match content_type(headers) {
+        value if value.eq_ignore_ascii_case("application/json") => {
+            auth::verify_csrf(headers)?;
+            let request = serde_json::from_slice(&bytes)
+                .map_err(|_| AppError::InvalidRequest("invalid JSON body".to_string()))?;
+            Ok((request, ReadMode::Json))
+        }
+        value if value.eq_ignore_ascii_case("application/x-www-form-urlencoded") => {
+            let mut fields = decode_form(&bytes)?;
+            let csrf = fields.remove("csrf").unwrap_or_default();
+            auth::verify_csrf_field(headers, &csrf)?;
+            Ok((
+                ReadReq {
+                    message_id: fields.remove("message_id").unwrap_or_default(),
+                },
+                ReadMode::Form,
+            ))
+        }
+        _ => Err(AppError::InvalidRequest(
+            "content type must be application/json or form-urlencoded".to_string(),
+        )),
+    }
+}
+
+fn decode_form(bytes: &[u8]) -> Result<HashMap<String, String>, AppError> {
+    let raw = std::str::from_utf8(bytes)
+        .map_err(|_| AppError::InvalidRequest("form body must be UTF-8".to_string()))?;
+    let mut fields = HashMap::new();
+    for pair in raw.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_form_component(key)?;
+        let value = decode_form_component(value)?;
+        fields.insert(key, value);
+    }
+    Ok(fields)
+}
+
+fn decode_form_component(value: &str) -> Result<String, AppError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let high = decode_hex(bytes[index + 1])
+                    .ok_or_else(|| AppError::InvalidRequest("invalid form encoding".to_string()))?;
+                let low = decode_hex(bytes[index + 2])
+                    .ok_or_else(|| AppError::InvalidRequest("invalid form encoding".to_string()))?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            b'%' => {
+                return Err(AppError::InvalidRequest(
+                    "invalid form encoding".to_string(),
+                ));
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
             }
         }
     }
-    mentioned
+    String::from_utf8(decoded)
+        .map_err(|_| AppError::InvalidRequest("form body must be UTF-8".to_string()))
+}
+
+fn decode_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_message_cursor(value: Option<&str>) -> Result<Option<MessageCursor>, AppError> {
+    value
+        .map(|value| {
+            MessageCursor::decode(value)
+                .ok_or_else(|| AppError::InvalidRequest("invalid query parameters".to_string()))
+        })
+        .transpose()
+}
+
+fn send_form_error(room_id: &str, request: &SendReq, csrf: &str, error: &AppError) -> Response {
+    let reply = request.reply_to_id.as_deref().unwrap_or("");
+    let (title, message) = match error {
+        AppError::Unavailable(_) | AppError::Internal(_) => (
+            "Send uncertain",
+            "Send uncertain — your text is preserved; check the tape before retrying".to_string(),
+        ),
+        _ => ("Not sent", error.safe_message()),
+    };
+    let recovery = match error {
+        AppError::InvalidRequest(_) if !csrf.is_empty() => format!(
+            r#"<form method="post" action="/api/rooms/{room}/messages"><textarea name="body" maxlength="{max}">{body}</textarea><input type="hidden" name="reply_to_id" value="{reply}"><input type="hidden" name="csrf" value="{csrf}"><button type="submit">Correct and send</button></form>"#,
+            room = crate::handlers::esc(room_id),
+            max = MAX_BODY_CHARS,
+            body = crate::handlers::esc(&request.body),
+            reply = crate::handlers::esc(reply),
+            csrf = crate::handlers::esc(csrf),
+        ),
+        AppError::CsrfInvalid | AppError::Unauthorized(_) => format!(
+            r#"<p>Reload the tape to recover a valid request token. Your text remains below for copying.</p><textarea readonly>{}</textarea>"#,
+            crate::handlers::esc(&request.body),
+        ),
+        _ => format!(
+            r#"<p>Your text remains below for checking before any later action.</p><textarea readonly>{}</textarea>"#,
+            crate::handlers::esc(&request.body),
+        ),
+    };
+    let page = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Murmur</title></head><body><main><h1>{title}</h1><p role="alert">{message}</p>{recovery}<a href="/?room={room}">Back to tape</a></main></body></html>"#,
+        title = crate::handlers::esc(title),
+        message = crate::handlers::esc(&message),
+        recovery = recovery,
+        room = crate::handlers::esc(room_id),
+    );
+    (error.status_code(), Html(page)).into_response()
 }
 
 fn spawn_message_notifications(
@@ -611,32 +875,44 @@ fn spawn_message_notifications(
         }
 
         if room.kind == "dm" {
-            let members = store.list_room_members(&room.id).await;
-            for member in members.into_iter().filter(|m| !m.banned) {
-                notify_once(
-                    &notifier,
-                    &mut notified,
-                    &message.sender_sub,
-                    &member.user_sub,
-                    &dm_title(&sender),
-                    &body,
-                    &url,
-                );
+            match store.list_room_members(&room.id).await {
+                Ok(members) => {
+                    for member in members.into_iter().filter(|m| !m.banned) {
+                        notify_once(
+                            &notifier,
+                            &mut notified,
+                            &message.sender_sub,
+                            &member.user_sub,
+                            &dm_title(&sender),
+                            &body,
+                            &url,
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, room_id = %room.id, "resolve DM notifications failed");
+                }
             }
         }
 
         if let Some(parent_id) = reply_parent_id {
-            let participants = store.list_thread_participants(&room.id, &parent_id).await;
-            for person in participants {
-                notify_person_once(
-                    &notifier,
-                    &mut notified,
-                    &message.sender_sub,
-                    &person,
-                    &thread_title(&sender, &room),
-                    &body,
-                    &url,
-                );
+            match store.list_thread_participants(&room.id, &parent_id).await {
+                Ok(participants) => {
+                    for person in participants {
+                        notify_person_once(
+                            &notifier,
+                            &mut notified,
+                            &message.sender_sub,
+                            &person,
+                            &thread_title(&sender, &room),
+                            &body,
+                            &url,
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, room_id = %room.id, "resolve thread notifications failed");
+                }
             }
         }
     });
@@ -741,39 +1017,26 @@ fn url_query_escape(s: &str) -> String {
     out
 }
 
+fn url_fragment_escape(s: &str) -> String {
+    url_query_escape(s)
+}
+
 /// Enforce that `sub` is a member of `room_id`, else `Forbidden` (or `NotFound` for a missing
 /// room). Defense in depth behind the gateway: SSO authenticates, membership authorizes.
 async fn require_membership(state: &AppState, room_id: &str, sub: &str) -> Result<Room, AppError> {
-    let room = state
+    state
         .store
-        .get_room(room_id)
+        .authorize_room_read(room_id, sub, false)
         .await
-        .ok_or_else(|| AppError::NotFound("no such room".to_string()))?;
-    if !state.store.is_member(room_id, sub).await {
-        return Err(AppError::Forbidden("not a member of this room".to_string()));
-    }
-    Ok(room)
+        .map_err(AppError::from)
 }
 
-/// Fetch a message and enforce that it lives in `room_id` AND was authored by `sub`
-/// (`created_by == gateway subject`). `NotFound` for a missing/other-room message; `Forbidden`
-/// when the caller is not the author. Returns the message so callers can inspect its state.
-async fn require_own_message(
-    state: &AppState,
-    room_id: &str,
-    msg_id: &str,
-    sub: &str,
-) -> Result<Message, AppError> {
-    let message = state
-        .store
-        .get_message(msg_id)
-        .await
-        .filter(|m| m.room_id == room_id)
-        .ok_or_else(|| AppError::NotFound("no such message".to_string()))?;
-    if message.sender_sub != sub {
-        return Err(AppError::Forbidden("not the message author".to_string()));
+fn require_active_room(room: &Room) -> Result<(), AppError> {
+    if room.archived {
+        Err(AppError::RoomArchived)
+    } else {
+        Ok(())
     }
-    Ok(message)
 }
 
 /// Prefer the email as the human-readable actor; fall back to the subject id.
@@ -805,7 +1068,10 @@ mod tests {
     fn notification_helper_shapes_are_stable() {
         let lobby = room("room one/alpha", "#lobby", "room");
         assert_eq!(room_label(&lobby), "#lobby");
-        assert_eq!(mention_title("alice@hf", &lobby), "alice@hf 在 #lobby 提到了你");
+        assert_eq!(
+            mention_title("alice@hf", &lobby),
+            "alice@hf 在 #lobby 提到了你"
+        );
         assert_eq!(
             message_url(&lobby.id, "msg 1/2"),
             "https://chat.w33d.xyz/?room=room%20one%2Falpha&message=msg%201%2F2"
@@ -824,5 +1090,26 @@ mod tests {
         assert_eq!(mention_title("alice@hf", &dm), "alice@hf 在私信中提到了你");
         assert_eq!(dm_title("alice@hf"), "alice@hf 发来一条私信");
         assert_eq!(thread_title("alice@hf", &dm), "alice@hf 回复了你的私信线程");
+    }
+
+    #[tokio::test]
+    async fn form_store_failure_is_uncertain_and_never_offers_retry() {
+        let response = send_form_error(
+            "lobby",
+            &SendReq {
+                body: "preserve this exact draft".to_string(),
+                reply_to_id: None,
+            },
+            "valid-token",
+            &AppError::Unavailable("raw backend detail".to_string()),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body
+            .contains("Send uncertain — your text is preserved; check the tape before retrying"));
+        assert!(body.contains("preserve this exact draft"));
+        assert!(!body.contains("raw backend detail"));
+        assert!(!body.contains(r#"<button type="submit">"#));
     }
 }

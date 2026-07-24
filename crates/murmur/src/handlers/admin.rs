@@ -14,21 +14,28 @@
 //! mutation emits an [`AuditEvent`] (`notice` for the destructive ones). All interpolated user
 //! input is HTML-escaped.
 
-use axum::extract::{Form, Path, State};
+use axum::extract::{
+    rejection::{FormRejection, PathRejection},
+    Form, Path, State,
+};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::audit::AuditEvent;
 use crate::auth;
-use crate::config::MESSAGE_PAGE_LIMIT;
+use crate::config::{LOBBY_ID, MESSAGE_PAGE_LIMIT};
 use crate::error::AppError;
-use crate::handlers::{app_css, esc, fmt_time, topbar};
+use crate::handlers::{
+    app_css, esc, fmt_time, form_or_invalid, path_or_invalid, render_template, topbar,
+};
 use crate::store::{Member, Message, Room};
 use crate::AppState;
 
 const ADMIN_ROOMS_HTML: &str = include_str!("../../templates/admin_rooms.html");
 const ADMIN_ROOM_HTML: &str = include_str!("../../templates/admin_room.html");
+const DELETE_TOKEN_TTL_SECS: i64 = 5 * 60;
 
 /// Hidden CSRF field carried by every admin form POST (double-submit vs. the cookie).
 #[derive(Debug, Deserialize)]
@@ -37,16 +44,29 @@ pub struct CsrfForm {
     pub csrf: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeleteRoomForm {
+    #[serde(default)]
+    pub csrf: String,
+    #[serde(default)]
+    pub confirm: String,
+    #[serde(default)]
+    pub consequence_token: String,
+}
+
 // ---------------------------------------------------------------------------
 // GET pages
 // ---------------------------------------------------------------------------
 
 /// `GET /admin` — list ALL rooms with archive/delete controls.
-pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !auth::is_admin(&headers) {
-        return forbidden_page();
+pub async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    if auth::require_admin(&headers).is_err() {
+        return Ok(forbidden_page());
     }
-    let rooms = state.store.list_all_rooms().await;
+    let rooms = state.store.list_all_rooms().await?;
     let (csrf, set_cookie) = auth::ensure_csrf(&headers);
     let theme = odyssey::resolve_theme(
         headers
@@ -54,66 +74,135 @@ pub async fn index(State(state): State<AppState>, headers: HeaderMap) -> Respons
             .and_then(|v| v.to_str().ok()),
     );
 
-    let page = ADMIN_ROOMS_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{THEME}}", odyssey::html_theme_attr(theme))
-        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
-        .replace("{{TOPBAR}}", &topbar("Admin", &auth::display_email(&headers), theme))
-        .replace("{{ROOMS}}", &render_room_rows(&rooms, &csrf));
+    let topbar_html = topbar("Admin", &auth::display_email(&headers), theme);
+    let room_rows_html = render_room_rows(&rooms, &csrf);
+    let page = match render_template(
+        ADMIN_ROOMS_HTML,
+        &[
+            ("CSS", app_css()),
+            ("THEME", odyssey::html_theme_attr(theme)),
+            ("COLOR_SCHEME", odyssey::color_scheme_meta(theme)),
+            ("TOPBAR", &topbar_html),
+            ("ROOMS", &room_rows_html),
+        ],
+    ) {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::error!(error = %error, "admin rooms template rendering failed");
+            return Err(AppError::Unavailable(
+                "admin rendering unavailable".to_string(),
+            ));
+        }
+    };
 
-    html_with_cookie(page, set_cookie)
+    Ok(html_with_cookie(page, set_cookie))
 }
 
 /// `GET /admin/rooms/{id}` — one room's members + messages, with per-row controls.
 pub async fn room_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
-    if !auth::is_admin(&headers) {
-        return forbidden_page();
+    path: Result<Path<String>, PathRejection>,
+) -> Result<Response, AppError> {
+    if auth::require_admin(&headers).is_err() {
+        return Ok(forbidden_page());
     }
-    let Some(room) = state.store.get_room(&id).await else {
-        return (StatusCode::NOT_FOUND, Html(not_found_page("no such room"))).into_response();
+    let id = path_or_invalid(path)?;
+    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+    let (actor_sub, _actor_email) = auth::require_user(&headers)?;
+    let now = crate::now_secs();
+    let (room, consequence_token) = if id == LOBBY_ID {
+        let Some(room) = state.store.get_room(&id).await? else {
+            return Ok(
+                (StatusCode::NOT_FOUND, Html(not_found_page("no such room"))).into_response(),
+            );
+        };
+        (room, String::new())
+    } else {
+        let token = auth::new_csrf_token();
+        let room = state
+            .store
+            .issue_room_delete_token(
+                &digest_binding(&token),
+                &id,
+                &actor_sub,
+                &digest_binding(&csrf),
+                now,
+                now + DELETE_TOKEN_TTL_SECS,
+            )
+            .await?;
+        (room, token)
     };
-    let members = state.store.list_room_members(&id).await;
+    let members = state.store.list_room_members(&id).await?;
     let messages = state
         .store
         .list_messages(&id, None, MESSAGE_PAGE_LIMIT)
-        .await;
-    let (csrf, set_cookie) = auth::ensure_csrf(&headers);
+        .await?;
     let theme = odyssey::resolve_theme(
         headers
             .get(axum::http::header::COOKIE)
             .and_then(|v| v.to_str().ok()),
     );
 
-    let page = ADMIN_ROOM_HTML
-        .replace("{{CSS}}", app_css())
-        .replace("{{THEME}}", odyssey::html_theme_attr(theme))
-        .replace("{{COLOR_SCHEME}}", odyssey::color_scheme_meta(theme))
-        .replace("{{TOPBAR}}", &topbar("Admin", &auth::display_email(&headers), theme))
-        .replace("{{ROOM_TITLE}}", &esc(&room.name))
-        .replace("{{ROOM_ID}}", &esc(&room.id))
-        .replace("{{MEMBERS}}", &render_member_rows(&id, &members, &csrf))
-        .replace("{{MESSAGES}}", &render_message_rows(&messages, &csrf));
+    let topbar_html = topbar("Admin", &auth::display_email(&headers), theme);
+    let room_title_html = esc(&room.name);
+    let room_id_html = esc(&room.id);
+    let consequence_html = render_delete_consequence(&room, &csrf, &consequence_token);
+    let members_html = render_member_rows(&id, &members, &csrf);
+    let messages_html = render_message_rows(&messages, &csrf);
+    let page = match render_template(
+        ADMIN_ROOM_HTML,
+        &[
+            ("CSS", app_css()),
+            ("THEME", odyssey::html_theme_attr(theme)),
+            ("COLOR_SCHEME", odyssey::color_scheme_meta(theme)),
+            ("TOPBAR", &topbar_html),
+            ("ROOM_TITLE", &room_title_html),
+            ("ROOM_ID", &room_id_html),
+            ("CONSEQUENCE", &consequence_html),
+            ("MEMBERS", &members_html),
+            ("MESSAGES", &messages_html),
+        ],
+    ) {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::error!(error = %error, "admin room template rendering failed");
+            return Err(AppError::Unavailable(
+                "admin rendering unavailable".to_string(),
+            ));
+        }
+    };
 
-    html_with_cookie(page, set_cookie)
+    Ok(html_with_cookie(page, set_cookie))
 }
 
 // ---------------------------------------------------------------------------
 // POST actions (admin-gated + CSRF-checked)
 // ---------------------------------------------------------------------------
 
-/// `POST /admin/rooms/{id}/archive` — soft-archive a room (drops out of users' room lists).
+/// `POST /admin/rooms/{id}/archive` — make a room authorized-reader-visible but read-only.
 pub async fn archive_room(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Form(form): Form<CsrfForm>,
+    path: Result<Path<String>, PathRejection>,
+    form: Result<Form<CsrfForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    auth::require_admin(&headers)?;
+    let id = path_or_invalid(path)?;
+    let form = form_or_invalid(form)?;
     guard(&headers, &form)?;
+    if id == LOBBY_ID {
+        return Err(AppError::Conflict(
+            "the lobby cannot be archived".to_string(),
+        ));
+    }
+    state
+        .store
+        .get_room(&id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("resource unavailable".to_string()))?;
     state.store.set_room_archived(&id, true).await?;
+    state.hub.invalidate(&id);
     state.audit.emit(AuditEvent::notice(
         "chat.admin.room.archive",
         &actor(&headers),
@@ -128,18 +217,45 @@ pub async fn archive_room(
 pub async fn delete_room(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Form(form): Form<CsrfForm>,
+    path: Result<Path<String>, PathRejection>,
+    form: Result<Form<DeleteRoomForm>, FormRejection>,
 ) -> Result<Response, AppError> {
-    guard(&headers, &form)?;
-    state.store.delete_room(&id).await?;
-    state.audit.emit(AuditEvent::notice(
-        "chat.admin.room.delete",
-        &actor(&headers),
-        &id,
-        "hard-deleted",
-    ));
-    tracing::info!(room_id = %id, "admin deleted room");
+    auth::require_admin(&headers)?;
+    let (actor_sub, _actor_email) = auth::require_user(&headers)?;
+    let id = path_or_invalid(path)?;
+    let form = form_or_invalid(form)?;
+    auth::verify_csrf_field(&headers, &form.csrf)?;
+    if form.confirm != "delete" {
+        return Err(AppError::InvalidRequest(
+            "confirm must equal delete".to_string(),
+        ));
+    }
+    if id == LOBBY_ID {
+        return Err(AppError::Conflict(
+            "the lobby cannot be deleted".to_string(),
+        ));
+    }
+    if !valid_consequence_token(&form.consequence_token) {
+        return Err(AppError::Conflict(
+            "delete authorization invalid".to_string(),
+        ));
+    }
+    let consequence = state
+        .store
+        .delete_room_with_token(
+            &id,
+            &digest_binding(&form.consequence_token),
+            &actor_sub,
+            &digest_binding(&form.csrf),
+            crate::now_secs(),
+        )
+        .await?;
+    state.hub.invalidate(&id);
+    tracing::info!(
+        room_id = %id,
+        audit_consequence_id = %consequence.id,
+        "admin deleted room with durable audit consequence"
+    );
     Ok(Redirect::to("/admin").into_response())
 }
 
@@ -147,11 +263,15 @@ pub async fn delete_room(
 pub async fn remove_member(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, user_sub)): Path<(String, String)>,
-    Form(form): Form<CsrfForm>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    form: Result<Form<CsrfForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    auth::require_admin(&headers)?;
+    let (id, user_sub) = path_or_invalid(path)?;
+    let form = form_or_invalid(form)?;
     guard(&headers, &form)?;
     state.store.remove_member(&id, &user_sub).await?;
+    state.hub.invalidate(&id);
     state.audit.emit(AuditEvent::notice(
         "chat.admin.member.remove",
         &actor(&headers),
@@ -166,11 +286,15 @@ pub async fn remove_member(
 pub async fn ban_member(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((id, user_sub)): Path<(String, String)>,
-    Form(form): Form<CsrfForm>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    form: Result<Form<CsrfForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    auth::require_admin(&headers)?;
+    let (id, user_sub) = path_or_invalid(path)?;
+    let form = form_or_invalid(form)?;
     guard(&headers, &form)?;
     state.store.ban_member(&id, &user_sub).await?;
+    state.hub.invalidate(&id);
     state.audit.emit(AuditEvent::notice(
         "chat.admin.member.ban",
         &actor(&headers),
@@ -185,12 +309,15 @@ pub async fn ban_member(
 pub async fn redact_message(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(msg_id): Path<String>,
-    Form(form): Form<CsrfForm>,
+    path: Result<Path<String>, PathRejection>,
+    form: Result<Form<CsrfForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    auth::require_admin(&headers)?;
+    let msg_id = path_or_invalid(path)?;
+    let form = form_or_invalid(form)?;
     guard(&headers, &form)?;
     // Look up the room to redirect back to the detail page (also 404s a stray id gracefully).
-    let room_id = state.store.get_message(&msg_id).await.map(|m| m.room_id);
+    let room_id = state.store.get_message(&msg_id).await?.map(|m| m.room_id);
     state.store.redact_message(&msg_id).await?;
     state.audit.emit(AuditEvent::notice(
         "chat.admin.message.redact",
@@ -224,37 +351,44 @@ fn actor(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "admin".to_string())
 }
 
-/// One row per room in the `/admin` table: name (linking to detail), kind, creator, status, and
-/// archive/delete forms.
+/// One row per room in the `/admin` table. Hard deletion is deliberately a link to the detail
+/// page's consequence section; the destructive POST remains a second, CSRF-protected step.
 fn render_room_rows(rooms: &[Room], csrf: &str) -> String {
     if rooms.is_empty() {
         return r#"<tr><td colspan="5" class="empty">No rooms.</td></tr>"#.to_string();
     }
     let mut out = String::new();
     for r in rooms {
-        let status = if r.archived {
-            r#"<span class="pill pill-warn">archived</span>"#
+        let status = if r.id == LOBBY_ID {
+            "System room"
+        } else if r.archived {
+            "Archived"
         } else {
-            r#"<span class="pill pill-ok">active</span>"#
+            "Active"
+        };
+        let actions = if r.id == LOBBY_ID {
+            String::new()
+        } else {
+            format!(
+                r#"<div class="cut-sheet__actions">{archive}<a class="cut-link" href="/admin/rooms/{id}#cut-delete">Delete…</a></div>"#,
+                archive = archive_form(&r.id, r.archived, csrf),
+                id = esc(&r.id),
+            )
         };
         out.push_str(&format!(
             r#"<tr>
-  <td><a class="btn-link" href="/admin/rooms/{id}">{name}</a><div class="mono admin__sub">{id}</div></td>
-  <td>{kind}</td>
-  <td>{creator}</td>
-  <td>{status}</td>
-  <td class="admin__col-actions"><div class="admin__actions">
-    {archive}
-    <form method="post" action="/admin/rooms/{id}/delete" onsubmit="return confirm('Delete this room and all its messages?')">{csrf_input}<button class="btn btn-danger btn-sm" type="submit">Delete</button></form>
-  </div></td>
+  <td data-label="Room"><a class="cut-sheet__room" href="/admin/rooms/{id}">{name}</a><span class="mono cut-sheet__id">{id}</span></td>
+  <td data-label="Kind">{kind}</td>
+  <td data-label="Created by">{creator}</td>
+  <td data-label="Status"><span class="cut-sheet__state">{status}</span></td>
+  <td data-label="Actions">{actions}</td>
 </tr>"#,
             id = esc(&r.id),
             name = esc(&r.name),
             kind = esc(&r.kind),
             creator = esc(&r.created_by),
             status = status,
-            archive = archive_form(&r.id, r.archived, csrf),
-            csrf_input = csrf_input(csrf),
+            actions = actions,
         ));
     }
     out
@@ -268,11 +402,45 @@ fn archive_form(room_id: &str, archived: bool, csrf: &str) -> String {
         String::new()
     } else {
         format!(
-            r#"<form method="post" action="/admin/rooms/{id}/archive">{csrf}<button class="btn btn-secondary btn-sm" type="submit">Archive</button></form>"#,
+            r#"<form method="post" action="/admin/rooms/{id}/archive">{csrf}<button type="submit">Archive</button></form>"#,
             id = esc(room_id),
             csrf = csrf_input(csrf),
         )
     }
+}
+
+fn render_delete_consequence(room: &Room, csrf: &str, consequence_token: &str) -> String {
+    if room.id == LOBBY_ID {
+        return String::new();
+    }
+    format!(
+        r#"<section class="consequence" id="cut-delete" aria-labelledby="cut-delete-title">
+  <h2 class="consequence__title" id="cut-delete-title"><span class="consequence__glyph" aria-hidden="true">&#9986;</span>Delete this room</h2>
+  <p class="consequence__scope">Permanently deletes <b>{name}</b> (<span class="mono">{id}</span>) — every message, member, reaction, pin, and mention. <b>This cannot be undone.</b></p>
+  <form class="consequence__form" method="post" action="/admin/rooms/{id}/delete">
+    <input type="hidden" name="confirm" value="delete">
+    <input type="hidden" name="consequence_token" value="{consequence_token}">
+    {csrf}
+    <button class="cut-btn" type="submit">Delete permanently</button>
+    <a class="consequence__cancel" href="/admin/rooms/{id}">Cancel</a>
+  </form>
+</section>"#,
+        name = esc(&room.name),
+        id = esc(&room.id),
+        consequence_token = esc(consequence_token),
+        csrf = csrf_input(csrf),
+    )
+}
+
+fn digest_binding(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn valid_consequence_token(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// One row per member: email, subject, status, and remove/ban forms.
@@ -282,16 +450,12 @@ fn render_member_rows(room_id: &str, members: &[Member], csrf: &str) -> String {
     }
     let mut out = String::new();
     for m in members {
-        let status = if m.banned {
-            r#"<span class="pill pill-down">banned</span>"#
-        } else {
-            r#"<span class="pill pill-ok">member</span>"#
-        };
+        let status = if m.banned { "Banned" } else { "Member" };
         let ban = if m.banned {
             String::new()
         } else {
             format!(
-                r#"<form method="post" action="/admin/rooms/{room}/members/{sub}/ban">{csrf}<button class="btn btn-danger btn-sm" type="submit">Ban</button></form>"#,
+                r#"<form method="post" action="/admin/rooms/{room}/members/{sub}/ban">{csrf}<button class="cut-btn" type="submit">Ban</button></form>"#,
                 room = esc(room_id),
                 sub = esc(&m.user_sub),
                 csrf = csrf_input(csrf),
@@ -299,11 +463,11 @@ fn render_member_rows(room_id: &str, members: &[Member], csrf: &str) -> String {
         };
         out.push_str(&format!(
             r#"<tr>
-  <td>{email}</td>
-  <td class="mono">{sub}</td>
-  <td>{status}</td>
-  <td class="admin__col-actions"><div class="admin__actions">
-    <form method="post" action="/admin/rooms/{room}/members/{sub}/remove">{csrf}<button class="btn btn-secondary btn-sm" type="submit">Remove</button></form>
+  <td data-label="Email">{email}</td>
+  <td data-label="Subject" class="mono">{sub}</td>
+  <td data-label="Status">{status}</td>
+  <td data-label="Actions"><div class="cut-sheet__actions">
+    <form method="post" action="/admin/rooms/{room}/members/{sub}/remove">{csrf}<button type="submit">Remove</button></form>
     {ban}
   </div></td>
 </tr>"#,
@@ -327,16 +491,23 @@ fn render_message_rows(messages: &[Message], csrf: &str) -> String {
     let mut out = String::new();
     for m in messages {
         let (body_cell, action) = if m.deleted {
-            let label = if m.body.is_empty() { "[deleted]" } else { m.body.as_str() };
+            let label = if m.body.is_empty() {
+                "[deleted]"
+            } else {
+                m.body.as_str()
+            };
             (
                 format!(r#"<span class="msg__deleted">{}</span>"#, esc(label)),
                 String::new(),
             )
         } else {
             (
-                format!(r#"<span class="admin__body">{}</span>"#, esc(&preview(&m.body))),
                 format!(
-                    r#"<form method="post" action="/admin/messages/{id}/redact">{csrf}<button class="btn btn-danger btn-sm" type="submit">Redact</button></form>"#,
+                    r#"<span class="admin__body">{}</span>"#,
+                    esc(&preview(&m.body))
+                ),
+                format!(
+                    r#"<form method="post" action="/admin/messages/{id}/redact">{csrf}<button class="cut-btn" type="submit">Redact</button></form>"#,
                     id = esc(&m.id),
                     csrf = csrf_input(csrf),
                 ),
@@ -344,10 +515,10 @@ fn render_message_rows(messages: &[Message], csrf: &str) -> String {
         };
         out.push_str(&format!(
             r#"<tr>
-  <td>{time}</td>
-  <td>{author}</td>
-  <td>{body}</td>
-  <td class="admin__col-actions"><div class="admin__actions">{action}</div></td>
+  <td data-label="Time">{time}</td>
+  <td data-label="Author">{author}</td>
+  <td data-label="Body">{body}</td>
+  <td data-label="Actions"><div class="cut-sheet__actions">{action}</div></td>
 </tr>"#,
             time = esc(&fmt_time(m.created_at)),
             author = esc(&m.sender_email),

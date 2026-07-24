@@ -26,7 +26,12 @@ fn get_auth(path: &str, sub: &str, email: &str, groups: Option<&str>) -> Request
 }
 
 /// JSON POST (the dashboard API path: header-based CSRF).
-fn post_json(path: &str, json: &str, auth: (&str, &str), csrf_header: Option<&str>) -> Request<Body> {
+fn post_json(
+    path: &str,
+    json: &str,
+    auth: (&str, &str),
+    csrf_header: Option<&str>,
+) -> Request<Body> {
     let mut b = Request::builder()
         .method("POST")
         .uri(path)
@@ -84,6 +89,13 @@ fn extract_id(body: &str) -> String {
     body[start..end].to_string()
 }
 
+fn extract_input_value(body: &str, name: &str) -> String {
+    let marker = format!(r#"name="{name}" value=""#);
+    let start = body.find(&marker).expect("input in body") + marker.len();
+    let end = body[start..].find('"').expect("input value terminator") + start;
+    body[start..end].to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Gate
 // ---------------------------------------------------------------------------
@@ -97,23 +109,41 @@ async fn admin_gate_allows_only_admins() {
     assert_eq!(status, StatusCode::FORBIDDEN, "no groups -> 403");
 
     // Signed-in with an unrelated group -> 403.
-    let (status, _) = call(&state, get_auth("/admin", "u_x", "x@hf", Some("readers,writers"))).await;
+    let (status, _) = call(
+        &state,
+        get_auth("/admin", "u_x", "x@hf", Some("readers,writers")),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "non-admin group -> 403");
 
     // `admins` -> 200.
     let (status, body) = call(&state, get_auth("/admin", "u_a", "a@hf", Some("admins"))).await;
     assert_eq!(status, StatusCode::OK, "admins -> 200");
-    assert!(body.contains("Rooms"), "admin panel renders");
+    assert!(
+        body.contains(r#"id="cutout-title">Cutout Bay"#),
+        "admin panel renders"
+    );
 
     // `infra-admins` (with whitespace) -> 200.
-    let (status, _) = call(&state, get_auth("/admin", "u_a", "a@hf", Some("dev, infra-admins"))).await;
+    let (status, _) = call(
+        &state,
+        get_auth("/admin", "u_a", "a@hf", Some("dev, infra-admins")),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "infra-admins -> 200");
 
     // Delegated admin: the product group `chat-admins` also unlocks the panel (a scoped operator
     // gets chat moderation without global admin). Default group; overridable via MURMUR_ADMIN_GROUP.
-    let (status, body) = call(&state, get_auth("/admin", "u_d", "d@hf", Some("chat-admins"))).await;
+    let (status, body) = call(
+        &state,
+        get_auth("/admin", "u_d", "d@hf", Some("chat-admins")),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "chat-admins -> 200");
-    assert!(body.contains("Rooms"), "delegated admin sees the panel");
+    assert!(
+        body.contains(r#"id="cutout-title">Cutout Bay"#),
+        "delegated admin sees the panel"
+    );
 }
 
 #[tokio::test]
@@ -123,26 +153,44 @@ async fn admin_post_requires_admin_and_csrf() {
     // Non-admin POST -> 403 (gate runs before CSRF).
     let (status, _) = call(
         &state,
-        post_form("/admin/rooms/lobby/archive", ("u_x", "x@hf"), Some("readers"), true, Some(CSRF)),
+        post_form(
+            "/admin/rooms/lobby/archive",
+            ("u_x", "x@hf"),
+            Some("readers"),
+            true,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "non-admin POST -> 403");
 
-    // Admin POST but missing CSRF field -> 401.
+    // Admin POST but missing CSRF field -> 403.
     let (status, _) = call(
         &state,
-        post_form("/admin/rooms/lobby/archive", ("u_a", "a@hf"), Some("admins"), true, None),
+        post_form(
+            "/admin/rooms/lobby/archive",
+            ("u_a", "a@hf"),
+            Some("admins"),
+            true,
+            None,
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "missing CSRF -> 401");
+    assert_eq!(status, StatusCode::FORBIDDEN, "missing CSRF -> 403");
 
-    // Admin POST, CSRF field present but no cookie -> 401.
+    // Admin POST, CSRF field present but no cookie -> 403.
     let (status, _) = call(
         &state,
-        post_form("/admin/rooms/lobby/archive", ("u_a", "a@hf"), Some("admins"), false, Some(CSRF)),
+        post_form(
+            "/admin/rooms/lobby/archive",
+            ("u_a", "a@hf"),
+            Some("admins"),
+            false,
+            Some(CSRF),
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "no CSRF cookie -> 401");
+    assert_eq!(status, StatusCode::FORBIDDEN, "no CSRF cookie -> 403");
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +205,12 @@ async fn admin_archive_then_delete_room() {
     // Bob creates a room (and is auto-joined).
     let (status, body) = call(
         &state,
-        post_json("/api/rooms", r#"{"name":"proj","kind":"room"}"#, bob, Some(CSRF)),
+        post_json(
+            "/api/rooms",
+            r#"{"name":"proj","kind":"room"}"#,
+            bob,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -168,22 +221,64 @@ async fn admin_archive_then_delete_room() {
     assert!(list.contains("proj"), "room in Bob's list");
     let (_, panel) = call(&state, get_auth("/admin", "u_a", "a@hf", Some("admins"))).await;
     assert!(panel.contains(&room_id), "room in admin panel");
+    assert!(panel.contains(&format!("/admin/rooms/{room_id}#cut-delete")));
+    assert!(!panel.contains(&format!(r#"action="/admin/rooms/{room_id}/delete""#)));
+    let (_, detail) = call(&state, {
+        let mut request = get_auth(
+            &format!("/admin/rooms/{room_id}"),
+            "u_a",
+            "a@hf",
+            Some("admins"),
+        );
+        request.headers_mut().insert(
+            header::COOKIE,
+            format!("__Host-csrf={CSRF}").parse().unwrap(),
+        );
+        request
+    })
+    .await;
+    assert!(detail.contains(r#"id="cut-delete""#));
+    assert!(detail.contains(r#"name="confirm" value="delete""#));
+    let consequence_token = extract_input_value(&detail, "consequence_token");
+    assert_eq!(consequence_token.len(), 64, "one-time token is CSPRNG hex");
 
-    // Admin archives it -> 303, and it drops out of Bob's active list.
+    // Admin archives it -> 303, and it remains visible as an authorized read-only room.
     let (status, _) = call(
         &state,
-        post_form(&format!("/admin/rooms/{room_id}/archive"), ("u_a", "a@hf"), Some("admins"), true, Some(CSRF)),
+        post_form(
+            &format!("/admin/rooms/{room_id}/archive"),
+            ("u_a", "a@hf"),
+            Some("admins"),
+            true,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "archive redirects");
     let (_, list) = call(&state, get_auth("/api/rooms", bob.0, bob.1, None)).await;
-    assert!(!list.contains("\"name\":\"proj\""), "archived room hidden from user list");
+    assert!(
+        list.contains("\"name\":\"proj\""),
+        "archived room remains readable"
+    );
+    assert!(
+        list.contains("\"archived\":true"),
+        "archived authority is explicit"
+    );
 
     // Admin hard-deletes it -> 303, and it is gone from the panel entirely.
-    let (status, _) = call(
-        &state,
-        post_form(&format!("/admin/rooms/{room_id}/delete"), ("u_a", "a@hf"), Some("infra-admins"), true, Some(CSRF)),
-    )
+    let (status, _) = call(&state, {
+        let mut request = post_form(
+            &format!("/admin/rooms/{room_id}/delete"),
+            ("u_a", "a@hf"),
+            Some("infra-admins"),
+            true,
+            Some(CSRF),
+        );
+        *request.body_mut() = Body::from(format!(
+            "csrf={CSRF}&confirm=delete&consequence_token={consequence_token}"
+        ));
+        request
+    })
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "delete redirects");
     let (_, panel) = call(&state, get_auth("/admin", "u_a", "a@hf", Some("admins"))).await;
@@ -191,10 +286,32 @@ async fn admin_archive_then_delete_room() {
     // The room detail 404s after deletion.
     let (status, _) = call(
         &state,
-        get_auth(&format!("/admin/rooms/{room_id}"), "u_a", "a@hf", Some("admins")),
+        get_auth(
+            &format!("/admin/rooms/{room_id}"),
+            "u_a",
+            "a@hf",
+            Some("admins"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The consumed grant cannot authorize a replay.
+    let (status, _) = call(&state, {
+        let mut request = post_form(
+            &format!("/admin/rooms/{room_id}/delete"),
+            ("u_a", "a@hf"),
+            Some("admins"),
+            true,
+            Some(CSRF),
+        );
+        *request.body_mut() = Body::from(format!(
+            "csrf={CSRF}&confirm=delete&consequence_token={consequence_token}"
+        ));
+        request
+    })
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "delete grant is one-time");
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +327,11 @@ async fn admin_ban_and_remove_member() {
     // Both auto-join the lobby; each can read it.
     let _ = call(&state, get_auth("/api/rooms", bob.0, bob.1, None)).await;
     let _ = call(&state, get_auth("/api/rooms", carol.0, carol.1, None)).await;
-    let (status, _) = call(&state, get_auth("/api/rooms/lobby/messages", carol.0, carol.1, None)).await;
+    let (status, _) = call(
+        &state,
+        get_auth("/api/rooms/lobby/messages", carol.0, carol.1, None),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "carol is a member before the ban");
 
     // The room detail lists both members.
@@ -220,17 +341,41 @@ async fn admin_ban_and_remove_member() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(detail.contains("carol@hf") && detail.contains("bob@hf"), "members listed");
+    assert!(
+        detail.contains("carol@hf") && detail.contains("bob@hf"),
+        "members listed"
+    );
+    assert!(
+        !detail.contains(r#"id="cut-delete""#),
+        "lobby has no delete consequence"
+    );
+    let (_, panel) = call(&state, get_auth("/admin", "u_a", "a@hf", Some("admins"))).await;
+    assert!(!panel.contains("/admin/rooms/lobby/archive"));
+    assert!(!panel.contains("/admin/rooms/lobby/delete"));
 
     // Admin bans carol -> she can no longer read the room (treated as a non-member).
     let (status, _) = call(
         &state,
-        post_form("/admin/rooms/lobby/members/u_carol/ban", ("u_a", "a@hf"), Some("admins"), true, Some(CSRF)),
+        post_form(
+            "/admin/rooms/lobby/members/u_carol/ban",
+            ("u_a", "a@hf"),
+            Some("admins"),
+            true,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (status, _) = call(&state, get_auth("/api/rooms/lobby/messages", carol.0, carol.1, None)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "banned member -> 403");
+    let (status, _) = call(
+        &state,
+        get_auth("/api/rooms/lobby/messages", carol.0, carol.1, None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "banned member -> generic 404"
+    );
 
     // A banned member cannot re-join their way back in.
     let (status, _) = call(
@@ -239,18 +384,40 @@ async fn admin_ban_and_remove_member() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "join is idempotent");
-    let (status, _) = call(&state, get_auth("/api/rooms/lobby/messages", carol.0, carol.1, None)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "ban sticks across re-join");
+    let (status, _) = call(
+        &state,
+        get_auth("/api/rooms/lobby/messages", carol.0, carol.1, None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "ban sticks across re-join with generic unavailable shape"
+    );
 
     // Admin removes bob outright -> he too is no longer a member.
     let (status, _) = call(
         &state,
-        post_form("/admin/rooms/lobby/members/u_bob/remove", ("u_a", "a@hf"), Some("admins"), true, Some(CSRF)),
+        post_form(
+            "/admin/rooms/lobby/members/u_bob/remove",
+            ("u_a", "a@hf"),
+            Some("admins"),
+            true,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let (status, _) = call(&state, get_auth("/api/rooms/lobby/messages", bob.0, bob.1, None)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "removed member -> 403");
+    let (status, _) = call(
+        &state,
+        get_auth("/api/rooms/lobby/messages", bob.0, bob.1, None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "removed member -> generic 404"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +433,12 @@ async fn admin_redacts_any_message() {
     let _ = call(&state, get_auth("/api/rooms", bob.0, bob.1, None)).await;
     let (status, body) = call(
         &state,
-        post_json("/api/rooms/lobby/messages", r#"{"body":"secret plans"}"#, bob, Some(CSRF)),
+        post_json(
+            "/api/rooms/lobby/messages",
+            r#"{"body":"secret plans"}"#,
+            bob,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -275,19 +447,38 @@ async fn admin_redacts_any_message() {
     // Admin redacts it (admin overrides ownership — Bob is the author, admin is not).
     let (status, _) = call(
         &state,
-        post_form(&format!("/admin/messages/{msg_id}/redact"), ("u_a", "a@hf"), Some("admins"), true, Some(CSRF)),
+        post_form(
+            &format!("/admin/messages/{msg_id}/redact"),
+            ("u_a", "a@hf"),
+            Some("admins"),
+            true,
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "redact redirects");
 
     // The API now flags it deleted and carries the moderator tombstone, not the original text.
-    let (_, list) = call(&state, get_auth("/api/rooms/lobby/messages", bob.0, bob.1, None)).await;
+    let (_, list) = call(
+        &state,
+        get_auth("/api/rooms/lobby/messages", bob.0, bob.1, None),
+    )
+    .await;
     assert!(list.contains("\"deleted\":true"), "message flagged deleted");
-    assert!(list.contains("[removed by moderator]"), "tombstone body present");
+    assert!(
+        list.contains("[removed by moderator]"),
+        "tombstone body present"
+    );
     assert!(!list.contains("secret plans"), "original body gone");
 
     // The rendered timeline shows the tombstone, not the old text.
     let (_, page) = call(&state, get_auth("/", bob.0, bob.1, None)).await;
-    assert!(page.contains("[removed by moderator]"), "tombstone rendered");
-    assert!(!page.contains("secret plans"), "old body gone from timeline");
+    assert!(
+        page.contains("[removed by moderator]"),
+        "tombstone rendered"
+    );
+    assert!(
+        !page.contains("secret plans"),
+        "old body gone from timeline"
+    );
 }

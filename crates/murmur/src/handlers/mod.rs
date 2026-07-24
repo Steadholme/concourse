@@ -15,10 +15,38 @@ pub mod rooms;
 pub mod search;
 pub mod ws;
 
+use axum::extract::{
+    rejection::{FormRejection, PathRejection, QueryRejection},
+    Path, Query,
+};
+use axum::Form;
 use serde_json::json;
+use std::fmt;
 use std::sync::OnceLock;
 
+use crate::error::AppError;
 use crate::store::{Message, ReactionCount};
+
+/// Convert Axum extractor failures into the frozen product-owned error envelope. Framework
+/// rejection text is intentionally discarded because it can contain parser internals or reflected
+/// request material.
+pub(crate) fn query_or_invalid<T>(result: Result<Query<T>, QueryRejection>) -> Result<T, AppError> {
+    result
+        .map(|Query(value)| value)
+        .map_err(|_| AppError::InvalidRequest("invalid query parameters".to_string()))
+}
+
+pub(crate) fn form_or_invalid<T>(result: Result<Form<T>, FormRejection>) -> Result<T, AppError> {
+    result
+        .map(|Form(value)| value)
+        .map_err(|_| AppError::InvalidRequest("invalid form body".to_string()))
+}
+
+pub(crate) fn path_or_invalid<T>(result: Result<Path<T>, PathRejection>) -> Result<T, AppError> {
+    result
+        .map(|Path(value)| value)
+        .map_err(|_| AppError::InvalidRequest("invalid path parameters".to_string()))
+}
 
 /// Embedded service CSS layered after Odyssey's canonical Steadholme design system.
 pub const SERVICE_CSS: &str = include_str!("../../static/service.css");
@@ -47,6 +75,95 @@ pub fn app_css() -> &'static str {
 /// Minimal HTML escaping for text/attribute interpolation (defense-in-depth on every field).
 pub fn esc(s: &str) -> String {
     crate::text::esc(s)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TemplateRenderError {
+    DuplicateSlot(String),
+    UnclosedComment { offset: usize },
+    UnclosedSlot { offset: usize },
+    UnknownSlot(String),
+}
+
+impl fmt::Display for TemplateRenderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateSlot(slot) => write!(formatter, "duplicate template slot: {slot}"),
+            Self::UnclosedComment { offset } => {
+                write!(formatter, "unclosed HTML comment at byte {offset}")
+            }
+            Self::UnclosedSlot { offset } => {
+                write!(formatter, "unclosed template slot at byte {offset}")
+            }
+            Self::UnknownSlot(slot) => write!(formatter, "unknown template slot: {slot}"),
+        }
+    }
+}
+
+impl std::error::Error for TemplateRenderError {}
+
+/// Remove template-only HTML comments before slot expansion.
+///
+/// K3 templates carry their renderer contract beside the markup. Those comments intentionally
+/// mention real `{{SLOT}}` names, so expanding the raw template would duplicate CSS, user data, or
+/// even the dashboard script inside a comment. Stripping comments first keeps the documentation in
+/// source control without shipping an interpolation seam to browsers.
+pub fn strip_html_comments(template: &str) -> Result<String, TemplateRenderError> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remainder = template;
+    let mut consumed = 0;
+    while let Some(start) = remainder.find("<!--") {
+        rendered.push_str(&remainder[..start]);
+        let after_open = &remainder[start + "<!--".len()..];
+        let Some(end) = after_open.find("-->") else {
+            return Err(TemplateRenderError::UnclosedComment {
+                offset: consumed + start,
+            });
+        };
+        consumed += start + "<!--".len() + end + "-->".len();
+        remainder = &after_open[end + "-->".len()..];
+    }
+    rendered.push_str(remainder);
+    Ok(rendered)
+}
+
+/// Expand a trusted template in one pass.
+///
+/// Inserted values are appended directly to the output and are never scanned for more slot names.
+/// This is important even after HTML escaping: braces are valid text, so a room named
+/// `{{BOOT_JSON}}` must remain that literal room name rather than triggering a later substitution.
+pub fn render_template(
+    template: &str,
+    slots: &[(&str, &str)],
+) -> Result<String, TemplateRenderError> {
+    for (index, (slot, _)) in slots.iter().enumerate() {
+        if slots[..index].iter().any(|(seen, _)| seen == slot) {
+            return Err(TemplateRenderError::DuplicateSlot((*slot).to_string()));
+        }
+    }
+
+    let stripped = strip_html_comments(template)?;
+    let mut rendered = String::with_capacity(stripped.len());
+    let mut remainder = stripped.as_str();
+    let mut consumed = 0;
+    while let Some(start) = remainder.find("{{") {
+        rendered.push_str(&remainder[..start]);
+        let after_open = &remainder[start + "{{".len()..];
+        let Some(end) = after_open.find("}}") else {
+            return Err(TemplateRenderError::UnclosedSlot {
+                offset: consumed + start,
+            });
+        };
+        let slot = &after_open[..end];
+        let Some((_, value)) = slots.iter().find(|(name, _)| *name == slot) else {
+            return Err(TemplateRenderError::UnknownSlot(slot.to_string()));
+        };
+        rendered.push_str(value);
+        consumed += start + "{{".len() + end + "}}".len();
+        remainder = &after_open[end + "}}".len()..];
+    }
+    rendered.push_str(remainder);
+    Ok(rendered)
 }
 
 /// Lucide-style line icons (viewBox 0 0 24 24, no fill, rounded caps) used across the app-bar.
@@ -107,16 +224,33 @@ fn usermenu(email: &str) -> String {
 /// control can only repaint — never forge identity/CSRF. The `.themeswitch` styles live in the
 /// vendored Odyssey `APP_CSS`, not the service layer.
 fn themeswitch(theme: &str) -> String {
-    let (l, lc) = if theme == "light" { (" is-active", r#" aria-current="true""#) } else { ("", "") };
-    let (d, dc) = if theme == "dark" { (" is-active", r#" aria-current="true""#) } else { ("", "") };
-    let (a, ac) = if theme == "auto" { (" is-active", r#" aria-current="true""#) } else { ("", "") };
+    let (l, lc) = if theme == "light" {
+        (" is-active", r#" aria-current="true""#)
+    } else {
+        ("", "")
+    };
+    let (d, dc) = if theme == "dark" {
+        (" is-active", r#" aria-current="true""#)
+    } else {
+        ("", "")
+    };
+    let (a, ac) = if theme == "auto" {
+        (" is-active", r#" aria-current="true""#)
+    } else {
+        ("", "")
+    };
     format!(
         r#"<div class="themeswitch" role="group" aria-label="Theme">
   <a class="themeswitch__opt{l}" href="/_gw/theme?to=light" title="Light" aria-label="Light"{lc}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></a>
   <a class="themeswitch__opt{d}" href="/_gw/theme?to=dark" title="Dark" aria-label="Dark"{dc}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6.5 6.5 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg></a>
   <a class="themeswitch__opt{a}" href="/_gw/theme?to=auto" title="System" aria-label="System"{ac}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></a>
 </div>"#,
-        l = l, lc = lc, d = d, dc = dc, a = a, ac = ac,
+        l = l,
+        lc = lc,
+        d = d,
+        dc = dc,
+        a = a,
+        ac = ac,
     )
 }
 
@@ -137,7 +271,10 @@ pub fn topbar(page_title: &str, email: &str, theme: &str) -> String {
             admin = admin_ic,
         )
     } else {
-        format!(r#"<a class="appnav is-active" href="/">{chat}Chat</a>"#, chat = chat_ic)
+        format!(
+            r#"<a class="appnav is-active" href="/">{chat}Chat</a>"#,
+            chat = chat_ic
+        )
     };
     format!(
         r#"<header class="appbar">
@@ -208,4 +345,40 @@ pub fn presence_frame(room_id: &str, email: &str, online: bool) -> String {
         "status": if online { "online" } else { "offline" },
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::{render_template, strip_html_comments, TemplateRenderError};
+
+    #[test]
+    fn inserted_slot_like_text_is_never_expanded_again() {
+        let rendered = render_template(
+            "<h1>{{TITLE}}</h1><script>{{BOOT_JSON}}</script>",
+            &[("TITLE", "{{BOOT_JSON}}"), ("BOOT_JSON", "{\"safe\":true}")],
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "<h1>{{BOOT_JSON}}</h1><script>{\"safe\":true}</script>"
+        );
+    }
+
+    #[test]
+    fn template_contract_comments_are_removed_before_expansion() {
+        let rendered = render_template(
+            "<!-- {{JS}} is replaced last --><main>{{BODY}}</main>",
+            &[("BODY", "ready")],
+        )
+        .unwrap();
+        assert_eq!(rendered, "<main>ready</main>");
+    }
+
+    #[test]
+    fn unclosed_template_comment_fails_closed_with_offset() {
+        assert_eq!(
+            strip_html_comments("ok<!-- missing"),
+            Err(TemplateRenderError::UnclosedComment { offset: 2 })
+        );
+    }
 }

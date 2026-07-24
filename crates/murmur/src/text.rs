@@ -84,7 +84,7 @@ pub fn render_body(body: &str) -> String {
 }
 
 /// Plain one-line preview for compact quote/chrome surfaces: no rich tags, no autolinks.
-pub fn render_preview(body: &str) -> String {
+pub fn preview_text(body: &str) -> String {
     let mut lines = Vec::new();
     for line in body.split('\n') {
         if fence_lang(line).is_some() || is_fence_close(line) {
@@ -92,7 +92,12 @@ pub fn render_preview(body: &str) -> String {
         }
         lines.push(line.trim_end_matches('\r'));
     }
-    esc(&lines.join(" "))
+    lines.join(" ")
+}
+
+/// Safe HTML form of [`preview_text`], escaped exactly once for direct sink interpolation.
+pub fn render_preview(body: &str) -> String {
+    esc(&preview_text(body))
 }
 
 fn flush_normal(lines: &mut Vec<&str>, out: &mut String) {
@@ -150,7 +155,7 @@ fn render_inline(line: &str, out: &mut String) {
                 "<a href=\"{u}\" rel=\"noopener noreferrer nofollow\" target=\"_blank\">{u}</a>",
                 u = url_escaped
             ));
-            i = i + url.len();
+            i += url.len();
             text_start = i;
             continue;
         }
@@ -309,7 +314,7 @@ fn is_url_byte(b: u8) -> bool {
 
 /// Strip trailing punctuation that is more likely sentence punctuation than part of the URL.
 fn trim_url_trailing(url: &str) -> &str {
-    url.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']'))
+    url.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']'])
 }
 
 /// Length in bytes of the UTF-8 char starting at lead byte `b`.
@@ -430,6 +435,17 @@ mod tests {
     fn render_preview_is_plain_single_line_without_fence_markers() {
         let r = render_preview("```rust\nlet x = 1;\n```\n> not rich @alice");
         assert_eq!(r, "let x = 1; &gt; not rich @alice");
+    }
+
+    #[test]
+    fn hostile_preview_is_escaped_exactly_once() {
+        let r = render_preview(r#"<script>alert("x")</script> & "quoted""#);
+        assert_eq!(
+            r,
+            "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &quot;quoted&quot;"
+        );
+        assert!(!r.contains("&amp;lt;"));
+        assert!(!r.contains("<script>"));
     }
 
     #[test]

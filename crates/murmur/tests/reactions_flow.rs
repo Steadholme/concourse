@@ -34,7 +34,9 @@ fn post_json(
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, format!("__Host-csrf={CSRF}"));
     if let Some((sub, email)) = auth {
-        b = b.header("x-auth-subject", sub).header("x-auth-email", email);
+        b = b
+            .header("x-auth-subject", sub)
+            .header("x-auth-email", email);
     }
     if let Some(tok) = csrf_header {
         b = b.header("x-csrf-token", tok);
@@ -90,15 +92,19 @@ async fn reaction_toggle_and_counts() {
 
     // --- guards ------------------------------------------------------------
     // Unauthenticated -> 401.
-    let (status, _) = call(&state, post_json(&react_path, r#"{"emoji":"👍"}"#, None, Some(CSRF))).await;
+    let (status, _) = call(
+        &state,
+        post_json(&react_path, r#"{"emoji":"👍"}"#, None, Some(CSRF)),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "no identity -> 401");
-    // Bad CSRF -> 401.
+    // Bad CSRF -> 403.
     let (status, _) = call(
         &state,
         post_json(&react_path, r#"{"emoji":"👍"}"#, Some(alice), Some("WRONG")),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "CSRF mismatch -> 401");
+    assert_eq!(status, StatusCode::FORBIDDEN, "CSRF mismatch -> 403");
     // Empty emoji -> 400.
     let (status, _) = call(
         &state,
@@ -129,7 +135,10 @@ async fn reaction_toggle_and_counts() {
     assert!(body.contains("\"added\":true"), "first react adds: {body}");
     assert!(body.contains("\"emoji\":\"👍\""), "emoji tallied");
     assert!(body.contains("\"count\":1"), "count is 1");
-    assert!(body.contains("\"mine\":[\"👍\"]"), "caller's reaction echoed");
+    assert!(
+        body.contains("\"mine\":[\"👍\"]"),
+        "caller's reaction echoed"
+    );
 
     // Bob adds the SAME emoji -> distinct-user count becomes 2.
     let (status, body) = call(
@@ -138,7 +147,10 @@ async fn reaction_toggle_and_counts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("\"count\":2"), "two distinct users -> count 2: {body}");
+    assert!(
+        body.contains("\"count\":2"),
+        "two distinct users -> count 2: {body}"
+    );
 
     // Alice toggles the same emoji again -> removed, count back to 1.
     let (status, body) = call(
@@ -147,19 +159,32 @@ async fn reaction_toggle_and_counts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("\"added\":false"), "second identical react removes: {body}");
+    assert!(
+        body.contains("\"added\":false"),
+        "second identical react removes: {body}"
+    );
     assert!(body.contains("\"count\":1"), "count back to 1");
     assert!(body.contains("\"mine\":[]"), "alice no longer reacted");
 
     // --- GET reactions tally ----------------------------------------------
     let (status, body) = call(
         &state,
-        get_auth(&format!("/api/rooms/lobby/messages/{msg}/reactions"), alice.0, alice.1),
+        get_auth(
+            &format!("/api/rooms/lobby/messages/{msg}/reactions"),
+            alice.0,
+            alice.1,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("\"count\":1"), "bob's reaction remains: {body}");
-    assert!(body.contains("\"mine\":[]"), "alice's own list empty after toggle-off");
+    assert!(
+        body.contains("\"count\":1"),
+        "bob's reaction remains: {body}"
+    );
+    assert!(
+        body.contains("\"mine\":[]"),
+        "alice's own list empty after toggle-off"
+    );
 }
 
 #[tokio::test]
@@ -172,7 +197,12 @@ async fn reaction_requires_membership() {
     let _ = call(&state, get_auth("/api/rooms", bob.0, bob.1)).await;
     let (status, body) = call(
         &state,
-        post_json("/api/rooms", r#"{"name":"secret","kind":"room"}"#, Some(bob), Some(CSRF)),
+        post_json(
+            "/api/rooms",
+            r#"{"name":"secret","kind":"room"}"#,
+            Some(bob),
+            Some(CSRF),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -189,7 +219,11 @@ async fn reaction_requires_membership() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-member cannot react -> 403");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "non-member cannot react -> generic 404"
+    );
 }
 
 #[tokio::test]
@@ -229,7 +263,11 @@ async fn threaded_reply_flow() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "reply to missing parent -> 400");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "reply to missing parent -> 400"
+    );
 
     // A reply whose parent lives in ANOTHER room is rejected (no cross-room threading).
     let (status, body) = call(
@@ -286,9 +324,15 @@ async fn timeline_renders_reply_and_reaction() {
     let (status, page) = call(&state, get_auth("/", alice.0, alice.1)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("msg__quote"), "quoted parent block rendered");
-    assert!(page.contains("hello parent"), "parent snippet present in quote");
+    assert!(
+        page.contains("hello parent"),
+        "parent snippet present in quote"
+    );
     assert!(page.contains("msg__replies"), "reply count marker rendered");
     assert!(page.contains("1 reply"), "singular reply count");
-    assert!(page.contains("msg__reactions"), "reaction chip row rendered");
+    assert!(
+        page.contains("msg__reactions"),
+        "reaction chip row rendered"
+    );
     assert!(page.contains("🎉"), "reaction emoji rendered");
 }

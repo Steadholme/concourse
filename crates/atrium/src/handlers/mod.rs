@@ -156,9 +156,9 @@ pub fn rel_time(then: i64, now: i64) -> String {
     }
     match d {
         0..=44 => "just now".to_string(),
-        45..=5399 => format!("{}m", (d + 59) / 60),       // up to ~90m -> minutes
+        45..=5399 => format!("{}m", (d + 59) / 60), // up to ~90m -> minutes
         5400..=86399 => format!("{}h", (d + 1799) / 3600), // up to ~24h -> hours
-        86400..=2591999 => format!("{}d", d / 86400),      // up to ~30d -> days
+        86400..=2591999 => format!("{}d", d / 86400), // up to ~30d -> days
         _ => fmt_date(then),
     }
 }

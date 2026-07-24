@@ -164,11 +164,13 @@ pub fn lazy_pool(dsn: &str) -> Result<PgPool, sqlx::Error> {
 
 /// Murmur (chat) source — the viewer's joined rooms with their unread message counts.
 ///
-/// Schema (Murmur owns it; Atrium only reads it): `memberships(user_sub, room_id, last_read_at)`
-/// records who joined which room and how far they've read; `rooms(id, name)` is the room; and
-/// `messages(room_id, body, created_at)` is the chat log. For each joined room we count messages
-/// newer than the viewer's `last_read_at` (the unread count) and pull the latest message as a
-/// preview, via portable correlated subqueries. Rooms with zero unread are dropped in-process so
+/// Schema (Murmur owns it; Atrium only reads it):
+/// `memberships(user_sub, room_id, last_read_at, last_read_message_id)` records who joined which
+/// room and the viewer's tuple read cursor; `rooms(id, name)` is the room; and
+/// `messages(id, room_id, sender_sub, body, created_at, deleted)` is the chat log. For each
+/// non-banned membership we count non-deleted messages from other users whose
+/// `(created_at, id)` tuple is newer than the viewer's read cursor, then pull the latest message as
+/// a preview via portable correlated subqueries. Rooms with zero unread are dropped in-process so
 /// the column shows only "what's new".
 pub struct MurmurSource {
     pool: PgPool,
@@ -191,14 +193,21 @@ impl Source for MurmurSource {
             "SELECT r.id AS room_id, \
                     r.name AS room_name, \
                     (SELECT COUNT(*) FROM messages m \
-                       WHERE m.room_id = r.id AND m.created_at > mem.last_read_at) AS unread, \
+                       WHERE m.room_id = r.id \
+                         AND (m.created_at > mem.last_read_at OR \
+                              (m.created_at = mem.last_read_at \
+                               AND m.id > mem.last_read_message_id)) \
+                         AND m.sender_sub <> mem.user_sub \
+                         AND m.deleted = FALSE) AS unread, \
                     (SELECT m2.body FROM messages m2 \
-                       WHERE m2.room_id = r.id ORDER BY m2.created_at DESC LIMIT 1) AS latest_body, \
+                       WHERE m2.room_id = r.id \
+                       ORDER BY m2.created_at DESC, m2.id DESC LIMIT 1) AS latest_body, \
                     (SELECT m3.created_at FROM messages m3 \
-                       WHERE m3.room_id = r.id ORDER BY m3.created_at DESC LIMIT 1) AS latest_at \
+                       WHERE m3.room_id = r.id \
+                       ORDER BY m3.created_at DESC, m3.id DESC LIMIT 1) AS latest_at \
              FROM memberships mem \
              JOIN rooms r ON r.id = mem.room_id \
-             WHERE mem.user_sub = $1 \
+             WHERE mem.user_sub = $1 AND mem.banned = FALSE \
              LIMIT $2",
         )
         .bind(user_sub)
@@ -278,11 +287,16 @@ impl Source for KlaxonSource {
             .iter()
             .map(|r| {
                 Ok(InboxRow {
-                    key: r.try_get("row_key").map_err(|e: sqlx::Error| e.to_string())?,
+                    key: r
+                        .try_get("row_key")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
                     title: r.try_get("title").map_err(|e: sqlx::Error| e.to_string())?,
                     snippet: r.try_get("body").map_err(|e: sqlx::Error| e.to_string())?,
                     source: String::new(),
-                    at: Some(r.try_get("created_at").map_err(|e: sqlx::Error| e.to_string())?),
+                    at: Some(
+                        r.try_get("created_at")
+                            .map_err(|e: sqlx::Error| e.to_string())?,
+                    ),
                     link: r.try_get("link").map_err(|e: sqlx::Error| e.to_string())?,
                     count: None,
                 })
@@ -339,11 +353,19 @@ impl Source for CurrentSource {
             .iter()
             .map(|r| {
                 Ok(InboxRow {
-                    key: r.try_get("row_key").map_err(|e: sqlx::Error| e.to_string())?,
+                    key: r
+                        .try_get("row_key")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
                     title: r.try_get("title").map_err(|e: sqlx::Error| e.to_string())?,
-                    snippet: r.try_get("summary").map_err(|e: sqlx::Error| e.to_string())?,
-                    source: r.try_get("feed_title").map_err(|e: sqlx::Error| e.to_string())?,
-                    at: r.try_get("published_at").map_err(|e: sqlx::Error| e.to_string())?,
+                    snippet: r
+                        .try_get("summary")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
+                    source: r
+                        .try_get("feed_title")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
+                    at: r
+                        .try_get("published_at")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
                     link: r.try_get("link").map_err(|e: sqlx::Error| e.to_string())?,
                     count: None,
                 })

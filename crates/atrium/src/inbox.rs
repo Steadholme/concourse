@@ -110,7 +110,12 @@ pub fn view(
 ) -> Inbox {
     Inbox {
         chat: view_section(&inbox.chat, SectionKind::Chat, hidden, filter),
-        notifications: view_section(&inbox.notifications, SectionKind::Notifications, hidden, filter),
+        notifications: view_section(
+            &inbox.notifications,
+            SectionKind::Notifications,
+            hidden,
+            filter,
+        ),
         feed: view_section(&inbox.feed, SectionKind::Feed, hidden, filter),
     }
 }
@@ -194,7 +199,11 @@ impl Engine {
 
 /// Fetch one column: `None` source -> empty-and-available; `Some` source -> `Ready` on success,
 /// `Unavailable` on error (the error is logged, never propagated).
-async fn fetch_section(source: Option<&Arc<dyn Source>>, user_sub: &str, limit: i64) -> SectionState {
+async fn fetch_section(
+    source: Option<&Arc<dyn Source>>,
+    user_sub: &str,
+    limit: i64,
+) -> SectionState {
     let Some(source) = source else {
         return SectionState::Ready(Section::empty());
     };
@@ -232,7 +241,12 @@ impl InboxCache {
     /// otherwise a freshly aggregated one (`fresh = true`). `fresh` lets the caller emit a single
     /// audit event per real refresh rather than on every cached view.
     pub async fn get(&self, engine: &Engine, user_sub: &str, limit: i64) -> (Arc<Inbox>, bool) {
-        if let Some((at, inbox)) = self.inner.lock().expect("inbox cache poisoned").get(user_sub) {
+        if let Some((at, inbox)) = self
+            .inner
+            .lock()
+            .expect("inbox cache poisoned")
+            .get(user_sub)
+        {
             if at.elapsed() < self.ttl {
                 return (Arc::clone(inbox), false);
             }
@@ -254,15 +268,29 @@ mod tests {
     fn section(total: i64, n: usize) -> Section {
         Section {
             total,
-            rows: (0..n).map(|i| InboxRow { title: format!("r{i}"), ..Default::default() }).collect(),
+            rows: (0..n)
+                .map(|i| InboxRow {
+                    title: format!("r{i}"),
+                    ..Default::default()
+                })
+                .collect(),
         }
     }
 
     fn engine_all_up() -> Engine {
         Engine::new(
-            Some(Arc::new(InMemorySource::new(SectionKind::Chat, section(5, 2)))),
-            Some(Arc::new(InMemorySource::new(SectionKind::Notifications, section(3, 3)))),
-            Some(Arc::new(InMemorySource::new(SectionKind::Feed, section(7, 1)))),
+            Some(Arc::new(InMemorySource::new(
+                SectionKind::Chat,
+                section(5, 2),
+            ))),
+            Some(Arc::new(InMemorySource::new(
+                SectionKind::Notifications,
+                section(3, 3),
+            ))),
+            Some(Arc::new(InMemorySource::new(
+                SectionKind::Feed,
+                section(7, 1),
+            ))),
         )
     }
 
@@ -287,7 +315,10 @@ mod tests {
     async fn down_source_is_unavailable_others_still_render() {
         let engine = Engine::new(
             Some(Arc::new(InMemorySource::down(SectionKind::Chat))),
-            Some(Arc::new(InMemorySource::new(SectionKind::Notifications, section(4, 1)))),
+            Some(Arc::new(InMemorySource::new(
+                SectionKind::Notifications,
+                section(4, 1),
+            ))),
             None,
         );
         let inbox = engine.aggregate("u", 50).await;
@@ -329,10 +360,15 @@ mod tests {
         let mut hidden: HashMap<String, HashSet<String>> = HashMap::new();
         hidden.entry("chat".into()).or_default().insert("r1".into());
         let out = view(&inbox, &hidden, &ViewFilter::default());
-        let SectionState::Ready(chat) = &out.chat else { panic!() };
+        let SectionState::Ready(chat) = &out.chat else {
+            panic!()
+        };
         assert_eq!(chat.rows.len(), 1, "dismissed room removed");
         assert_eq!(chat.rows[0].title, "#random");
-        assert_eq!(chat.total, 3, "total drops by the hidden room's unread count");
+        assert_eq!(
+            chat.total, 3,
+            "total drops by the hidden room's unread count"
+        );
         // Unavailable column passes through untouched.
         assert!(!out.feed.is_available());
     }
@@ -343,11 +379,15 @@ mod tests {
         let empty = HashMap::new();
         let f = ViewFilter::new(Some("lunch".into()), None);
         let out = view(&inbox, &empty, &f);
-        let SectionState::Ready(chat) = &out.chat else { panic!() };
+        let SectionState::Ready(chat) = &out.chat else {
+            panic!()
+        };
         assert_eq!(chat.rows.len(), 1);
         assert_eq!(chat.rows[0].title, "#random");
         // The notification doesn't match "lunch" -> emptied.
-        let SectionState::Ready(notifs) = &out.notifications else { panic!() };
+        let SectionState::Ready(notifs) = &out.notifications else {
+            panic!()
+        };
         assert!(notifs.rows.is_empty());
         assert_eq!(notifs.total, 0);
     }
@@ -359,9 +399,13 @@ mod tests {
         let f = ViewFilter::new(None, Some("notifications".into()));
         let out = view(&inbox, &empty, &f);
         // Only notifications keeps rows; chat is emptied (still available).
-        let SectionState::Ready(chat) = &out.chat else { panic!() };
+        let SectionState::Ready(chat) = &out.chat else {
+            panic!()
+        };
         assert!(chat.rows.is_empty());
-        let SectionState::Ready(notifs) = &out.notifications else { panic!() };
+        let SectionState::Ready(notifs) = &out.notifications else {
+            panic!()
+        };
         assert_eq!(notifs.rows.len(), 1);
     }
 

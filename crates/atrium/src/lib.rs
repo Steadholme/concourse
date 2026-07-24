@@ -14,11 +14,11 @@
 //! Endpoints:
 //! - `GET /healthz`  liveness (container HEALTHCHECK), unauthenticated
 //! - `GET /`         the unified dashboard: three columns (Chat unread / Notifications / Feed
-//!                   river) + a summary bar of total unread, concurrently fetched, ~10 s cached,
-//!                   and resilient (a down source renders "unavailable", the page still renders)
+//!   river) + a summary bar of total unread, concurrently fetched, ~10 s cached, and resilient (a
+//!   down source renders "unavailable", the page still renders)
 //! - `GET /api/inbox` the same viewer-scoped, cached aggregate as JSON (pre-rendered `summary` +
-//!                   `columns` fragments) — the payload the page's ~20 s live-refresh poll swaps in
-//!                   without a full reload (scroll preserved)
+//!   `columns` fragments) — the payload the page's ~20 s live-refresh poll swaps in without a full
+//!   reload (scroll preserved)
 
 pub mod audit;
 pub mod auth;

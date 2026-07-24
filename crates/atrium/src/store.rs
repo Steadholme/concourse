@@ -156,13 +156,12 @@ impl ActionStore for PgActionStore {
     }
 
     async fn hidden(&self, user_sub: &str) -> Result<HashMap<String, HashSet<String>>, String> {
-        let rows = sqlx::query(
-            "SELECT source, row_key FROM atrium_row_actions WHERE user_sub = $1",
-        )
-        .bind(user_sub)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        let rows =
+            sqlx::query("SELECT source, row_key FROM atrium_row_actions WHERE user_sub = $1")
+                .bind(user_sub)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
 
         let mut out: HashMap<String, HashSet<String>> = HashMap::new();
         for r in &rows {
@@ -184,21 +183,33 @@ mod tests {
         // A brand-new viewer hides nothing.
         assert!(store.hidden("u").await.unwrap().is_empty());
 
-        store.record("u", "feed", "item-1", "dismiss").await.unwrap();
+        store
+            .record("u", "feed", "item-1", "dismiss")
+            .await
+            .unwrap();
         store.record("u", "feed", "item-2", "read").await.unwrap();
         store.record("u", "chat", "room-9", "read").await.unwrap();
         // A different viewer is isolated.
-        store.record("other", "feed", "item-1", "read").await.unwrap();
+        store
+            .record("other", "feed", "item-1", "read")
+            .await
+            .unwrap();
 
         let hidden = store.hidden("u").await.unwrap();
         assert_eq!(hidden.get("feed").unwrap().len(), 2);
         assert!(hidden.get("feed").unwrap().contains("item-1"));
         assert!(hidden.get("chat").unwrap().contains("room-9"));
-        assert!(hidden.get("notifications").is_none());
+        assert!(!hidden.contains_key("notifications"));
 
         // Re-acting is idempotent (still one key, no duplicate).
-        store.record("u", "chat", "room-9", "dismiss").await.unwrap();
-        assert_eq!(store.hidden("u").await.unwrap().get("chat").unwrap().len(), 1);
+        store
+            .record("u", "chat", "room-9", "dismiss")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.hidden("u").await.unwrap().get("chat").unwrap().len(),
+            1
+        );
 
         let other = store.hidden("other").await.unwrap();
         assert_eq!(other.get("feed").unwrap().len(), 1);

@@ -25,6 +25,10 @@ pub const ANON_OWNER: &str = "anonymous";
 pub const CSRF_COOKIE: &str = "__Host-almanac_csrf";
 /// CSRF cookie lifetime, seconds.
 const CSRF_TTL: u64 = 3600;
+/// A reviewed RSVP consequence may be committed for at most five minutes.
+const RSVP_CONFIRMATION_TTL: i64 = 5 * 60;
+const RSVP_CONFIRMATION_DOMAIN: &[u8] = b"almanac-rsvp-confirm-v1\0";
+const RSVP_CONFIRMATION_MAX_LEN: usize = 96;
 
 /// The signed-in user's stable subject id, used as the row OWNER. Falls back to [`ANON_OWNER`]
 /// when the gateway injected nothing (local dev), so the app still works without Sluice.
@@ -89,9 +93,12 @@ pub fn gateway_identity_ok(headers: &HeaderMap) -> bool {
     };
     let win = now_unix() / 60;
     // Accept the current and previous minute (clock skew + minute-boundary tolerance).
-    [win, win - 1]
-        .iter()
-        .any(|&w| ct_eq(sig.as_bytes(), sign_identity(key, &subject, &groups, w).as_bytes()))
+    [win, win - 1].iter().any(|&w| {
+        ct_eq(
+            sig.as_bytes(),
+            sign_identity(key, &subject, &groups, w).as_bytes(),
+        )
+    })
 }
 
 /// Recompute the gateway signature — byte-identical to Sluice's `auth.SignIdentity` (Go).
@@ -115,12 +122,109 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-fn now_unix() -> i64 {
+pub fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// RSVP reviewed-consequence proof
+// ---------------------------------------------------------------------------
+
+/// Mint a short-lived server proof that this exact RSVP capability, reply, and
+/// CSRF subject passed through the Confirm step.
+pub fn mint_rsvp_confirmation(token: &str, reply: &str, csrf: &str, now: i64) -> String {
+    let expires = now.saturating_add(RSVP_CONFIRMATION_TTL);
+    let mac = sign_rsvp_confirmation(rsvp_confirmation_key(), token, reply, csrf, expires);
+    format!("v1.{expires}.{mac}")
+}
+
+/// Verify a proof minted by [`mint_rsvp_confirmation`].
+///
+/// The upper expiry bound matters even though the expiry is authenticated: it
+/// makes an accidentally long-lived mint fail closed instead of extending the
+/// reviewed-consequence window.
+pub fn verify_rsvp_confirmation(
+    proof: &str,
+    token: &str,
+    reply: &str,
+    csrf: &str,
+    now: i64,
+) -> bool {
+    if proof.is_empty()
+        || proof.len() > RSVP_CONFIRMATION_MAX_LEN
+        || token.len() > 256
+        || reply.len() > 32
+        || csrf.len() > 256
+    {
+        return false;
+    }
+    let mut parts = proof.split('.');
+    let (Some(version), Some(expires), Some(signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if version != "v1" || signature.len() != 64 {
+        return false;
+    }
+    let Ok(expires) = expires.parse::<i64>() else {
+        return false;
+    };
+    if expires <= now || expires > now.saturating_add(RSVP_CONFIRMATION_TTL) {
+        return false;
+    }
+    let expected = sign_rsvp_confirmation(rsvp_confirmation_key(), token, reply, csrf, expires);
+    ct_eq(signature.as_bytes(), expected.as_bytes())
+}
+
+/// Derive a purpose-specific key from the configured gateway secret. Direct
+/// dev/test mode gets a process-local random key; restarting only invalidates
+/// outstanding confirmations and therefore fails closed.
+fn rsvp_confirmation_key() -> &'static [u8; 32] {
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let gateway = gateway_key();
+        if gateway.is_empty() {
+            let mut key = [0u8; 32];
+            getrandom::getrandom(&mut key).expect("OS CSPRNG unavailable");
+            key
+        } else {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut mac =
+                Hmac::<Sha256>::new_from_slice(gateway.as_bytes()).expect("valid HMAC key");
+            mac.update(RSVP_CONFIRMATION_DOMAIN);
+            mac.finalize().into_bytes().into()
+        }
+    })
+}
+
+fn sign_rsvp_confirmation(
+    key: &[u8],
+    token: &str,
+    reply: &str,
+    csrf: &str,
+    expires: i64,
+) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    let token_digest = Sha256::digest(token.as_bytes());
+    let csrf_digest = Sha256::digest(csrf.as_bytes());
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("valid HMAC key");
+    mac.update(RSVP_CONFIRMATION_DOMAIN);
+    mac.update(&token_digest);
+    mac.update(b"\0");
+    mac.update(reply.as_bytes());
+    mac.update(b"\0");
+    mac.update(&csrf_digest);
+    mac.update(b"\0");
+    mac.update(expires.to_string().as_bytes());
+    to_hex(&mac.finalize().into_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -245,5 +349,49 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(HEADER_SUBJECT, "user-42".parse().unwrap());
         assert!(gateway_identity_ok(&h));
+    }
+
+    #[test]
+    fn rsvp_confirmation_is_bound_and_short_lived() {
+        let now = 1_800_000_000;
+        let proof = mint_rsvp_confirmation("cap-a", "accepted", "csrf-a", now);
+        assert!(verify_rsvp_confirmation(
+            &proof, "cap-a", "accepted", "csrf-a", now
+        ));
+        assert!(!verify_rsvp_confirmation(
+            &proof, "cap-b", "accepted", "csrf-a", now
+        ));
+        assert!(!verify_rsvp_confirmation(
+            &proof, "cap-a", "declined", "csrf-a", now
+        ));
+        assert!(!verify_rsvp_confirmation(
+            &proof, "cap-a", "accepted", "csrf-b", now
+        ));
+        assert!(!verify_rsvp_confirmation(
+            &proof,
+            "cap-a",
+            "accepted",
+            "csrf-a",
+            now + RSVP_CONFIRMATION_TTL
+        ));
+    }
+
+    #[test]
+    fn rsvp_confirmation_rejects_malformed_and_future_expiry() {
+        let now = 1_800_000_000;
+        assert!(!verify_rsvp_confirmation(
+            "", "cap", "accepted", "csrf", now
+        ));
+        assert!(!verify_rsvp_confirmation(
+            "v1.not-a-time.deadbeef",
+            "cap",
+            "accepted",
+            "csrf",
+            now
+        ));
+        let future = format!("v1.{}.{}", now + RSVP_CONFIRMATION_TTL + 1, "0".repeat(64));
+        assert!(!verify_rsvp_confirmation(
+            &future, "cap", "accepted", "csrf", now
+        ));
     }
 }

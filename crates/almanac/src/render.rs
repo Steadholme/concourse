@@ -7,6 +7,7 @@
 
 use crate::auth;
 use axum::http::HeaderMap;
+use std::fmt;
 use std::sync::OnceLock;
 
 /// Embedded service CSS layered after Odyssey's canonical Steadholme design system.
@@ -14,6 +15,110 @@ const SERVICE_CSS: &str = include_str!("../static/service.css");
 static APP_CSS: OnceLock<String> = OnceLock::new();
 /// Page shell with `{{...}}` slots.
 const LAYOUT: &str = include_str!("../templates/layout.html");
+const LAYOUT_SLOTS: [&str; 5] = ["PAGE_TITLE", "STYLE", "NAV", "USERBOX", "CONTENT"];
+const LAYOUT_FAILURE_PAGE: &str = "<!DOCTYPE html><html lang=\"en\"><head>\
+<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<meta name=\"robots\" content=\"noindex\"><title>Almanac unavailable</title></head>\
+<body><a class=\"skip-link\" href=\"#main-pane\">Skip to content</a>\
+<main id=\"main-pane\" tabindex=\"-1\"><h1>Almanac is temporarily unavailable</h1>\
+<p>The page shell could not be rendered.</p></main></body></html>";
+
+#[derive(Debug, PartialEq, Eq)]
+enum LayoutTemplateError {
+    UnknownSlot { name: String, offset: usize },
+    UnclosedSlot { offset: usize },
+    UnexpectedClose { offset: usize },
+    DuplicateSlot { name: &'static str },
+    MissingSlot { name: &'static str },
+}
+
+impl fmt::Display for LayoutTemplateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownSlot { name, offset } => {
+                write!(f, "unknown layout slot {name:?} at byte {offset}")
+            }
+            Self::UnclosedSlot { offset } => {
+                write!(f, "unclosed layout slot at byte {offset}")
+            }
+            Self::UnexpectedClose { offset } => {
+                write!(f, "unexpected layout slot close at byte {offset}")
+            }
+            Self::DuplicateSlot { name } => {
+                write!(f, "duplicate layout slot {name:?}")
+            }
+            Self::MissingSlot { name } => {
+                write!(f, "missing layout slot {name:?}")
+            }
+        }
+    }
+}
+
+/// Render the trusted page-shell template in one left-to-right pass.
+///
+/// Replacement values are appended as opaque bytes and are never scanned for slot syntax. The
+/// template itself is strict: unknown, malformed, duplicate, or missing slots fail closed.
+fn render_layout_template(
+    template: &str,
+    replacements: [&str; LAYOUT_SLOTS.len()],
+) -> Result<String, LayoutTemplateError> {
+    let mut rendered = String::with_capacity(
+        template.len() + replacements.iter().map(|value| value.len()).sum::<usize>(),
+    );
+    let mut seen = [false; LAYOUT_SLOTS.len()];
+    let mut cursor = 0;
+
+    while cursor < template.len() {
+        let tail = &template[cursor..];
+        let next_open = tail.find("{{").map(|offset| cursor + offset);
+        let next_close = tail.find("}}").map(|offset| cursor + offset);
+
+        let open = match (next_open, next_close) {
+            (Some(open), Some(close)) if close < open => {
+                return Err(LayoutTemplateError::UnexpectedClose { offset: close });
+            }
+            (Some(open), _) => open,
+            (None, Some(close)) => {
+                return Err(LayoutTemplateError::UnexpectedClose { offset: close });
+            }
+            (None, None) => {
+                rendered.push_str(tail);
+                break;
+            }
+        };
+
+        rendered.push_str(&template[cursor..open]);
+        let slot_start = open + 2;
+        let Some(close_offset) = template[slot_start..].find("}}") else {
+            return Err(LayoutTemplateError::UnclosedSlot { offset: open });
+        };
+        let close = slot_start + close_offset;
+        let slot_name = &template[slot_start..close];
+        let Some(slot_index) = LAYOUT_SLOTS.iter().position(|name| *name == slot_name) else {
+            return Err(LayoutTemplateError::UnknownSlot {
+                name: slot_name.to_string(),
+                offset: open,
+            });
+        };
+        if seen[slot_index] {
+            return Err(LayoutTemplateError::DuplicateSlot {
+                name: LAYOUT_SLOTS[slot_index],
+            });
+        }
+
+        rendered.push_str(replacements[slot_index]);
+        seen[slot_index] = true;
+        cursor = close + 2;
+    }
+
+    if let Some((slot_index, _)) = seen.iter().enumerate().find(|(_, was_seen)| !**was_seen) {
+        return Err(LayoutTemplateError::MissingSlot {
+            name: LAYOUT_SLOTS[slot_index],
+        });
+    }
+
+    Ok(rendered)
+}
 
 /// Cross-subdomain SSO logout (terminated at the Keystone IdP behind the gateway).
 const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
@@ -113,12 +218,30 @@ pub fn userbox(headers: &HeaderMap) -> String {
 /// gateway-injected signed-in email shown in the app-bar user chip. `content` is already-safe
 /// HTML built by the handler.
 pub fn layout(page_title: &str, headers: &HeaderMap, content: &str) -> String {
-    LAYOUT
-        .replace("{{STYLE}}", app_css())
-        .replace("{{PAGE_TITLE}}", &esc(page_title))
-        .replace("{{NAV}}", &appnav(page_title))
-        .replace("{{USERBOX}}", &userbox(headers))
-        .replace("{{CONTENT}}", content)
+    layout_with_template(LAYOUT, page_title, headers, content)
+}
+
+fn layout_with_template(
+    template: &str,
+    page_title: &str,
+    headers: &HeaderMap,
+    content: &str,
+) -> String {
+    let escaped_title = esc(page_title);
+    let nav = appnav(page_title);
+    let user_box = userbox(headers);
+    let replacements = [
+        escaped_title.as_str(),
+        app_css(),
+        nav.as_str(),
+        user_box.as_str(),
+        content,
+    ];
+
+    render_layout_template(template, replacements).unwrap_or_else(|error| {
+        tracing::error!(%error, "Almanac layout template rejected");
+        LAYOUT_FAILURE_PAGE.to_string()
+    })
 }
 
 /// The section nav (`Calendar` / `Contacts` / `Settings`). `active` is `"calendar"`,
@@ -142,14 +265,22 @@ pub fn subnav(active: &str) -> String {
 
 /// A standalone Steadholme-styled error page (used by [`crate::error::AppError`]).
 pub fn error_page(status: u16, title: &str, detail: &str) -> String {
+    let state = match status {
+        400 => "invalid",
+        403 => "csrf",
+        404 => "not-found",
+        409 => "conflict",
+        _ => "unavailable",
+    };
     let content = format!(
-        "<section class=\"card empty-state\">\
+        "<section class=\"card empty-state state state--{state}\">\
            <div class=\"empty-state__code\">{status}</div>\
            <h1>{title}</h1>\
            <p class=\"muted\">{detail}</p>\
            <a class=\"btn btn-primary\" href=\"/\">Back to the calendar</a>\
          </section>",
         status = status,
+        state = state,
         title = esc(title),
         detail = esc(detail),
     );
@@ -173,15 +304,20 @@ pub fn public_shell(page_title: &str, content: &str) -> String {
     )
 }
 
-/// A design-system pill for an attendee's RSVP status.
-pub fn status_pill(status: &str) -> String {
+/// Non-color attendance tag: border style, typography, and text all carry the state.
+pub fn status_tag(status: &str) -> String {
     let (cls, label) = match status {
-        "accepted" => ("pill pill-ok", "Accepted"),
-        "declined" => ("pill pill-down", "Declined"),
-        "tentative" => ("pill pill-warn", "Tentative"),
-        _ => ("pill pill-info", "No response"),
+        "accepted" => ("tag tag--accepted", "Accepted"),
+        "declined" => ("tag tag--declined", "Declined"),
+        "tentative" => ("tag tag--tentative", "Tentative"),
+        _ => ("tag tag--needs-action", "No response"),
     };
     format!("<span class=\"{cls}\">{label}</span>")
+}
+
+/// Backward-compatible source alias while all emitters migrate to [`status_tag`].
+pub fn status_pill(status: &str) -> String {
+    status_tag(status)
 }
 
 /// Minimal HTML-escape for any untrusted text rendered into the page.
@@ -218,6 +354,85 @@ mod tests {
         assert!(html.contains("me@steadholme.local"));
         assert!(html.contains("Steadholme"));
         assert!(html.contains("sso.w33d.xyz/_gw/auth/logout"));
+    }
+
+    #[test]
+    fn layout_treats_placeholder_like_input_as_opaque() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            auth::HEADER_EMAIL,
+            "{{STYLE}}+{{CONTENT}}@example.test".parse().unwrap(),
+        );
+        let content =
+            "<p id=\"hostile\">{{PAGE_TITLE}} {{STYLE}} {{NAV}} {{USERBOX}} {{CONTENT}}</p>";
+
+        let html = layout("{{CONTENT}} {{STYLE}}", &headers, content);
+
+        assert!(html.contains("<title>{{CONTENT}} {{STYLE}} · Almanac"));
+        assert!(html.contains(content));
+        assert!(html.contains("{{STYLE}}+{{CONTENT}}@example.test"));
+        assert_eq!(html.matches("id=\"hostile\"").count(), 1);
+        assert_eq!(html.matches("<!DOCTYPE html>").count(), 1);
+    }
+
+    #[test]
+    fn layout_template_rejects_unknown_and_unclosed_slots() {
+        let replacements = ["title", "style", "nav", "user", "content"];
+
+        let unknown = render_layout_template(
+            "{{PAGE_TITLE}}{{STYLE}}{{NAV}}{{USERBOX}}{{UNKNOWN}}",
+            replacements,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            unknown,
+            LayoutTemplateError::UnknownSlot { ref name, .. } if name == "UNKNOWN"
+        ));
+
+        let unclosed = render_layout_template(
+            "{{PAGE_TITLE}}{{STYLE}}{{NAV}}{{USERBOX}}{{CONTENT",
+            replacements,
+        )
+        .unwrap_err();
+        assert!(matches!(unclosed, LayoutTemplateError::UnclosedSlot { .. }));
+    }
+
+    #[test]
+    fn error_shell_has_one_skip_link_target() {
+        let html = error_page(500, "Unavailable", "Try again later.");
+
+        assert_eq!(html.matches("id=\"main-pane\"").count(), 1);
+        assert_eq!(
+            html.matches("class=\"skip-link\" href=\"#main-pane\"")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejected_template_fallback_has_one_skip_link_target() {
+        let html = layout_with_template(
+            "{{PAGE_TITLE}}{{STYLE}}{{NAV}}{{USERBOX}}{{CONTENT}}{{UNKNOWN}}",
+            "HOSTILE-TITLE",
+            &HeaderMap::new(),
+            "<script>HOSTILE-CONTENT</script>",
+        );
+
+        assert_eq!(html.matches("id=\"main-pane\"").count(), 1);
+        assert_eq!(
+            html.matches("class=\"skip-link\" href=\"#main-pane\"")
+                .count(),
+            1
+        );
+        assert!(html.contains("id=\"main-pane\" tabindex=\"-1\""));
+        assert!(!html.contains("{{"));
+        assert!(!html.contains("HOSTILE-TITLE"));
+        assert!(!html.contains("HOSTILE-CONTENT"));
+        let body = html.split_once("<body>").expect("body").1;
+        assert!(
+            body.starts_with("<a class=\"skip-link\""),
+            "skip link is the first focusable body element"
+        );
     }
 
     #[test]

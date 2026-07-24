@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -9,6 +9,7 @@
   <style>{{STYLE}}</style>
 </head>
 <body class="page-almanac">
+  <a class="skip-link" href="#main-pane">Skip to main content</a>
   <header class="appbar">
     <a class="appbar__brand" href="/" aria-label="Steadholme Almanac">
       <span class="app-tile" style="--app:#0891b2;--app-soft:#e0f5f9" aria-hidden="true">
@@ -23,7 +24,7 @@
     <div class="appbar__right">{{USERBOX}}</div>
   </header>
 
-  <main class="wrap">
+  <main class="wrap" id="main-pane" tabindex="-1">
     {{CONTENT}}
   </main>
 </body>

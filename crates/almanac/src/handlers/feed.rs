@@ -7,13 +7,14 @@
 //! Both are SSO (owner scoped by the gateway `X-Auth-Subject`) and emit `text/calendar` with an
 //! attachment disposition. CalDAV write (`PROPFIND`/`PUT`) is a noted future enhancement.
 
-use axum::extract::{Path, State};
+use axum::extract::{rejection::PathRejection, Path, State};
 use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 
 use crate::auth;
 use crate::calendar;
 use crate::error::AppError;
+use crate::handlers::path_or_invalid;
 use crate::{ics, now_ms, AppState};
 
 /// The host used for VEVENT UID domains.
@@ -26,8 +27,13 @@ pub async fn calendar_ics(
 ) -> Result<Response, AppError> {
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
-    let events = state.store.list_events(&owner).await?;
-    let body = ics::calendar_feed(&events, off, now_ms(), CAL_HOST);
+    let listing = state.store.list_events(&owner).await?;
+    if listing.has_more {
+        return Err(AppError::Unavailable(
+            "The calendar export is too large to produce completely right now.".to_string(),
+        ));
+    }
+    let body = ics::calendar_feed(&listing.events, off, now_ms(), CAL_HOST);
     Ok(ics_response(body, "calendar.ics"))
 }
 
@@ -35,8 +41,9 @@ pub async fn calendar_ics(
 pub async fn event_ics(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
     let event = state

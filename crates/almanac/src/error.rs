@@ -24,6 +24,10 @@ pub enum AppError {
     /// Unexpected internal failure (store I/O).
     #[error("server_error: {0}")]
     Internal(String),
+
+    /// Store data could not be read or written. Copy is deliberately generic.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
 }
 
 impl AppError {
@@ -33,6 +37,7 @@ impl AppError {
             AppError::Forbidden(d) => (StatusCode::FORBIDDEN, d.clone()),
             AppError::NotFound(d) => (StatusCode::NOT_FOUND, d.clone()),
             AppError::Internal(d) => (StatusCode::INTERNAL_SERVER_ERROR, d.clone()),
+            AppError::Unavailable(d) => (StatusCode::SERVICE_UNAVAILABLE, d.clone()),
         }
     }
 }
@@ -51,9 +56,33 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Store failures collapse to a 500 server_error.
+/// Store failures are logged server-side and collapse to one non-sensitive unavailable state.
 impl From<crate::store::StoreError> for AppError {
     fn from(e: crate::store::StoreError) -> Self {
-        AppError::Internal(e.to_string())
+        tracing::error!(error = %e, "Almanac store operation failed");
+        AppError::Unavailable(
+            "Calendar data is unavailable right now. Nothing shown is current.".to_string(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_failures_do_not_expose_backend_detail() {
+        let error = AppError::from(crate::store::StoreError::Backend(
+            "postgres://secret@internal.example".to_string(),
+        ));
+        let (status, detail) = error.parts();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            detail,
+            "Calendar data is unavailable right now. Nothing shown is current."
+        );
+        assert!(!detail.contains("secret"));
+        assert!(!detail.contains("internal.example"));
     }
 }

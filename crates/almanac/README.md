@@ -86,7 +86,7 @@ docker run --rm -p 127.0.0.1:8960:8960 steadholme/almanac:dev   # 然后 curl /h
 docker run --rm -d --name almanac-testpg -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=almanac \
   -p 127.0.0.1:55480:5432 postgres:18-alpine
 TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55480/almanac \
-  cargo test --test pg_store -- --nocapture
+  cargo test --test pg_store -- --ignored --nocapture
 docker rm -f almanac-testpg
 ```
 

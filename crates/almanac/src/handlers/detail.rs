@@ -4,14 +4,15 @@
 //! and its reminders, plus links to edit the event and download its `.ics`. Every remote/user
 //! string is HTML-escaped on the way out.
 
-use axum::extract::{Path, State};
+use axum::extract::{rejection::PathRejection, Path, State};
 use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Response};
 
 use crate::auth;
 use crate::calendar;
 use crate::error::AppError;
-use crate::render::{self, esc, layout, status_pill};
+use crate::handlers::path_or_invalid;
+use crate::render::{self, esc, layout, status_tag};
 use crate::store::{Attendee, Reminder};
 use crate::AppState;
 
@@ -21,8 +22,9 @@ const CAL_HOST: &str = "cal.w33d.xyz";
 pub async fn show(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
     let event = state
@@ -34,10 +36,31 @@ pub async fn show(
     let reminders = state.store.list_reminders(&owner, &id).await?;
 
     let when = calendar::fmt_event_when_at(event.starts_at, event.ends_at, event.all_day, off);
-    let recur = if event.rrule.trim().is_empty() {
+    let recur = if !event.series_id.trim().is_empty() {
+        "<span class=\"esp esp--override\" aria-label=\"Changed occurrence\">\
+           <span class=\"esp__label\">Changed occurrence</span></span>"
+            .to_string()
+    } else if event.rrule.trim().is_empty() {
         String::new()
     } else {
-        "<span class=\"pill pill-accent\">Repeats ↻</span>".to_string()
+        let removed = if event.exception_dates.is_empty() {
+            String::new()
+        } else {
+            let count = event.exception_dates.len();
+            format!(
+                " <span class=\"esp esp--exception\" aria-label=\"{count} removed {noun}\">\
+                   <span class=\"esp__label\">{count} removed {noun}</span></span>",
+                noun = if count == 1 {
+                    "occurrence"
+                } else {
+                    "occurrences"
+                },
+            )
+        };
+        format!(
+            "<span class=\"esp esp--series\" aria-label=\"Series\">\
+               <span class=\"esp__label\">Series</span></span>{removed}"
+        )
     };
 
     let meta = {
@@ -58,7 +81,7 @@ pub async fn show(
     };
 
     let content = format!(
-        "{subnav}\
+        "{subnav}<div class=\"view-detail\">\
          <div class=\"page-head\">\
            <div><h1>{title}</h1><p class=\"muted\">{when} {recur}</p></div>\
            <div class=\"page-head__actions\">\
@@ -70,7 +93,8 @@ pub async fn show(
          <section class=\"card detail\">{meta}</section>\
          {attendees}\
          {reminders}\
-         <p class=\"almanac-foot\">Steadholme Almanac · <a href=\"/calendar.ics\">Subscribe to this calendar</a> (read-only .ics)</p>",
+         <p class=\"almanac-foot\">Steadholme Almanac · <a href=\"/calendar.ics\">Subscribe to this calendar</a> (read-only .ics)</p>\
+         </div>",
         subnav = render::subnav("calendar"),
         title = esc(&event.title),
         when = esc(&when),
@@ -89,8 +113,14 @@ pub async fn show(
 }
 
 fn render_attendees(attendees: &[Attendee], event_id: &str) -> String {
+    let responded = attendees
+        .iter()
+        .filter(|attendee| attendee.status != "needs-action")
+        .count();
     let head = format!(
-        "<div class=\"almanac-card__head\"><h2>Attendees</h2><span class=\"muted\">{n} invited</span></div>",
+        "<div class=\"almanac-card__head\"><h2>Attendees</h2>\
+           <span class=\"muted\">{responded} of {n} responses</span></div>",
+        responded = responded,
         n = attendees.len()
     );
     if attendees.is_empty() {
@@ -124,14 +154,14 @@ fn render_attendee_row(a: &Attendee) -> String {
     let link = format!("https://{CAL_HOST}/rsvp/{}", esc(&a.token));
     format!(
         "<tr>\
-           <td class=\"strong\">{name}</td>\
-           <td>{email}</td>\
-           <td>{status}</td>\
-           <td><a class=\"rsvp-link\" href=\"/rsvp/{token}\">{link}</a></td>\
+           <td class=\"strong\" data-label=\"Name\">{name}</td>\
+           <td data-label=\"Email\">{email}</td>\
+           <td data-label=\"Status\">{status}</td>\
+           <td data-label=\"RSVP link\"><a class=\"rsvp-link\" href=\"/rsvp/{token}\">{link}</a></td>\
          </tr>",
         name = name,
         email = esc(&a.email),
-        status = status_pill(&a.status),
+        status = status_tag(&a.status),
         token = esc(&a.token),
         link = link,
     )
@@ -144,14 +174,28 @@ fn render_reminders(reminders: &[Reminder]) -> String {
             "<section class=\"card\">{head}<div class=\"list-empty\">No reminders set.</div></section>"
         );
     }
-    let chips: String = reminders
+    let items: String = reminders
         .iter()
-        .map(|r| format!("<span class=\"pill pill-info\">{}</span>", esc(&reminder_label(r.minutes_before))))
+        .map(|r| {
+            let state = if r.delivered_at > 0 {
+                "Hand-off recorded"
+            } else {
+                "Scheduled"
+            };
+            format!(
+                "<li class=\"drip__item\">\
+                   <span class=\"drip__node\" aria-hidden=\"true\"></span>\
+                   <span class=\"drip__lead\">{}</span>\
+                   <span class=\"drip__state\">{state}</span>\
+                 </li>",
+                esc(&reminder_label(r.minutes_before)),
+            )
+        })
         .collect();
     format!(
-        "<section class=\"card\">{head}<div class=\"reminder-chips\">{chips}</div></section>",
+        "<section class=\"card\">{head}<ol class=\"drip\">{items}</ol></section>",
         head = head,
-        chips = chips,
+        items = items,
     )
 }
 

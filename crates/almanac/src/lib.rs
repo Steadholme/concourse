@@ -86,8 +86,11 @@ pub fn app(state: AppState) -> Router {
         // Read-only iCalendar: the whole subscription feed + a single-event download.
         .route("/calendar.ics", get(handlers::feed::calendar_ics))
         .route("/event/{id}/ics", get(handlers::feed::event_ics))
-        // Public (no-SSO) per-attendee RSVP capability link.
-        .route("/rsvp/{token}", get(handlers::rsvp::rsvp))
+        // Public (no-SSO) per-attendee RSVP capability. GET is safe; POST is two-stage + CSRF.
+        .route(
+            "/rsvp/{token}",
+            get(handlers::rsvp::show).post(handlers::rsvp::respond),
+        )
         // Contacts / address book.
         .route("/contacts", get(handlers::contacts::index))
         .route("/contacts/new", post(handlers::contacts::create))

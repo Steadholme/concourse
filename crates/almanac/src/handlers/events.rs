@@ -6,9 +6,12 @@
 //! other's events. Every state-changing POST is double-submit CSRF checked, and all
 //! user-supplied text is HTML-escaped on the way out.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{
+    rejection::{FormRejection, PathRejection, QueryRejection},
+    Path, Query, State,
+};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::{Form, Json};
 use serde::{Deserialize, Deserializer};
 
@@ -16,11 +19,11 @@ use crate::auth;
 use crate::calendar::{self, DayCell, GridDay, MonthView, TimeGridView};
 use crate::config::{AGENDA_HORIZON_MS, AGENDA_LIMIT, DAY_CHIP_LIMIT};
 use crate::error::AppError;
-use crate::handlers::html_with_csrf_cookie;
+use crate::handlers::{form_or_invalid, html_with_csrf_cookie, path_or_invalid, query_or_invalid};
 use crate::render::{self, esc, layout};
 use crate::rrule::{self, Freq};
 use crate::store::{
-    default_calendar_id, Attendee, Calendar, Event, EventException, Reminder,
+    default_calendar_id, Attendee, AttendeeInput, Calendar, Event, EventBundle, EventException,
     DEFAULT_CALENDAR_COLOR,
 };
 use crate::{now_ms, quickadd, AppState};
@@ -132,6 +135,8 @@ impl ViewKind {
 #[derive(Debug, Deserialize)]
 pub struct OccurrenceQuery {
     #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
     pub occurrence: Option<i64>,
 }
 
@@ -215,13 +220,30 @@ pub struct DeleteForm {
     pub csrf_token: String,
 }
 
-/// The quick-add box body: a raw phrase like `Lunch tomorrow 12pm`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickAddIntent {
+    #[default]
+    Review,
+    Commit,
+    OpenEditor,
+}
+
+/// Shared quick-add input for both the HTML form and JSON endpoint.
 #[derive(Debug, Deserialize)]
-pub struct QuickAddForm {
+pub struct QuickAddInput {
     #[serde(default)]
     pub csrf_token: String,
     #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub calendar_id: String,
+    #[serde(default)]
+    pub intent: QuickAddIntent,
+    #[serde(default)]
+    pub reviewed_title: Option<String>,
+    #[serde(default)]
+    pub reviewed_starts_at: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -231,8 +253,9 @@ pub struct QuickAddForm {
 pub async fn index(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<IndexQuery>,
+    query: Result<Query<IndexQuery>, QueryRejection>,
 ) -> Result<Response, AppError> {
+    let q = query_or_invalid(query)?;
     let owner = auth::owner_subject(&headers);
     let settings = state.store.get_settings(&owner).await?;
     let off = calendar::tz_offset_minutes(&settings.timezone);
@@ -240,18 +263,28 @@ pub async fn index(
     let now = now_ms();
     let calendars = state.store.list_calendars(&owner).await?;
     let selected_calendars = selected_calendar_ids(&calendars, &q.cal);
-    let stored = state.store.list_events(&owner).await?;
+    let listing = state.store.list_events(&owner).await?;
+    let source_partial = listing.has_more;
+    let stored = listing.events;
     let csrf = auth::new_csrf_token();
     let kind = ViewKind::parse(q.view.as_deref());
+    if matches!(kind, ViewKind::Month) && q.m.is_some_and(|month| !(1..=12).contains(&month)) {
+        return Err(AppError::BadRequest(format!(
+            "“{}” is not a valid calendar month. Use a month from 1 through 12.",
+            q.m.unwrap_or_default()
+        )));
+    }
+    let requested_anchor = if matches!(kind, ViewKind::Week | ViewKind::Day) {
+        parse_optional_query_date(q.date.as_deref(), "calendar", off)?
+    } else {
+        None
+    };
 
     let inner = match kind {
         ViewKind::Month => {
             let (cur_y, cur_m) = calendar::month_of_at(now, off);
             let year = q.y.unwrap_or(cur_y);
-            let month = match q.m {
-                Some(m) if (1..=12).contains(&m) => m,
-                _ => cur_m,
-            };
+            let month = q.m.unwrap_or(cur_m);
             let view = calendar::build_month_at(year, month, now, off, monday_first);
             // Expand recurring series into the concrete occurrences visible in this render: the
             // month grid's span plus the upcoming-agenda horizon. One-offs pass through unchanged.
@@ -264,20 +297,19 @@ pub async fn index(
                 &view,
                 &events,
                 &calendars,
-                now,
-                &csrf,
-                off,
-                monday_first,
-                &settings.timezone,
+                MonthRenderContext {
+                    now,
+                    csrf: &csrf,
+                    off,
+                    monday_first,
+                    timezone: &settings.timezone,
+                    source_partial,
+                },
             )
         }
         ViewKind::Week | ViewKind::Day => {
             // Anchor on `?date=` (owner-local), else today.
-            let anchor = q
-                .date
-                .as_deref()
-                .and_then(|d| calendar::parse_date_at(d, off))
-                .unwrap_or(now);
+            let anchor = requested_anchor.unwrap_or(now);
             let grid = match kind {
                 ViewKind::Week => calendar::build_week_at(anchor, now, off, monday_first),
                 _ => calendar::build_day_at(anchor, now, off),
@@ -306,22 +338,30 @@ pub async fn index(
             render_agenda_view(
                 &events,
                 &calendars,
-                now,
-                &csrf,
-                off,
-                &settings.timezone,
-                days,
+                AgendaRenderContext {
+                    now,
+                    csrf: &csrf,
+                    off,
+                    timezone: &settings.timezone,
+                    days,
+                    source_partial,
+                },
             )
         }
     };
 
     let content = format!(
-        "{}<div class=\"cal-layout\">{}<div class=\"cal-main\">{}{}</div></div>{}",
-        render::subnav("calendar"),
-        render_calendar_sidebar(&calendars, &selected_calendars, &q, kind, &csrf),
-        render_quick_add(&csrf),
-        inner,
-        QUICKADD_ENHANCER,
+        "{subnav}<div class=\"view-{view} cal-layout\">\
+           <div class=\"cal-main\">{completeness}{bench}{pane}</div>\
+           {rail}\
+         </div>{enhancer}",
+        subnav = render::subnav("calendar"),
+        view = kind.key(),
+        completeness = event_listing_notice(source_partial),
+        bench = render_quick_add(&csrf, &calendars),
+        pane = inner,
+        rail = render_calendar_sidebar(&calendars, &selected_calendars, &q, kind, &csrf),
+        enhancer = QUICKADD_ENHANCER,
     );
     let title = match kind {
         ViewKind::Week => "Week",
@@ -336,29 +376,32 @@ pub async fn index(
 pub async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<SearchQuery>,
+    query: Result<Query<SearchQuery>, QueryRejection>,
 ) -> Result<Response, AppError> {
+    let q = query_or_invalid(query)?;
     let owner = auth::owner_subject(&headers);
     let settings = state.store.get_settings(&owner).await?;
     let off = calendar::tz_offset_minutes(&settings.timezone);
     let now = now_ms();
     let calendars = state.store.list_calendars(&owner).await?;
     let selected_calendars = selected_calendar_ids(&calendars, &q.cal);
-    let stored = state.store.list_events(&owner).await?;
+    let listing = state.store.list_events(&owner).await?;
+    let source_partial = listing.has_more;
+    let stored = listing.events;
     let csrf = auth::new_csrf_token();
     let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
-    let win_start = q
-        .from
-        .as_deref()
-        .and_then(|d| calendar::parse_date_at(d, off))
+    let win_start = parse_optional_query_date(q.from.as_deref(), "search start", off)?
         .unwrap_or(now - 365 * DAY_MS);
-    let win_end =
-        q.to.as_deref()
-            .and_then(|d| calendar::parse_date_at(d, off))
-            .map(|t| t + DAY_MS)
-            .unwrap_or(now + 365 * DAY_MS);
+    let win_end = parse_optional_query_date(q.to.as_deref(), "search end", off)?
+        .map(|t| t + DAY_MS)
+        .unwrap_or(now + 365 * DAY_MS);
+    if win_start >= win_end {
+        return Err(AppError::BadRequest(
+            "The search start date must be before or equal to the end date.".to_string(),
+        ));
+    }
 
-    let results = if needle.is_empty() {
+    let mut results = if needle.is_empty() {
         Vec::new()
     } else {
         let expanded = rrule::expand_events(&stored, win_start, win_end);
@@ -371,30 +414,74 @@ pub async fn search(
                     || e.location.to_lowercase().contains(&needle)
                     || e.notes.to_lowercase().contains(&needle)
             })
-            .take(SEARCH_LIMIT)
+            .take(SEARCH_LIMIT + 1)
             .collect::<Vec<_>>()
     };
+    let search_partial = results.len() > SEARCH_LIMIT;
+    results.truncate(SEARCH_LIMIT);
 
-    let inner = render_search_results(&q, &results, &calendars, now, &csrf, off, &needle);
-    let content = format!("{}{}", render::subnav("calendar"), inner);
+    let inner = render_search_results(
+        &q,
+        &results,
+        &calendars,
+        SearchRenderContext {
+            csrf: &csrf,
+            off,
+            needle: &needle,
+            result_partial: search_partial,
+            source_partial,
+        },
+    );
+    let content = format!(
+        "{}<div class=\"view-search\">{}{}</div>",
+        render::subnav("calendar"),
+        event_listing_notice(source_partial),
+        inner
+    );
     let html = layout("Search", &headers, &content);
     Ok(html_with_csrf_cookie(html, &csrf))
 }
 
-/// Progressive-enhancement layer for the quick-add box + a toast host. With JS off the `.quickadd`
-/// form posts to `/quick-add` (unchanged); with JS on this intercepts the submit, POSTs the phrase
-/// to `/quick-add.json`, and on success clears the box, prepends the new event to the on-screen
-/// agenda, and toasts — no reload. An unparseable phrase falls through to the plain form submit so
-/// the editor still opens prefilled. Remote strings are inserted via textContent only (XSS-safe).
+fn parse_optional_query_date(
+    submitted: Option<&str>,
+    field: &str,
+    off: i32,
+) -> Result<Option<i64>, AppError> {
+    let Some(submitted) = submitted.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    calendar::parse_date_at(submitted, off)
+        .map(Some)
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "“{submitted}” is not a valid {field} date. Use YYYY-MM-DD."
+            ))
+        })
+}
+
+fn event_listing_notice(source_partial: bool) -> &'static str {
+    if source_partial {
+        "<section class=\"state state--partial\" role=\"status\">\
+           Showing the first loaded events. Empty cells and counts describe loaded rows only; \
+           more events exist outside this projection.\
+         </section>"
+    } else {
+        ""
+    }
+}
+
+/// Progressive enhancement for the typed review → commit contract. A network failure is left
+/// uncertain: it never auto-retries and never falls through to another mutating submission.
 const QUICKADD_ENHANCER: &str = r##"<div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="true"></div>
 <script>
 (function () {
-  var form = document.querySelector('.quickadd');
+  var form = document.querySelector('[data-quickadd]');
   if (!form) return;
-  var input = form.querySelector('.quickadd__input');
-  var btn = form.querySelector('button[type=submit]');
-  var btnLabel = btn ? btn.textContent : 'Add';
+  var input = form.querySelector('input[name=text]');
+  var stage = document.getElementById('bench-stage');
+  var reviewButton = form.querySelector('button[type=submit]');
   var toastHost = document.getElementById('toast-host');
+  var inFlight = false;
   function toast(text, kind) {
     if (!toastHost) return;
     var el = document.createElement('div');
@@ -408,65 +495,116 @@ const QUICKADD_ENHANCER: &str = r##"<div class="toast-host" id="toast-host" aria
       setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 200);
     }, 2600);
   }
-  function csrf() { var el = form.querySelector('input[name=csrf_token]'); return el ? el.value : ''; }
-  function setBusy(on) { if (!btn) return; btn.disabled = on; btn.textContent = on ? 'Adding…' : btnLabel; }
-  function prependAgenda(data) {
-    var agenda = document.querySelector('.agenda');
-    if (!agenda) return false;
-    var empty = agenda.querySelector('.agenda-empty'); if (empty) empty.remove();
-    var item = document.createElement('div');
-    item.className = 'agenda__item agenda__item--fresh';
-    var when = document.createElement('div'); when.className = 'agenda__when'; when.textContent = data.when || '';
-    var body = document.createElement('div'); body.className = 'agenda__body';
-    var a = document.createElement('a'); a.className = 'agenda__title';
-    a.href = '/edit/' + encodeURIComponent(data.id); a.textContent = data.title || '(untitled)';
-    body.appendChild(a); item.appendChild(when); item.appendChild(body);
-    agenda.insertBefore(item, agenda.querySelector('.agenda__item') || null);
-    return true;
+  function value(name) {
+    var el = form.querySelector('[name="' + name + '"]');
+    return el ? el.value : '';
   }
-  form.addEventListener('submit', function (ev) {
-    var text = input ? input.value.trim() : '';
-    if (!text) { ev.preventDefault(); return; }
-    ev.preventDefault();
-    setBusy(true);
+  function request(payload, trigger) {
+    if (inFlight) return;
+    inFlight = true;
+    if (reviewButton) reviewButton.disabled = true;
+    if (trigger) trigger.disabled = true;
     fetch('/quick-add.json', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
       cache: 'no-store',
-      body: JSON.stringify({ text: text, csrf_token: csrf() })
+      body: JSON.stringify(payload)
     })
-      .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+      .then(function (r) { return r.json(); })
       .then(function (data) {
-        if (data && data.ok) {
+        if (!data || !stage) return;
+        stage.replaceChildren();
+        if (data.kind === 'review') {
+          var dl = document.createElement('dl'); dl.className = 'bench__review';
+          [['When', data.when], ['Title', data.title], ['Calendar', data.calendar_name]].forEach(function (row) {
+            var dt = document.createElement('dt'); dt.textContent = row[0];
+            var dd = document.createElement('dd'); dd.textContent = row[1] || '';
+            dl.appendChild(dt); dl.appendChild(dd);
+          });
+          var actions = document.createElement('div'); actions.className = 'bench__commit';
+          var commit = document.createElement('button'); commit.type = 'button'; commit.className = 'btn btn-primary';
+          commit.textContent = 'Add to calendar';
+          commit.addEventListener('click', function () {
+            request({
+              csrf_token: value('csrf_token'), text: value('text'),
+              calendar_id: value('calendar_id'), intent: 'commit',
+              reviewed_title: data.title, reviewed_starts_at: data.starts_at
+            }, commit);
+          });
+          var editor = document.createElement('button'); editor.type = 'button'; editor.className = 'btn btn-secondary';
+          editor.textContent = 'Open in editor';
+          editor.addEventListener('click', function () {
+            var intent = form.querySelector('input[name=intent]'); intent.value = 'open_editor';
+            form.submit();
+          });
+          actions.appendChild(commit); actions.appendChild(editor);
+          stage.appendChild(dl); stage.appendChild(actions);
+        } else if (data.kind === 'committed') {
           if (input) input.value = '';
-          prependAgenda(data);
           toast('Added ' + (data.title || 'event') + (data.when ? ' · ' + data.when : ''));
-          setBusy(false);
+          var done = document.createElement('p'); done.className = 'state state--committed';
+          done.textContent = 'Added to calendar.';
+          stage.appendChild(done);
         } else {
-          // Unparseable — hand off to the real form (opens the editor prefilled). form.submit()
-          // bypasses this handler, so there is no recursion.
-          setBusy(false);
-          form.submit();
+          var notice = document.createElement('p');
+          notice.className = 'bench__notice state state--' + (data.kind || 'unavailable');
+          notice.textContent = data.message || 'Time interpretation is unavailable — retry.';
+          stage.appendChild(notice);
         }
       })
-      .catch(function () { setBusy(false); toast("Couldn't add — try again", 'err'); });
+      .catch(function () {
+        toast('Result unknown — check the calendar before trying again.', 'err');
+      })
+      .finally(function () {
+        inFlight = false;
+        if (reviewButton) reviewButton.disabled = false;
+        if (trigger) trigger.disabled = false;
+      });
+  }
+  form.addEventListener('submit', function (ev) {
+    if (value('intent') !== 'review') return;
+    if (!input || !input.value.trim()) { ev.preventDefault(); return; }
+    ev.preventDefault();
+    request({
+      csrf_token: value('csrf_token'), text: value('text'),
+      calendar_id: value('calendar_id'), intent: 'review'
+    }, reviewButton);
   });
 })();
 </script>"##;
 
-/// The natural-language quick-add box shown above every calendar view. Posts the raw phrase to
-/// `/quick-add`; an unparseable phrase re-renders the editor prefilled (see [`quick_add`]).
-fn render_quick_add(csrf: &str) -> String {
+/// Stage one of the Propagation Bench. The same form is complete without JavaScript.
+fn render_quick_add(csrf: &str, calendars: &[Calendar]) -> String {
+    let options: String = calendars
+        .iter()
+        .map(|calendar| {
+            format!(
+                "<option value=\"{}\">{}</option>",
+                esc(&calendar.id),
+                esc(&calendar.name)
+            )
+        })
+        .collect();
     format!(
-        "<form class=\"card quickadd\" method=\"post\" action=\"/quick-add\">\
-           <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-           <input class=\"quickadd__input\" type=\"text\" name=\"text\" autocomplete=\"off\" \
-             maxlength=\"200\" placeholder=\"Quick add — e.g. Lunch tomorrow 12pm\" \
-             aria-label=\"Quick add an event\">\
-           <button class=\"btn btn-primary\" type=\"submit\">Add</button>\
-         </form>",
+        "<section class=\"bench\" aria-labelledby=\"bench-title\">\
+           <div class=\"bench__head\"><h2 id=\"bench-title\">Propagation bench</h2>\
+             <p>Interpret first, then add.</p></div>\
+           <form class=\"bench__raw quickadd\" method=\"post\" action=\"/quick-add\" data-quickadd>\
+             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+             <input type=\"hidden\" name=\"intent\" value=\"review\">\
+             <label for=\"quickadd-text\">Quick add</label>\
+             <input id=\"quickadd-text\" class=\"quickadd__input\" type=\"text\" name=\"text\" \
+               autocomplete=\"off\" maxlength=\"200\" \
+               placeholder=\"Lunch tomorrow 12pm\">\
+             <label for=\"quickadd-calendar\">Calendar</label>\
+             <select id=\"quickadd-calendar\" name=\"calendar_id\">{options}</select>\
+             <button class=\"btn btn-primary\" type=\"submit\">Review</button>\
+           </form>\
+           <div class=\"bench__parse\" id=\"bench-stage\" aria-live=\"polite\"></div>\
+         </section>",
         csrf = esc(csrf),
+        options = options,
     )
 }
 
@@ -479,7 +617,15 @@ fn view_switch(active: ViewKind, anchor: &str) -> String {
         } else {
             "btn btn-secondary btn-sm"
         };
-        format!("<a class=\"{cls}\" href=\"{}\">{label}</a>", esc(href))
+        let current = if kind == active {
+            " aria-current=\"page\""
+        } else {
+            ""
+        };
+        format!(
+            "<a class=\"{cls}\" href=\"{}\"{current}>{label}</a>",
+            esc(href)
+        )
     };
     format!(
         "<span class=\"cal-viewswitch\">{}{}{}{}</span>",
@@ -681,10 +827,7 @@ fn render_time_grid(
 
     // Both the header row and the body use the same column template so the columns line up:
     // a fixed hour-gutter column plus one flexible column per day.
-    let cols_style = format!(
-        "grid-template-columns: 56px repeat({}, minmax(0, 1fr))",
-        g.days.len()
-    );
+    let cols_style = format!("--days:{}", g.days.len());
 
     // Day headers + the all-day strip (both share the header grid).
     let mut dayheads = String::new();
@@ -692,9 +835,10 @@ fn render_time_grid(
     for d in &g.days {
         let day_href = esc(&format!("/?view=day&date={}", d.iso_date));
         dayheads.push_str(&format!(
-            "<a class=\"tgrid__dayhead{today}\" href=\"{href}\">\
+            "<a class=\"tgrid__dayhead{today}\" href=\"{href}\" aria-label=\"{date}{today_label}\">\
                <span class=\"tgrid__dow\">{dow}</span>\
                <span class=\"tgrid__dnum\">{mon} {day}</span>\
+               {today_text}\
              </a>",
             today = if d.is_today {
                 " tgrid__dayhead--today"
@@ -702,9 +846,16 @@ fn render_time_grid(
                 ""
             },
             href = day_href,
+            date = esc(&d.iso_date),
+            today_label = if d.is_today { " — Today" } else { "" },
             dow = d.weekday,
             mon = d.month_abbr,
             day = d.day,
+            today_text = if d.is_today {
+                "<span class=\"sr-only\">Today</span>"
+            } else {
+                ""
+            },
         ));
         alldays.push_str(&format!(
             "<div class=\"tgrid__allday-cell\">{}</div>",
@@ -763,8 +914,9 @@ fn render_allday_chips(d: &GridDay, events: &[Event], calendars: &[Calendar], of
                 e.title
             ));
             format!(
-                "<a class=\"tgrid__allday-event\" href=\"/edit/{id}\" title=\"{tip}\"{style}>{title}{recur}</a>",
-                id = esc(&e.id),
+                "<a class=\"tgrid__allday-event\" href=\"{href}\" title=\"{tip}\"{style}>\
+                   <span class=\"sr-only\">All-day · </span>{title}{recur}</a>",
+                href = event_edit_href(e),
                 tip = tooltip,
                 style = event_style(e, calendars),
                 title = esc(&e.title),
@@ -784,7 +936,7 @@ fn render_now_line(d: &GridDay, now: i64) -> String {
         return String::new();
     }
     format!(
-        "<div class=\"tgrid__now\" style=\"top:{:.1}px\"></div>",
+        "<div class=\"tgrid__now\" style=\"top:{:.1}px\"><span class=\"sr-only\">Now</span></div>",
         min * PX_PER_MIN
     )
 }
@@ -850,12 +1002,12 @@ fn render_day_column(d: &GridDay, events: &[Event], calendars: &[Calendar], off:
                 e.title
             ));
             out.push_str(&format!(
-                "<a class=\"tgrid__event\" href=\"/edit/{id}\" \
+                "<a class=\"tgrid__event\" href=\"{href}\" \
                    style=\"top:{top:.1}px;height:{height:.1}px;left:{left:.4}%;width:{width:.4}%;--cal-color:{color}\" \
                    title=\"{tip}\">\
-                   <span class=\"tgrid__event-time\">{start}</span> {title}{recur}\
+                   <span class=\"cal-event__time tgrid__event-time\">{start}</span> {title}{recur}\
                  </a>",
-                id = esc(&e.id),
+                href = event_edit_href(e),
                 top = top,
                 height = height,
                 left = left,
@@ -872,16 +1024,29 @@ fn render_day_column(d: &GridDay, events: &[Event], calendars: &[Calendar], off:
     out
 }
 
+struct MonthRenderContext<'a> {
+    now: i64,
+    csrf: &'a str,
+    off: i32,
+    monday_first: bool,
+    timezone: &'a str,
+    source_partial: bool,
+}
+
 fn render_calendar(
     view: &MonthView,
     events: &[Event],
     calendars: &[Calendar],
-    now: i64,
-    csrf: &str,
-    off: i32,
-    monday_first: bool,
-    tz_label: &str,
+    context: MonthRenderContext<'_>,
 ) -> String {
+    let MonthRenderContext {
+        now,
+        csrf,
+        off,
+        monday_first,
+        timezone,
+        source_partial,
+    } = context;
     let head = format!(
         "<div class=\"cal-head\">\
            <h1>{month} {year}</h1>\
@@ -913,7 +1078,9 @@ fn render_calendar(
         for cell in week {
             match cell {
                 None => weeks.push_str("<div class=\"cal-day cal-day--pad\"></div>"),
-                Some(c) => weeks.push_str(&render_day_cell(c, events, calendars, off)),
+                Some(c) => {
+                    weeks.push_str(&render_day_cell(c, events, calendars, off, source_partial))
+                }
             }
         }
         weeks.push_str("</div>");
@@ -930,8 +1097,8 @@ fn render_calendar(
         head = head,
         weekdays = weekdays,
         weeks = weeks,
-        agenda = render_agenda(events, calendars, now, csrf, off),
-        tz = esc(tz_label),
+        agenda = render_agenda(events, calendars, now, csrf, off, source_partial),
+        tz = esc(timezone),
     )
 }
 
@@ -950,17 +1117,47 @@ fn grid_bounds(view: &MonthView) -> (i64, i64) {
     }
 }
 
-/// A small "repeats" glyph appended to recurring-series chips/labels (occurrences carry the series
-/// `rrule`). Empty for one-off events.
-fn recur_mark(e: &Event) -> &'static str {
-    if e.rrule.trim().is_empty() {
-        ""
+fn recurrence_context(e: &Event) -> Option<(&str, i64)> {
+    if !e.series_id.trim().is_empty() && e.override_occurrence_date > 0 {
+        Some((&e.series_id, e.override_occurrence_date))
+    } else if !e.rrule.trim().is_empty() {
+        Some((&e.id, e.starts_at))
     } else {
-        " ↻"
+        None
     }
 }
 
-fn render_day_cell(c: &DayCell, events: &[Event], calendars: &[Calendar], off: i32) -> String {
+fn event_edit_href(e: &Event) -> String {
+    match recurrence_context(e) {
+        Some((series_id, occurrence)) => {
+            format!("/edit/{}?occurrence={occurrence}", esc(series_id))
+        }
+        None => format!("/edit/{}", esc(&e.id)),
+    }
+}
+
+/// Structural recurrence marker: CSS draws the espalier, text preserves meaning without color.
+fn recur_mark(e: &Event) -> String {
+    if !e.series_id.trim().is_empty() {
+        "<span class=\"esp esp--override\" aria-label=\"Changed occurrence\">\
+           <span class=\"esp__label\">Changed occurrence</span></span>"
+            .to_string()
+    } else if !e.rrule.trim().is_empty() {
+        "<span class=\"esp esp--occurrence\" aria-label=\"Occurrence\">\
+           <span class=\"esp__label\">Occurrence</span></span>"
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn render_day_cell(
+    c: &DayCell,
+    events: &[Event],
+    calendars: &[Calendar],
+    off: i32,
+    source_partial: bool,
+) -> String {
     let day_events: Vec<&Event> = events
         .iter()
         .filter(|e| e.starts_at <= c.end_ms && e.ends_at >= c.start_ms)
@@ -968,14 +1165,27 @@ fn render_day_cell(c: &DayCell, events: &[Event], calendars: &[Calendar], off: i
 
     let mut chips = String::new();
     for e in day_events.iter().take(DAY_CHIP_LIMIT) {
+        let calendar_name = event_calendar(e, calendars)
+            .map(|calendar| calendar.name.as_str())
+            .unwrap_or("Calendar");
         let label = if e.all_day {
-            format!("{}{}", esc(&e.title), recur_mark(e))
+            format!(
+                "<span class=\"sr-only\">All-day · </span>\
+                 <span class=\"cal-event__title\">{}</span>{}\
+                 <span class=\"sr-only\"> · {}</span>",
+                esc(&e.title),
+                recur_mark(e),
+                esc(calendar_name),
+            )
         } else {
             format!(
-                "{} {}{}",
+                "<span class=\"cal-event__time\">{}</span> \
+                 <span class=\"cal-event__title\">{}</span>{}\
+                 <span class=\"sr-only\"> · {}</span>",
                 calendar::human_time_at(e.starts_at, off),
                 esc(&e.title),
-                recur_mark(e)
+                recur_mark(e),
+                esc(calendar_name),
             )
         };
         let tooltip = esc(&format!(
@@ -984,9 +1194,9 @@ fn render_day_cell(c: &DayCell, events: &[Event], calendars: &[Calendar], off: i
             e.title
         ));
         chips.push_str(&format!(
-            "<a class=\"cal-event{ad}\" href=\"/edit/{id}\" title=\"{tooltip}\"{style}>{label}</a>",
+            "<a class=\"cal-event{ad}\" href=\"{href}\" title=\"{tooltip}\"{style}>{label}</a>",
             ad = if e.all_day { " cal-event--allday" } else { "" },
-            id = esc(&e.id),
+            href = event_edit_href(e),
             tooltip = tooltip,
             style = event_style(e, calendars),
             label = label,
@@ -994,19 +1204,39 @@ fn render_day_cell(c: &DayCell, events: &[Event], calendars: &[Calendar], off: i
     }
     if day_events.len() > DAY_CHIP_LIMIT {
         chips.push_str(&format!(
-            "<span class=\"cal-more\">+{} more</span>",
-            day_events.len() - DAY_CHIP_LIMIT
+            "<a class=\"cal-more\" href=\"/?view=day&amp;date={iso}\">\
+               +{more} more{loaded} <span class=\"cal-tally\" aria-hidden=\"true\">{total}</span>\
+             </a>",
+            iso = esc(&c.iso_date),
+            more = day_events.len() - DAY_CHIP_LIMIT,
+            loaded = if source_partial { " loaded" } else { "" },
+            total = day_events.len(),
         ));
     }
+    let count_label = if source_partial {
+        format!(
+            "{} loaded events; more may exist outside this projection",
+            day_events.len()
+        )
+    } else {
+        format!("{} events", day_events.len())
+    };
 
     format!(
-        "<div class=\"cal-day{today}\">\
-           <a class=\"cal-daynum\" href=\"/new?date={iso}\" title=\"Add an event on this day\">{day}</a>\
+        "<div class=\"cal-day{today}\" aria-label=\"{iso} — {count_label}\">\
+           <a class=\"cal-daynum\" href=\"/?view=day&amp;date={iso}\">{day}{today_text}</a>\
+           <a class=\"cal-add\" href=\"/new?date={iso}\" aria-label=\"Add an event on {iso}\">+</a>\
            <div class=\"cal-events\">{chips}</div>\
          </div>",
         today = if c.is_today { " cal-day--today" } else { "" },
         iso = esc(&c.iso_date),
         day = c.day,
+        count_label = count_label,
+        today_text = if c.is_today {
+            "<span class=\"sr-only\"> Today</span>"
+        } else {
+            ""
+        },
         chips = chips,
     )
 }
@@ -1017,17 +1247,19 @@ fn render_agenda(
     now: i64,
     csrf: &str,
     off: i32,
+    source_partial: bool,
 ) -> String {
     // `events` is already sorted by starts_at ascending; keep only those that haven't ended.
-    let upcoming: Vec<&Event> = events
-        .iter()
-        .filter(|e| e.ends_at >= now)
-        .take(AGENDA_LIMIT)
-        .collect();
+    let all_upcoming: Vec<&Event> = events.iter().filter(|e| e.ends_at >= now).collect();
+    let hidden = all_upcoming.len().saturating_sub(AGENDA_LIMIT);
+    let upcoming: Vec<&Event> = all_upcoming.into_iter().take(AGENDA_LIMIT).collect();
 
     let body = if upcoming.is_empty() {
-        "<p class=\"agenda-empty\">No upcoming events. <a href=\"/new\">Add one.</a></p>"
-            .to_string()
+        if source_partial {
+            "<p class=\"agenda-empty state state--partial\">No loaded events in this range; more events exist outside this projection.</p>".to_string()
+        } else {
+            "<p class=\"agenda-empty state state--empty\">No events in this range. <a href=\"/new\">New event</a></p>".to_string()
+        }
     } else {
         upcoming
             .iter()
@@ -1035,29 +1267,47 @@ fn render_agenda(
             .collect()
     };
 
+    let partial = if hidden > 0 {
+        format!("<p class=\"state state--partial\">+{hidden} more loaded events not shown</p>")
+    } else {
+        String::new()
+    };
     format!(
-        "<section class=\"agenda\"><h2 class=\"agenda__head\">Upcoming</h2>{body}</section>",
-        body = body,
+        "<section class=\"agenda\"><h2 class=\"agenda__head\">Upcoming</h2>{body}{partial}</section>",
     )
+}
+
+struct AgendaRenderContext<'a> {
+    now: i64,
+    csrf: &'a str,
+    off: i32,
+    timezone: &'a str,
+    days: i64,
+    source_partial: bool,
 }
 
 fn render_agenda_view(
     events: &[Event],
     calendars: &[Calendar],
-    now: i64,
-    csrf: &str,
-    off: i32,
-    tz_label: &str,
-    days: i64,
+    context: AgendaRenderContext<'_>,
 ) -> String {
-    let upcoming: Vec<&Event> = events
-        .iter()
-        .filter(|e| e.ends_at >= now)
-        .take(AGENDA_LIMIT)
-        .collect();
+    let AgendaRenderContext {
+        now,
+        csrf,
+        off,
+        timezone,
+        days,
+        source_partial,
+    } = context;
+    let all_upcoming: Vec<&Event> = events.iter().filter(|e| e.ends_at >= now).collect();
+    let hidden = all_upcoming.len().saturating_sub(AGENDA_LIMIT);
+    let upcoming: Vec<&Event> = all_upcoming.into_iter().take(AGENDA_LIMIT).collect();
     let body = if upcoming.is_empty() {
-        "<p class=\"agenda-empty\">No events in this range. <a href=\"/new\">Add one.</a></p>"
-            .to_string()
+        if source_partial {
+            "<p class=\"agenda-empty state state--partial\">No loaded events in this range; more events exist outside this projection.</p>".to_string()
+        } else {
+            "<p class=\"agenda-empty state state--empty\">No events in this range. <a href=\"/new\">New event</a></p>".to_string()
+        }
     } else {
         let mut out = String::new();
         let mut current_day: Option<i64> = None;
@@ -1074,6 +1324,11 @@ fn render_agenda_view(
         }
         out
     };
+    let partial = if hidden > 0 {
+        format!("<p class=\"state state--partial\">+{hidden} more loaded events not shown</p>")
+    } else {
+        String::new()
+    };
     format!(
         "<div class=\"cal-head\">\
            <h1>Agenda</h1>\
@@ -1082,31 +1337,51 @@ fn render_agenda_view(
              <a class=\"btn btn-primary btn-sm\" href=\"/new\">New event</a>\
            </div>\
          </div>\
-         <section class=\"agenda agenda--list\" aria-label=\"Next {days} days\">{body}</section>\
+         <section class=\"agenda agenda--list\" aria-label=\"Next {days} days\">{body}{partial}</section>\
          <p class=\"almanac-foot\">Steadholme Almanac · personal calendar &amp; contacts · times shown in {tz}</p>",
         switch = view_switch(ViewKind::Agenda, &calendar::fmt_date_input(now)),
         days = days,
         body = body,
-        tz = esc(tz_label),
+        partial = partial,
+        tz = esc(timezone),
     )
+}
+
+struct SearchRenderContext<'a> {
+    csrf: &'a str,
+    off: i32,
+    needle: &'a str,
+    result_partial: bool,
+    source_partial: bool,
 }
 
 fn render_search_results(
     q: &SearchQuery,
     results: &[Event],
     calendars: &[Calendar],
-    _now: i64,
-    csrf: &str,
-    off: i32,
-    needle: &str,
+    context: SearchRenderContext<'_>,
 ) -> String {
+    let SearchRenderContext {
+        csrf,
+        off,
+        needle,
+        result_partial,
+        source_partial,
+    } = context;
     let q_str = q.q.as_deref().unwrap_or("").trim();
     let from_str = q.from.as_deref().unwrap_or("").trim();
     let to_str = q.to.as_deref().unwrap_or("").trim();
     let body = if needle.is_empty() {
         "<p class=\"muted\">Type a word to search your events.</p>".to_string()
     } else if results.is_empty() {
-        format!("<p class=\"muted\">No events match “{}”.</p>", esc(q_str))
+        if source_partial {
+            format!(
+                "<p class=\"state state--partial\">No loaded events match “{}”; additional events were not searched.</p>",
+                esc(q_str)
+            )
+        } else {
+            format!("<p class=\"muted\">No events match “{}”.</p>", esc(q_str))
+        }
     } else {
         let mut out = String::new();
         let mut current_day: Option<i64> = None;
@@ -1124,6 +1399,11 @@ fn render_search_results(
         out
     };
 
+    let bound = if result_partial || source_partial {
+        "<p class=\"state state--partial\">Showing a bounded set of loaded matches — narrow the search. More events may exist.</p>"
+    } else {
+        ""
+    };
     format!(
         "<div class=\"cal-head\"><h1>Search</h1></div>\
          <form method=\"get\" action=\"/search\" class=\"search-form\">\
@@ -1132,11 +1412,12 @@ fn render_search_results(
            <input type=\"date\" name=\"to\" value=\"{to}\" aria-label=\"To date\">\
            <button class=\"btn btn-primary btn-sm\" type=\"submit\">Search</button>\
          </form>\
-         <section class=\"agenda agenda--list\">{body}</section>",
+         <section class=\"agenda agenda--list\">{body}{bound}</section>",
         q = esc(q_str),
         from = esc(from_str),
         to = esc(to_str),
         body = body,
+        bound = bound,
     )
 }
 
@@ -1156,49 +1437,61 @@ fn render_agenda_item(e: &Event, calendars: &[Calendar], csrf: &str, off: i32) -
         })
         .unwrap_or_default();
     let occurrence_actions = occurrence_actions(e, csrf);
+    let delete = if recurrence_context(e).is_some() {
+        String::new()
+    } else {
+        format!(
+            "<form class=\"agenda__del\" method=\"post\" action=\"/delete/{id}\" \
+               onsubmit=\"return confirm('Delete this event?')\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Delete</button>\
+             </form>",
+            id = esc(&e.id),
+            csrf = esc(csrf),
+        )
+    };
     format!(
         "<div class=\"agenda__item\"{style}>\
            <div class=\"agenda__when\">{when}</div>\
            <div class=\"agenda__body\">\
-             <a class=\"agenda__title\" href=\"/edit/{id}\">{title}{recur}</a>\
+             <a class=\"agenda__title\" href=\"{href}\">{title}{recur}</a>\
              {cal}\
              {loc}\
            </div>\
            {occurrence_actions}\
-           <form class=\"agenda__del\" method=\"post\" action=\"/delete/{id}\" onsubmit=\"return confirm('Delete this event?')\">\
-             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-             <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Delete</button>\
-           </form>\
+           {delete}\
          </div>",
         style = event_style(e, calendars),
-        when = esc(&calendar::fmt_event_when_at(e.starts_at, e.ends_at, e.all_day, off)),
-        id = esc(&e.id),
+        when = esc(&calendar::fmt_event_when_at(
+            e.starts_at,
+            e.ends_at,
+            e.all_day,
+            off
+        )),
+        href = event_edit_href(e),
         title = esc(&e.title),
         recur = recur_mark(e),
         cal = cal,
         loc = loc,
         occurrence_actions = occurrence_actions,
-        csrf = esc(csrf),
+        delete = delete,
     )
 }
 
 fn occurrence_actions(e: &Event, csrf: &str) -> String {
-    let (series_id, occurrence_date) = if !e.series_id.trim().is_empty() {
-        (e.series_id.as_str(), e.override_occurrence_date)
-    } else if !e.rrule.trim().is_empty() {
-        (e.id.as_str(), e.starts_at)
-    } else {
+    let Some((series_id, occurrence_date)) = recurrence_context(e) else {
         return String::new();
     };
     if occurrence_date <= 0 {
         return String::new();
     }
     format!(
-        "<div class=\"agenda__occ\">\
-           <a class=\"btn btn-secondary btn-sm\" href=\"/edit/{id}?occurrence={occ}\">Edit this</a>\
-           <form method=\"post\" action=\"/delete/{id}?occurrence={occ}\" onsubmit=\"return confirm('Delete this occurrence?')\">\
+        "<div class=\"agenda__occ esp esp--scope\">\
+           <span class=\"esp__label\">Occurrence scope</span>\
+           <a class=\"btn btn-secondary btn-sm\" href=\"/edit/{id}?occurrence={occ}\">Choose edit scope</a>\
+           <form method=\"post\" action=\"/delete/{id}?scope=occurrence&amp;occurrence={occ}\" onsubmit=\"return confirm('Delete only this occurrence?')\">\
              <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-             <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Delete this</button>\
+             <button class=\"btn btn-ghost btn-sm\" type=\"submit\">Delete this occurrence</button>\
            </form>\
          </div>",
         id = esc(series_id),
@@ -1246,6 +1539,113 @@ fn occurrence_event(series: &Event, occurrence_date: i64) -> Event {
     event
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MutationScope {
+    OneOff,
+    Series,
+    Occurrence(i64),
+}
+
+fn mutation_scope(event: &Event, query: &OccurrenceQuery) -> Result<MutationScope, AppError> {
+    let recurring = !event.rrule.trim().is_empty();
+    if !recurring {
+        return if query.scope.is_none() && query.occurrence.is_none() {
+            Ok(MutationScope::OneOff)
+        } else {
+            Err(AppError::BadRequest(
+                "A one-off event does not accept recurrence scope.".to_string(),
+            ))
+        };
+    }
+
+    match (query.scope.as_deref().map(str::trim), query.occurrence) {
+        (Some("series"), None) => Ok(MutationScope::Series),
+        (Some("occurrence"), Some(occurrence))
+            if valid_occurrence_for_series(event, occurrence) =>
+        {
+            Ok(MutationScope::Occurrence(occurrence))
+        }
+        _ => Err(AppError::BadRequest(
+            "Choose the whole series or one valid occurrence before continuing.".to_string(),
+        )),
+    }
+}
+
+fn valid_occurrence_for_series(series: &Event, occurrence: i64) -> bool {
+    occurrence > 0
+        && !series.exception_dates.contains(&occurrence)
+        && rrule::occurrence_belongs_to_series(series.starts_at, &series.rrule, occurrence)
+}
+
+fn render_scope_gate(series: &Event, csrf: &str, off: i32, occurrence: Option<i64>) -> String {
+    let occurrence_choice = occurrence
+        .map(|occurrence| {
+            let event = occurrence_event(series, occurrence);
+            format!(
+                "<form method=\"get\" action=\"/edit/{id}\" class=\"scope-gate__choice\">\
+                   <input type=\"hidden\" name=\"scope\" value=\"occurrence\">\
+                   <input type=\"hidden\" name=\"occurrence\" value=\"{occurrence}\">\
+                   <button class=\"btn btn-secondary\" type=\"submit\">\
+                     <strong>Occurrence</strong><span>{when}</span>\
+                   </button>\
+                 </form>",
+                id = esc(&series.id),
+                when = esc(&calendar::fmt_event_when_at(
+                    event.starts_at,
+                    event.ends_at,
+                    event.all_day,
+                    off,
+                )),
+            )
+        })
+        .unwrap_or_else(|| {
+            "<p class=\"state state--empty\">Open an occurrence from the calendar to edit only that date.</p>"
+                .to_string()
+        });
+    let occurrence_delete = occurrence
+        .map(|occurrence| {
+            format!(
+                "<form method=\"post\" action=\"/delete/{id}?scope=occurrence&amp;occurrence={occurrence}\">\
+                   <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                   <p>Delete only this occurrence. The series and other occurrences stay.</p>\
+                   <button class=\"btn btn-danger\" type=\"submit\">Delete this occurrence</button>\
+                 </form>",
+                id = esc(&series.id),
+                csrf = esc(csrf),
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<section class=\"card scope-gate view-editor\">\
+           <h1>Choose what to edit</h1>\
+           <p>This event repeats. No scope is selected for you.</p>\
+           <div class=\"scope-gate__choices\" aria-label=\"Apply this edit to\">\
+             <form method=\"get\" action=\"/edit/{id}\" class=\"scope-gate__choice\">\
+               <input type=\"hidden\" name=\"scope\" value=\"series\">\
+               <button class=\"btn btn-primary\" type=\"submit\">\
+                 <strong>Series</strong><span>The whole recurring event</span>\
+               </button>\
+             </form>\
+             {occurrence_choice}\
+           </div>\
+           <div class=\"danger-zone scope-gate__delete\">\
+             <h2>Delete scope</h2>\
+             <form method=\"post\" action=\"/delete/{id}?scope=series\">\
+               <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+               <p>Delete the whole series “{title}”. All future occurrences, overrides, attendee responses, and reminders are removed. Shared .ics files and inboxes are not affected.</p>\
+               <button class=\"btn btn-danger\" type=\"submit\">Delete whole series</button>\
+             </form>\
+             {occurrence_delete}\
+           </div>\
+         </section>",
+        id = esc(&series.id),
+        title = esc(&series.title),
+        csrf = esc(csrf),
+        occurrence_choice = occurrence_choice,
+        occurrence_delete = occurrence_delete,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // GET /new  — the create form
 // ---------------------------------------------------------------------------
@@ -1253,19 +1653,17 @@ fn occurrence_event(series: &Event, occurrence_date: i64) -> Event {
 pub async fn new_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<NewQuery>,
+    query: Result<Query<NewQuery>, QueryRejection>,
 ) -> Result<Response, AppError> {
+    let q = query_or_invalid(query)?;
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
     let calendars = state.store.list_calendars(&owner).await?;
     let csrf = auth::new_csrf_token();
 
     // If a day was clicked, default to a 09:00–10:00 LOCAL slot on that day; else leave blank.
-    let (starts_local, ends_local) = match q
-        .date
-        .as_deref()
-        .and_then(|d| calendar::parse_date_at(d, off))
-    {
+    let requested_date = parse_optional_query_date(q.date.as_deref(), "new-event", off)?;
+    let (starts_local, ends_local) = match requested_date {
         Some(day) => {
             let s = day + 9 * 3_600_000;
             (
@@ -1299,8 +1697,13 @@ pub async fn new_form(
         series_id: String::new(),
         occurrence_date: 0,
         id: String::new(),
+        errors: Vec::new(),
     };
-    let content = format!("{}{}", render::subnav("calendar"), render_event_form(&view));
+    let content = format!(
+        "{}<div class=\"view-editor\">{}</div>",
+        render::subnav("calendar"),
+        render_event_form(&view)
+    );
     Ok(html_with_csrf_cookie(
         layout("New event", &headers, &content),
         &csrf,
@@ -1314,38 +1717,58 @@ pub async fn new_form(
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<EventForm>,
+    form: Result<Form<EventForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    let form = form_or_invalid(form)?;
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
-    let parsed = parse_event_form(&form, off)?;
+    let parsed = match parse_event_form(&form, off) {
+        Ok(parsed) => parsed,
+        Err(errors) => {
+            let calendars = state.store.list_calendars(&owner).await?;
+            let view = FormView::from_submission(
+                &form,
+                calendars,
+                "/new".to_string(),
+                errors,
+                SubmittedEditContext::default(),
+            );
+            return Ok(invalid_event_form_response(&headers, &view));
+        }
+    };
     let now = now_ms();
     let id = auth::random_hex();
 
+    let redirect_start = parsed.starts_at;
     state
         .store
-        .upsert_event(Event {
-            id: id.clone(),
-            owner_sub: owner.clone(),
-            calendar_id: parsed.calendar_id,
-            title: parsed.title,
-            starts_at: parsed.starts_at,
-            ends_at: parsed.ends_at,
-            all_day: parsed.all_day,
-            location: parsed.location,
-            notes: parsed.notes,
-            rrule: parsed.rrule,
-            series_id: String::new(),
-            override_occurrence_date: 0,
-            exception_dates: Vec::new(),
-            created_at: now,
+        .save_event_bundle(EventBundle {
+            event: Event {
+                id,
+                owner_sub: owner,
+                calendar_id: parsed.calendar_id,
+                title: parsed.title,
+                starts_at: parsed.starts_at,
+                ends_at: parsed.ends_at,
+                all_day: parsed.all_day,
+                location: parsed.location,
+                notes: parsed.notes,
+                rrule: parsed.rrule,
+                series_id: String::new(),
+                override_occurrence_date: 0,
+                exception_dates: Vec::new(),
+                created_at: now,
+            },
+            attendees: attendee_inputs_from_form(&form),
+            reminder_minutes: reminder_minutes_from_form(&form),
+            now_ms: now,
+            reconcile_series: false,
         })
         .await?;
-    save_attendees_and_reminders(&state, &owner, &id, &form, now).await?;
 
     tracing::info!(target: "audit", event = "event.created", "event created");
-    Ok(redirect_to_month(parsed.starts_at, off))
+    Ok(redirect_to_month(redirect_start, off))
 }
 
 // ---------------------------------------------------------------------------
@@ -1355,9 +1778,11 @@ pub async fn create(
 pub async fn edit_form(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(q): Query<OccurrenceQuery>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<OccurrenceQuery>, QueryRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
+    let q = query_or_invalid(query)?;
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
     let calendars = state.store.list_calendars(&owner).await?;
@@ -1368,9 +1793,31 @@ pub async fn edit_form(
         .ok_or_else(|| AppError::NotFound("That event does not exist.".to_string()))?;
 
     let csrf = auth::new_csrf_token();
-    let occurrence = q.occurrence.filter(|_| !series.rrule.trim().is_empty());
-    let (event, action, is_occurrence, attendee_source_id) = match occurrence {
-        Some(occ) => {
+    if !series.rrule.trim().is_empty() && q.scope.is_none() {
+        let occurrence_context = match q.occurrence {
+            Some(occurrence) if valid_occurrence_for_series(&series, occurrence) => {
+                Some(occurrence)
+            }
+            Some(_) => {
+                return Err(AppError::BadRequest(
+                    "Choose a valid occurrence before continuing.".to_string(),
+                ))
+            }
+            None => None,
+        };
+        let content = format!(
+            "{}{}",
+            render::subnav("calendar"),
+            render_scope_gate(&series, &csrf, off, occurrence_context)
+        );
+        return Ok(html_with_csrf_cookie(
+            layout("Choose edit scope", &headers, &content),
+            &csrf,
+        ));
+    }
+    let scope = mutation_scope(&series, &q)?;
+    let (event, action, is_occurrence, attendee_source_id, occurrence_date) = match scope {
+        MutationScope::Occurrence(occ) => {
             let override_event = state
                 .store
                 .get_event_override(&owner, &series.id, occ)
@@ -1383,16 +1830,25 @@ pub async fn edit_form(
             };
             (
                 event,
-                format!("/edit/{}?occurrence={}", series.id, occ),
+                format!("/edit/{}?scope=occurrence&occurrence={}", series.id, occ),
                 true,
                 source,
+                occ,
             )
         }
-        None => (
+        MutationScope::Series => (
+            series.clone(),
+            format!("/edit/{}?scope=series", series.id),
+            false,
+            series.id.clone(),
+            0,
+        ),
+        MutationScope::OneOff => (
             series.clone(),
             format!("/edit/{}", series.id),
             false,
             series.id.clone(),
+            0,
         ),
     };
     let (repeat, repeat_interval, repeat_count, repeat_until) =
@@ -1428,14 +1884,19 @@ pub async fn edit_form(
         is_edit: true,
         is_occurrence,
         series_id: series.id.clone(),
-        occurrence_date: occurrence.unwrap_or(0),
+        occurrence_date,
         id: if is_occurrence {
             series.id.clone()
         } else {
             event.id.clone()
         },
+        errors: Vec::new(),
     };
-    let content = format!("{}{}", render::subnav("calendar"), render_event_form(&view));
+    let content = format!(
+        "{}<div class=\"view-editor\">{}</div>",
+        render::subnav("calendar"),
+        render_event_form(&view)
+    );
     Ok(html_with_csrf_cookie(
         layout("Edit event", &headers, &content),
         &csrf,
@@ -1449,10 +1910,13 @@ pub async fn edit_form(
 pub async fn update(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(q): Query<OccurrenceQuery>,
-    Form(form): Form<EventForm>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<OccurrenceQuery>, QueryRejection>,
+    form: Result<Form<EventForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
+    let q = query_or_invalid(query)?;
+    let form = form_or_invalid(form)?;
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
     let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
@@ -1462,10 +1926,47 @@ pub async fn update(
         .get_event(&owner, &id)
         .await?
         .ok_or_else(|| AppError::NotFound("That event does not exist.".to_string()))?;
-    let parsed = parse_event_form(&form, off)?;
+    let scope = mutation_scope(&existing, &q)?;
+    let parsed = match parse_event_form(&form, off) {
+        Ok(parsed) => parsed,
+        Err(errors) => {
+            let calendars = state.store.list_calendars(&owner).await?;
+            let (action, edit) = match scope {
+                MutationScope::Occurrence(occurrence) => (
+                    format!("/edit/{id}?scope=occurrence&occurrence={occurrence}"),
+                    SubmittedEditContext {
+                        is_edit: true,
+                        is_occurrence: true,
+                        series_id: existing.id.clone(),
+                        occurrence_date: occurrence,
+                        id: existing.id.clone(),
+                    },
+                ),
+                MutationScope::Series => (
+                    format!("/edit/{id}?scope=series"),
+                    SubmittedEditContext {
+                        is_edit: true,
+                        series_id: existing.id.clone(),
+                        id: existing.id.clone(),
+                        ..SubmittedEditContext::default()
+                    },
+                ),
+                MutationScope::OneOff => (
+                    format!("/edit/{id}"),
+                    SubmittedEditContext {
+                        is_edit: true,
+                        id: existing.id.clone(),
+                        ..SubmittedEditContext::default()
+                    },
+                ),
+            };
+            let view = FormView::from_submission(&form, calendars, action, errors, edit);
+            return Ok(invalid_event_form_response(&headers, &view));
+        }
+    };
     let now = now_ms();
 
-    if let Some(occ) = q.occurrence.filter(|_| !existing.rrule.trim().is_empty()) {
+    if let MutationScope::Occurrence(occ) = scope {
         let prior = state
             .store
             .get_event_override(&owner, &existing.id, occ)
@@ -1475,11 +1976,43 @@ pub async fn update(
             .map(|e| e.id.clone())
             .unwrap_or_else(auth::random_hex);
         let created_at = prior.as_ref().map(|e| e.created_at).unwrap_or(now);
+        let redirect_start = parsed.starts_at;
         state
             .store
-            .upsert_event(Event {
-                id: override_id.clone(),
-                owner_sub: owner.clone(),
+            .save_event_bundle(EventBundle {
+                event: Event {
+                    id: override_id,
+                    owner_sub: owner,
+                    calendar_id: parsed.calendar_id,
+                    title: parsed.title,
+                    starts_at: parsed.starts_at,
+                    ends_at: parsed.ends_at,
+                    all_day: parsed.all_day,
+                    location: parsed.location,
+                    notes: parsed.notes,
+                    rrule: String::new(),
+                    series_id: existing.id,
+                    override_occurrence_date: occ,
+                    exception_dates: Vec::new(),
+                    created_at,
+                },
+                attendees: attendee_inputs_from_form(&form),
+                reminder_minutes: reminder_minutes_from_form(&form),
+                now_ms: now,
+                reconcile_series: false,
+            })
+            .await?;
+        tracing::info!(target: "audit", event = "event.occurrence.updated", "event occurrence updated");
+        return Ok(redirect_to_month(redirect_start, off));
+    }
+
+    let redirect_start = parsed.starts_at;
+    state
+        .store
+        .save_event_bundle(EventBundle {
+            event: Event {
+                id: existing.id,
+                owner_sub: owner,
                 calendar_id: parsed.calendar_id,
                 title: parsed.title,
                 starts_at: parsed.starts_at,
@@ -1487,41 +2020,21 @@ pub async fn update(
                 all_day: parsed.all_day,
                 location: parsed.location,
                 notes: parsed.notes,
-                rrule: String::new(),
-                series_id: existing.id.clone(),
-                override_occurrence_date: occ,
+                rrule: parsed.rrule,
+                series_id: existing.series_id,
+                override_occurrence_date: existing.override_occurrence_date,
                 exception_dates: Vec::new(),
-                created_at,
-            })
-            .await?;
-        save_attendees_and_reminders(&state, &owner, &override_id, &form, now).await?;
-        tracing::info!(target: "audit", event = "event.occurrence.updated", "event occurrence updated");
-        return Ok(redirect_to_month(parsed.starts_at, off));
-    }
-
-    state
-        .store
-        .upsert_event(Event {
-            id: existing.id,
-            owner_sub: owner.clone(),
-            calendar_id: parsed.calendar_id,
-            title: parsed.title,
-            starts_at: parsed.starts_at,
-            ends_at: parsed.ends_at,
-            all_day: parsed.all_day,
-            location: parsed.location,
-            notes: parsed.notes,
-            rrule: parsed.rrule,
-            series_id: existing.series_id,
-            override_occurrence_date: existing.override_occurrence_date,
-            exception_dates: Vec::new(),
-            created_at: existing.created_at,
+                created_at: existing.created_at,
+            },
+            attendees: attendee_inputs_from_form(&form),
+            reminder_minutes: reminder_minutes_from_form(&form),
+            now_ms: now,
+            reconcile_series: scope == MutationScope::Series,
         })
         .await?;
-    save_attendees_and_reminders(&state, &owner, &id, &form, now).await?;
 
     tracing::info!(target: "audit", event = "event.updated", "event updated");
-    Ok(redirect_to_month(parsed.starts_at, off))
+    Ok(redirect_to_month(redirect_start, off))
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,65 +2044,50 @@ pub async fn update(
 pub async fn delete(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(q): Query<OccurrenceQuery>,
-    Form(form): Form<DeleteForm>,
+    path: Result<Path<String>, PathRejection>,
+    query: Result<Query<OccurrenceQuery>, QueryRejection>,
+    form: Result<Form<DeleteForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
+    let q = query_or_invalid(query)?;
+    let form = form_or_invalid(form)?;
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
-    let existing = state.store.get_event(&owner, &id).await?;
-    if let Some(series) = existing.as_ref() {
-        if let Some(occ) = q.occurrence.filter(|_| !series.rrule.trim().is_empty()) {
-            state
-                .store
-                .upsert_event_exception(EventException {
-                    id: format!("ex:{}:{occ}", series.id),
-                    event_id: series.id.clone(),
+    let existing = state
+        .store
+        .get_event(&owner, &id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("That event does not exist.".to_string()))?;
+    let scope = mutation_scope(&existing, &q)?;
+    if let MutationScope::Occurrence(occ) = scope {
+        let deleted = state
+            .store
+            .delete_occurrence_bundle(
+                &owner,
+                &existing.id,
+                occ,
+                EventException {
+                    id: format!("ex:{}:{occ}", existing.id),
+                    event_id: existing.id.clone(),
                     owner_sub: owner.clone(),
                     occurrence_date: occ,
                     created_at: now_ms(),
-                })
-                .await?;
-            if let Some(override_event) = state
-                .store
-                .delete_event_override(&owner, &series.id, occ)
-                .await?
-            {
-                state
-                    .store
-                    .delete_event_attendees(&owner, &override_event.id)
-                    .await?;
-                state
-                    .store
-                    .delete_event_reminders(&owner, &override_event.id)
-                    .await?;
-            }
-            tracing::info!(target: "audit", event = "event.occurrence.deleted", "event occurrence deleted");
-            return Ok(Redirect::to("/").into_response());
-        }
-        for override_event in state
-            .store
-            .delete_event_overrides(&owner, &series.id)
-            .await?
-        {
-            state
-                .store
-                .delete_event_attendees(&owner, &override_event.id)
-                .await?;
-            state
-                .store
-                .delete_event_reminders(&owner, &override_event.id)
-                .await?;
-        }
-        state
-            .store
-            .delete_event_exceptions(&owner, &series.id)
+                },
+            )
             .await?;
+        if !deleted {
+            return Err(AppError::NotFound(
+                "That occurrence is no longer available.".to_string(),
+            ));
+        }
+        tracing::info!(target: "audit", event = "event.occurrence.deleted", "event occurrence deleted");
+        return Ok(Redirect::to("/").into_response());
     }
-    state.store.delete_event(&owner, &id).await?;
-    // Cascade: an event's attendees + reminders go with it (both ownership-scoped).
-    state.store.delete_event_attendees(&owner, &id).await?;
-    state.store.delete_event_reminders(&owner, &id).await?;
+    if !state.store.delete_event_tree(&owner, &id).await? {
+        return Err(AppError::NotFound(
+            "That event is no longer available.".to_string(),
+        ));
+    }
     tracing::info!(target: "audit", event = "event.deleted", "event deleted");
     Ok(Redirect::to("/").into_response())
 }
@@ -1598,54 +2096,358 @@ pub async fn delete(
 // POST /quick-add  — natural-language quick-add
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
+struct QuickAddReview {
+    title: String,
+    starts_at: i64,
+    ends_at: i64,
+    when: String,
+    calendar_id: String,
+    calendar_name: String,
+    timezone: String,
+    offset_minutes: i32,
+}
+
+#[derive(Clone, Debug)]
+struct QuickAddCommitted {
+    id: String,
+    title: String,
+    starts_at: i64,
+    ends_at: i64,
+    when: String,
+    href: String,
+}
+
+#[derive(Clone, Debug)]
+enum QuickAddOutcome {
+    Review(QuickAddReview),
+    InvalidInput {
+        field: &'static str,
+        message: &'static str,
+    },
+    Unavailable {
+        commit_uncertain: bool,
+    },
+    Committed(QuickAddCommitted),
+}
+
 pub async fn quick_add(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<QuickAddForm>,
-) -> Result<Response, AppError> {
-    require_csrf(&headers, &form.csrf_token)?;
-    let owner = auth::owner_subject(&headers);
-    let off = calendar::tz_offset_minutes(&state.store.get_settings(&owner).await?.timezone);
-    let raw = form.text.trim();
-
-    match quickadd::parse_quick_add(raw) {
-        Some(qa) => {
-            let now = now_ms();
-            let starts_at = quick_add_starts_at(&qa, off, now);
-            state
-                .store
-                .upsert_event(Event {
-                    id: auth::random_hex(),
-                    owner_sub: owner.clone(),
-                    calendar_id: String::new(),
-                    title: qa.title,
-                    starts_at,
-                    ends_at: starts_at + 3_600_000,
-                    all_day: false,
-                    location: String::new(),
-                    notes: String::new(),
-                    rrule: String::new(),
-                    series_id: String::new(),
-                    override_occurrence_date: 0,
-                    exception_dates: Vec::new(),
-                    created_at: now,
-                })
-                .await?;
-            tracing::info!(target: "audit", event = "event.created", "event quick-added");
-            Ok(redirect_to_month(starts_at, off))
+    form: Result<Form<QuickAddInput>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let Form(form) = match form {
+        Ok(form) => form,
+        Err(_) => {
+            return quick_add_html_state(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "Check the highlighted fields.",
+            )
         }
-        None => {
-            // Unparseable: fall back to the normal editor, prefilled with the raw text as the title.
-            let csrf = auth::new_csrf_token();
-            let calendars = state.store.list_calendars(&owner).await?;
-            let view = blank_form_view(&csrf, raw, &calendars);
-            let content = format!("{}{}", render::subnav("calendar"), render_event_form(&view));
-            Ok(html_with_csrf_cookie(
-                layout("New event", &headers, &content),
-                &csrf,
-            ))
+    };
+    if !auth::verify_csrf(&headers, &form.csrf_token) {
+        return quick_add_html_state(
+            StatusCode::FORBIDDEN,
+            "csrf",
+            "This form expired — reload and try again.",
+        );
+    }
+    let owner = auth::owner_subject(&headers);
+    let outcome = evaluate_quick_add(&state, &owner, &form).await;
+
+    if form.intent == QuickAddIntent::OpenEditor {
+        return render_quick_add_editor(&state, &headers, &owner, &form, outcome).await;
+    }
+
+    match outcome {
+        QuickAddOutcome::Review(review) => {
+            let content = format!(
+                "{}<div class=\"view-editor\">{}</div>",
+                render::subnav("calendar"),
+                render_quick_add_review(&form, &review),
+            );
+            Html(layout("Quick add review", &headers, &content)).into_response()
+        }
+        QuickAddOutcome::InvalidInput { field, message } => {
+            let content = format!(
+                "{}<div class=\"view-editor\">{}</div>",
+                render::subnav("calendar"),
+                render_quick_add_invalid(&form, field, message),
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Html(layout("Check quick add", &headers, &content)),
+            )
+                .into_response()
+        }
+        QuickAddOutcome::Unavailable { commit_uncertain } => quick_add_html_state(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            quick_add_unavailable_message(commit_uncertain),
+        ),
+        QuickAddOutcome::Committed(committed) => {
+            tracing::info!(target: "audit", event = "event.created", "event quick-added");
+            Redirect::to(&committed.href).into_response()
         }
     }
+}
+
+async fn evaluate_quick_add(
+    state: &AppState,
+    owner: &str,
+    input: &QuickAddInput,
+) -> QuickAddOutcome {
+    let settings = match state.store.get_settings(owner).await {
+        Ok(settings) => settings,
+        Err(_) => {
+            return QuickAddOutcome::Unavailable {
+                commit_uncertain: false,
+            }
+        }
+    };
+    let calendars = match state.store.list_calendars(owner).await {
+        Ok(calendars) => calendars,
+        Err(_) => {
+            return QuickAddOutcome::Unavailable {
+                commit_uncertain: false,
+            }
+        }
+    };
+    let requested_calendar = input.calendar_id.trim();
+    let calendar = if requested_calendar.is_empty() {
+        calendars.first()
+    } else {
+        calendars
+            .iter()
+            .find(|calendar| calendar.id == requested_calendar)
+    };
+    let calendar = match calendar {
+        Some(calendar) => calendar,
+        None => {
+            return QuickAddOutcome::InvalidInput {
+                field: "calendar_id",
+                message: "Choose an available calendar.",
+            }
+        }
+    };
+    let qa = match quickadd::parse_quick_add(input.text.trim()) {
+        Some(qa) => qa,
+        None => {
+            return QuickAddOutcome::InvalidInput {
+                field: "text",
+                message: "We couldn't interpret that phrase.",
+            }
+        }
+    };
+    let off = calendar::tz_offset_minutes(&settings.timezone);
+    let now = now_ms();
+    let starts_at = quick_add_starts_at(&qa, off, now);
+    let ends_at = starts_at + 3_600_000;
+    let review = QuickAddReview {
+        title: qa.title,
+        starts_at,
+        ends_at,
+        when: calendar::fmt_event_when_at(starts_at, ends_at, false, off),
+        calendar_id: calendar.id.clone(),
+        calendar_name: calendar.name.clone(),
+        timezone: settings.timezone,
+        offset_minutes: off,
+    };
+
+    if input.intent != QuickAddIntent::Commit
+        || input.reviewed_title.as_deref() != Some(review.title.as_str())
+        || input.reviewed_starts_at != Some(review.starts_at)
+    {
+        return QuickAddOutcome::Review(review);
+    }
+
+    let id = auth::random_hex();
+    if state
+        .store
+        .save_event_bundle(EventBundle {
+            event: Event {
+                id: id.clone(),
+                owner_sub: owner.to_string(),
+                calendar_id: review.calendar_id.clone(),
+                title: review.title.clone(),
+                starts_at: review.starts_at,
+                ends_at: review.ends_at,
+                all_day: false,
+                location: String::new(),
+                notes: String::new(),
+                rrule: String::new(),
+                series_id: String::new(),
+                override_occurrence_date: 0,
+                exception_dates: Vec::new(),
+                created_at: now,
+            },
+            attendees: Vec::new(),
+            reminder_minutes: Vec::new(),
+            now_ms: now,
+            reconcile_series: false,
+        })
+        .await
+        .is_err()
+    {
+        return QuickAddOutcome::Unavailable {
+            commit_uncertain: true,
+        };
+    }
+    let (year, month) = calendar::month_of_at(review.starts_at, off);
+    QuickAddOutcome::Committed(QuickAddCommitted {
+        id,
+        title: review.title,
+        starts_at: review.starts_at,
+        ends_at: review.ends_at,
+        when: review.when,
+        href: format!("/?y={year}&m={month}"),
+    })
+}
+
+async fn render_quick_add_editor(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    input: &QuickAddInput,
+    outcome: QuickAddOutcome,
+) -> Response {
+    if let QuickAddOutcome::Unavailable { commit_uncertain } = &outcome {
+        return quick_add_html_state(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            quick_add_unavailable_message(*commit_uncertain),
+        );
+    }
+    if let QuickAddOutcome::InvalidInput { field, message } = &outcome {
+        if *field != "text" {
+            let content = format!(
+                "{}<div class=\"view-editor\">{}</div>",
+                render::subnav("calendar"),
+                render_quick_add_invalid(input, field, message),
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(layout("Check quick add", headers, &content)),
+            )
+                .into_response();
+        }
+    }
+    let calendars = match state.store.list_calendars(owner).await {
+        Ok(calendars) => calendars,
+        Err(_) => {
+            return quick_add_html_state(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "Time interpretation is unavailable — retry.",
+            )
+        }
+    };
+    let mut view = blank_form_view(&input.csrf_token, input.text.trim(), &calendars);
+    if let QuickAddOutcome::Review(review) = outcome {
+        view.title = review.title;
+        view.calendar_id = review.calendar_id;
+        view.starts_local =
+            calendar::fmt_datetime_local_at(review.starts_at, review.offset_minutes);
+        view.ends_local = calendar::fmt_datetime_local_at(review.ends_at, review.offset_minutes);
+    }
+    let content = format!(
+        "{}<div class=\"view-editor\">{}</div>",
+        render::subnav("calendar"),
+        render_event_form(&view)
+    );
+    Html(layout("New event", headers, &content)).into_response()
+}
+
+fn render_quick_add_review(input: &QuickAddInput, review: &QuickAddReview) -> String {
+    let hidden = |intent: &str| {
+        format!(
+            "<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+             <input type=\"hidden\" name=\"text\" value=\"{text}\">\
+             <input type=\"hidden\" name=\"calendar_id\" value=\"{calendar}\">\
+             <input type=\"hidden\" name=\"intent\" value=\"{intent}\">",
+            csrf = esc(&input.csrf_token),
+            text = esc(&input.text),
+            calendar = esc(&review.calendar_id),
+        )
+    };
+    format!(
+        "<section class=\"bench bench--review\" aria-labelledby=\"bench-review-title\">\
+           <div class=\"bench__raw\"><h1 id=\"bench-review-title\">Review quick add</h1>\
+             <p>{raw}</p></div>\
+           <dl class=\"bench__parse\">\
+             <dt>When</dt><dd>{when} ({timezone}, fixed offset)</dd>\
+             <dt>Title</dt><dd>{title}</dd>\
+             <dt>Calendar</dt><dd>{calendar}</dd>\
+           </dl>\
+           <div class=\"bench__commit\">\
+             <form method=\"post\" action=\"/quick-add\">\
+               {commit_hidden}\
+               <input type=\"hidden\" name=\"reviewed_title\" value=\"{title}\">\
+               <input type=\"hidden\" name=\"reviewed_starts_at\" value=\"{starts}\">\
+               <button class=\"btn btn-primary\" type=\"submit\">Add to calendar</button>\
+             </form>\
+             <form method=\"post\" action=\"/quick-add\">\
+               {editor_hidden}\
+               <button class=\"btn btn-secondary\" type=\"submit\">Open in editor</button>\
+             </form>\
+           </div>\
+         </section>",
+        raw = esc(input.text.trim()),
+        when = esc(&review.when),
+        timezone = esc(&review.timezone),
+        title = esc(&review.title),
+        calendar = esc(&review.calendar_name),
+        commit_hidden = hidden("commit"),
+        editor_hidden = hidden("open_editor"),
+        starts = review.starts_at,
+    )
+}
+
+fn render_quick_add_invalid(
+    input: &QuickAddInput,
+    field: &'static str,
+    message: &'static str,
+) -> String {
+    format!(
+        "<section class=\"bench bench--invalid\">\
+           <div class=\"state state--invalid\" role=\"alert\">\
+             <h1>Check the highlighted fields.</h1>\
+             <p id=\"quickadd-{field}-error\">{message}</p>\
+           </div>\
+           <form method=\"post\" action=\"/quick-add\" class=\"bench__raw\">\
+             <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+             <input type=\"hidden\" name=\"calendar_id\" value=\"{calendar}\">\
+             <input type=\"hidden\" name=\"intent\" value=\"open_editor\">\
+             <label for=\"quickadd-invalid-text\">Quick add</label>\
+             <input id=\"quickadd-invalid-text\" name=\"text\" value=\"{text}\" \
+               aria-invalid=\"true\" aria-describedby=\"quickadd-{field}-error\">\
+             <button class=\"btn btn-secondary\" type=\"submit\">Open in editor</button>\
+           </form>\
+         </section>",
+        field = field,
+        message = esc(message),
+        csrf = esc(&input.csrf_token),
+        calendar = esc(&input.calendar_id),
+        text = esc(&input.text),
+    )
+}
+
+fn quick_add_html_state(status: StatusCode, kind: &str, message: &str) -> Response {
+    let body = render::error_page(
+        status.as_u16(),
+        if kind == "csrf" {
+            "Form expired"
+        } else {
+            "Quick add unavailable"
+        },
+        message,
+    )
+    .replace(
+        "class=\"card empty-state\"",
+        &format!("class=\"card empty-state state state--{kind}\" data-kind=\"{kind}\""),
+    );
+    (status, Html(body)).into_response()
 }
 
 /// Resolve a parsed quick-add phrase into a real UTC start instant: place the time on the owner's
@@ -1659,87 +2461,79 @@ fn quick_add_starts_at(qa: &quickadd::QuickAdd, off: i32, now: i64) -> i64 {
     local_start - off as i64 * 60_000
 }
 
-/// The JSON body for the optimistic quick-add box: the raw phrase + the double-submit CSRF token.
-#[derive(Debug, Deserialize)]
-pub struct QuickAddJson {
-    #[serde(default)]
-    pub csrf_token: String,
-    #[serde(default)]
-    pub text: String,
-}
-
-/// `POST /quick-add.json` — JSON sibling of [`quick_add`] for the no-reload quick-add box. Same
-/// owner scope + double-submit CSRF as the form route (which is unchanged, so no-JS users still get
-/// the redirect / editor fallback). Returns `{ok:true, id, title, when, href}` on a parsed create,
-/// or `{ok:false, parsed:false}` when the phrase can't be understood (the client then falls back to
-/// posting the real form so the editor opens prefilled).
+/// `POST /quick-add.json` uses the exact same typed evaluator as the HTML form.
 pub async fn quick_add_json(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(form): Json<QuickAddJson>,
+    form: Result<Json<QuickAddInput>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let Json(form) = match form {
+        Ok(form) => form,
+        Err(_) => return json_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"kind":"invalid_input","field":"form","message":"Check the highlighted fields."}"#
+                .to_string(),
+        ),
+    };
     if !auth::verify_csrf(&headers, &form.csrf_token) {
         return json_response(
             StatusCode::FORBIDDEN,
-            r#"{"ok":false,"error":"csrf"}"#.to_string(),
+            r#"{"kind":"csrf","message":"This form expired — reload and try again."}"#.to_string(),
         );
     }
     let owner = auth::owner_subject(&headers);
-    let off = match state.store.get_settings(&owner).await {
-        Ok(s) => calendar::tz_offset_minutes(&s.timezone),
-        Err(_) => 0,
-    };
-    let raw = form.text.trim();
-
-    match quickadd::parse_quick_add(raw) {
-        Some(qa) => {
-            let now = now_ms();
-            let starts_at = quick_add_starts_at(&qa, off, now);
-            let ends_at = starts_at + 3_600_000;
-            let id = auth::random_hex();
-            let title = qa.title.clone();
-            if state
-                .store
-                .upsert_event(Event {
-                    id: id.clone(),
-                    owner_sub: owner.clone(),
-                    calendar_id: String::new(),
-                    title: qa.title,
-                    starts_at,
-                    ends_at,
-                    all_day: false,
-                    location: String::new(),
-                    notes: String::new(),
-                    rrule: String::new(),
-                    series_id: String::new(),
-                    override_occurrence_date: 0,
-                    exception_dates: Vec::new(),
-                    created_at: now,
-                })
-                .await
-                .is_err()
-            {
-                return json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    r#"{"ok":false,"error":"store"}"#.to_string(),
-                );
-            }
-            tracing::info!(target: "audit", event = "event.created", "event quick-added (json)");
-            let (y, m) = calendar::month_of_at(starts_at, off);
-            let when = calendar::fmt_event_when_at(starts_at, ends_at, false, off);
-            let body = format!(
-                r#"{{"ok":true,"id":"{id}","title":"{title}","when":"{when}","href":"/?y={y}&m={m}"}}"#,
-                id = json_escape(&id),
-                title = json_escape(&title),
-                when = json_escape(&when),
-                y = y,
-                m = m,
-            );
-            json_response(StatusCode::OK, body)
+    match evaluate_quick_add(&state, &owner, &form).await {
+        QuickAddOutcome::Review(review) => json_response(
+            StatusCode::OK,
+            format!(
+                r#"{{"kind":"review","title":"{title}","starts_at":{starts},"ends_at":{ends},"when":"{when}","calendar_id":"{calendar_id}","calendar_name":"{calendar_name}","timezone":"{timezone}"}}"#,
+                title = json_escape(&review.title),
+                starts = review.starts_at,
+                ends = review.ends_at,
+                when = json_escape(&review.when),
+                calendar_id = json_escape(&review.calendar_id),
+                calendar_name = json_escape(&review.calendar_name),
+                timezone = json_escape(&review.timezone),
+            ),
+        ),
+        QuickAddOutcome::InvalidInput { field, message } => json_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                r#"{{"kind":"invalid_input","field":"{}","message":"{}"}}"#,
+                json_escape(field),
+                json_escape(message),
+            ),
+        ),
+        QuickAddOutcome::Unavailable { commit_uncertain } => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                r#"{{"kind":"unavailable","message":"{}"}}"#,
+                json_escape(quick_add_unavailable_message(commit_uncertain)),
+            ),
+        ),
+        QuickAddOutcome::Committed(committed) => {
+            tracing::info!(target: "audit", event = "event.created", "event quick-added");
+            json_response(
+                StatusCode::OK,
+                format!(
+                    r#"{{"kind":"committed","id":"{id}","title":"{title}","starts_at":{starts},"ends_at":{ends},"when":"{when}","href":"{href}"}}"#,
+                    id = json_escape(&committed.id),
+                    title = json_escape(&committed.title),
+                    starts = committed.starts_at,
+                    ends = committed.ends_at,
+                    when = json_escape(&committed.when),
+                    href = json_escape(&committed.href),
+                ),
+            )
         }
-        // Unparseable is NOT an error: 200 with parsed=false, the client re-posts the form so the
-        // editor opens prefilled (identical to the no-JS fallback).
-        None => json_response(StatusCode::OK, r#"{"ok":false,"parsed":false}"#.to_string()),
+    }
+}
+
+fn quick_add_unavailable_message(commit_uncertain: bool) -> &'static str {
+    if commit_uncertain {
+        "We couldn't confirm whether the event was saved. Check the calendar before deciding what to do next."
+    } else {
+        "Time interpretation is unavailable — try again later."
     }
 }
 
@@ -1780,8 +2574,9 @@ fn json_escape(s: &str) -> String {
 pub async fn create_calendar(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<CalendarForm>,
+    form: Result<Form<CalendarForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    let form = form_or_invalid(form)?;
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
     let calendars = state.store.list_calendars(&owner).await?;
@@ -1803,9 +2598,11 @@ pub async fn create_calendar(
 pub async fn update_calendar(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Form(form): Form<CalendarForm>,
+    path: Result<Path<String>, PathRejection>,
+    form: Result<Form<CalendarForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
+    let form = form_or_invalid(form)?;
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
     let existing = state
@@ -1830,9 +2627,11 @@ pub async fn update_calendar(
 pub async fn delete_calendar(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-    Form(form): Form<DeleteForm>,
+    path: Result<Path<String>, PathRejection>,
+    form: Result<Form<DeleteForm>, FormRejection>,
 ) -> Result<Response, AppError> {
+    let id = path_or_invalid(path)?;
+    let form = form_or_invalid(form)?;
     require_csrf(&headers, &form.csrf_token)?;
     let owner = auth::owner_subject(&headers);
     if state.store.delete_calendar(&owner, &id).await? {
@@ -1891,6 +2690,13 @@ struct FormView {
     series_id: String,
     occurrence_date: i64,
     id: String,
+    errors: Vec<FormFieldError>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FormFieldError {
+    field: &'static str,
+    message: &'static str,
 }
 
 /// A blank (non-recurring) create-form view, optionally prefilled with a `title` — used by the
@@ -1919,6 +2725,7 @@ fn blank_form_view(csrf: &str, title: &str, calendars: &[Calendar]) -> FormView 
         series_id: String::new(),
         occurrence_date: 0,
         id: String::new(),
+        errors: Vec::new(),
     }
 }
 
@@ -1940,21 +2747,127 @@ impl FormView {
             None => FormView::no_recurrence(),
         }
     }
+
+    fn from_submission(
+        form: &EventForm,
+        calendars: Vec<Calendar>,
+        action: String,
+        errors: Vec<FormFieldError>,
+        edit: SubmittedEditContext,
+    ) -> Self {
+        Self {
+            action,
+            title: form.title.clone(),
+            calendar_id: form.calendar_id.clone(),
+            calendars,
+            starts_local: form.starts_at.clone(),
+            ends_local: form.ends_at.clone(),
+            all_day: checkbox_on(form.all_day.as_deref()),
+            location: form.location.clone(),
+            notes: form.notes.clone(),
+            repeat: form.repeat.clone(),
+            repeat_interval: form.repeat_interval.clone(),
+            repeat_count: form.repeat_count.clone(),
+            repeat_until: form.repeat_until.clone(),
+            attendees: form.attendees.clone(),
+            reminders: reminder_minutes_from_form(form),
+            csrf: form.csrf_token.clone(),
+            is_edit: edit.is_edit,
+            is_occurrence: edit.is_occurrence,
+            series_id: edit.series_id,
+            occurrence_date: edit.occurrence_date,
+            id: edit.id,
+            errors,
+        }
+    }
+
+    fn error(&self, field: &str) -> Option<&'static str> {
+        self.errors
+            .iter()
+            .find(|error| error.field == field)
+            .map(|error| error.message)
+    }
+}
+
+#[derive(Default)]
+struct SubmittedEditContext {
+    is_edit: bool,
+    is_occurrence: bool,
+    series_id: String,
+    occurrence_date: i64,
+    id: String,
+}
+
+fn field_aria(v: &FormView, field: &str) -> String {
+    if v.error(field).is_some() {
+        format!(" aria-invalid=\"true\" aria-describedby=\"{field}-error\"")
+    } else {
+        String::new()
+    }
+}
+
+fn field_error(v: &FormView, field: &str) -> String {
+    v.error(field)
+        .map(|message| {
+            format!(
+                "<p class=\"field-error\" id=\"{field}-error\">{}</p>",
+                esc(message)
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn event_error_summary(v: &FormView) -> String {
+    if v.errors.is_empty() {
+        return String::new();
+    }
+    let items: String = v
+        .errors
+        .iter()
+        .map(|error| {
+            format!(
+                "<li><a href=\"#{field}\">{message}</a></li>",
+                field = error.field,
+                message = esc(error.message),
+            )
+        })
+        .collect();
+    format!(
+        "<section class=\"error-summary\" role=\"alert\" aria-labelledby=\"event-errors-title\">\
+           <h2 id=\"event-errors-title\">Check the event details</h2><ul>{items}</ul>\
+         </section>"
+    )
 }
 
 /// A `<select>` for the recurrence frequency, marking the current choice `selected`.
-fn repeat_select(current: &str) -> String {
+fn repeat_select(v: &FormView) -> String {
     let opt = |val: &str, label: &str| {
-        let sel = if val == current { " selected" } else { "" };
+        let sel = if val == v.repeat { " selected" } else { "" };
         format!("<option value=\"{val}\"{sel}>{label}</option>")
     };
+    let supported = ["", "daily", "weekly", "monthly", "yearly"];
+    let unsupported = if v.error("repeat").is_some()
+        && !supported.contains(&v.repeat.trim())
+        && !v.repeat.trim().is_empty()
+    {
+        format!(
+            "<option value=\"{}\" selected>Unsupported selection: {}</option>",
+            esc(&v.repeat),
+            esc(&v.repeat),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "<select id=\"repeat\" name=\"repeat\">{}{}{}{}{}</select>",
+        "<select id=\"repeat\" name=\"repeat\"{}>{}{}{}{}{}{}</select>{}",
+        field_aria(v, "repeat"),
+        unsupported,
         opt("", "Does not repeat"),
         opt("daily", "Daily"),
         opt("weekly", "Weekly"),
         opt("monthly", "Monthly"),
         opt("yearly", "Yearly"),
+        field_error(v, "repeat"),
     )
 }
 
@@ -1970,25 +2883,34 @@ fn render_recurrence(v: &FormView) -> String {
              </div>\
              <div class=\"editor__field\">\
                <label for=\"repeat_interval\">Every</label>\
-               <input id=\"repeat_interval\" type=\"number\" name=\"repeat_interval\" min=\"1\" max=\"999\" value=\"{interval}\">\
+               <input id=\"repeat_interval\" type=\"number\" name=\"repeat_interval\" min=\"1\" max=\"999\" value=\"{interval}\"{interval_aria}>\
+               {interval_error}\
              </div>\
            </div>\
            <div class=\"editor__row\">\
              <div class=\"editor__field\">\
                <label for=\"repeat_count\">For (occurrences)</label>\
-               <input id=\"repeat_count\" type=\"number\" name=\"repeat_count\" min=\"1\" max=\"9999\" value=\"{count}\" placeholder=\"unlimited\">\
+               <input id=\"repeat_count\" type=\"number\" name=\"repeat_count\" min=\"1\" max=\"9999\" value=\"{count}\" placeholder=\"unlimited\"{count_aria}>\
+               {count_error}\
              </div>\
              <div class=\"editor__field\">\
                <label for=\"repeat_until\">Until</label>\
-               <input id=\"repeat_until\" type=\"date\" name=\"repeat_until\" value=\"{until}\">\
+               <input id=\"repeat_until\" type=\"date\" name=\"repeat_until\" value=\"{until}\"{until_aria}>\
+               {until_error}\
              </div>\
            </div>\
            <p class=\"editor__hint\">Recurring edits and deletes apply to the whole series.</p>\
          </fieldset>",
-        select = repeat_select(&v.repeat),
+        select = repeat_select(v),
         interval = esc(&v.repeat_interval),
+        interval_aria = field_aria(v, "repeat_interval"),
+        interval_error = field_error(v, "repeat_interval"),
         count = esc(&v.repeat_count),
+        count_aria = field_aria(v, "repeat_count"),
+        count_error = field_error(v, "repeat_count"),
         until = esc(&v.repeat_until),
+        until_aria = field_aria(v, "repeat_until"),
+        until_error = field_error(v, "repeat_until"),
     )
 }
 
@@ -2050,7 +2972,7 @@ fn render_reminders(v: &FormView) -> String {
         "<fieldset class=\"editor__field editor__recur\">\
            <legend>Reminders</legend>\
            <div class=\"reminders-grid\">{boxes}</div>\
-           <p class=\"editor__hint\">Delivered as an in-app notification before the event starts.</p>\
+           <p class=\"editor__hint\">Requested as an in-app notification before the event starts.</p>\
          </fieldset>",
         boxes = boxes,
     )
@@ -2110,6 +3032,13 @@ fn parse_attendees(raw: &str) -> Vec<(String, String)> {
     out
 }
 
+fn attendee_inputs_from_form(form: &EventForm) -> Vec<AttendeeInput> {
+    parse_attendees(&form.attendees)
+        .into_iter()
+        .map(|(name, email)| AttendeeInput { email, name })
+        .collect()
+}
+
 /// Parse one attendee line: `Name <email>` → (name, email); a bare `email` token → ("", email);
 /// otherwise → (line, "") which the caller drops (no address).
 fn parse_attendee_line(line: &str) -> (String, String) {
@@ -2147,6 +3076,7 @@ fn format_attendees_textarea(attendees: &[Attendee]) -> String {
 /// Reconcile submitted `(name, email)` pairs against the event's existing attendees: an email that
 /// is retained KEEPS its id/token/status (so its RSVP link + reply stay valid), while a new email
 /// gets a fresh token and `needs-action`. Removed emails simply fall out of the returned set.
+#[cfg(test)]
 fn reconcile_attendees(
     owner: &str,
     event_id: &str,
@@ -2187,47 +3117,6 @@ fn reconcile_attendees(
         .collect()
 }
 
-/// Persist the submitted attendees + reminders for an event. Attendees reconcile against the stored
-/// set (retained RSVP links survive); reminders preserve `delivered_at` for a retained minutes value
-/// so a trivial edit does not re-fire an already-delivered reminder.
-async fn save_attendees_and_reminders(
-    state: &AppState,
-    owner: &str,
-    event_id: &str,
-    form: &EventForm,
-    now: i64,
-) -> Result<(), AppError> {
-    let submitted = parse_attendees(&form.attendees);
-    let existing_att = state.store.list_attendees(owner, event_id).await?;
-    let attendees = reconcile_attendees(owner, event_id, &submitted, &existing_att, now);
-    state
-        .store
-        .replace_attendees(owner, event_id, attendees)
-        .await?;
-
-    let minutes = reminder_minutes_from_form(form);
-    let existing_rem = state.store.list_reminders(owner, event_id).await?;
-    let reminders: Vec<Reminder> = minutes
-        .into_iter()
-        .map(|m| {
-            let prev = existing_rem.iter().find(|r| r.minutes_before == m);
-            Reminder {
-                id: prev.map(|r| r.id.clone()).unwrap_or_else(auth::random_hex),
-                event_id: event_id.to_string(),
-                owner_sub: owner.to_string(),
-                minutes_before: m,
-                delivered_at: prev.map(|r| r.delivered_at).unwrap_or(0),
-                created_at: prev.map(|r| r.created_at).unwrap_or(now),
-            }
-        })
-        .collect();
-    state
-        .store
-        .replace_reminders(owner, event_id, reminders)
-        .await?;
-    Ok(())
-}
-
 fn render_event_form(v: &FormView) -> String {
     let recurrence = if v.is_occurrence {
         String::new()
@@ -2237,20 +3126,24 @@ fn render_event_form(v: &FormView) -> String {
     let main = format!(
         "<form class=\"card editor\" method=\"post\" action=\"{action}\">\
            <div class=\"editor__head\"><h1>{verb} event</h1></div>\
+           {error_summary}\
            <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
            <div class=\"editor__field\">\
              <label for=\"title\">Title</label>\
-             <input id=\"title\" type=\"text\" name=\"title\" value=\"{title}\" autocomplete=\"off\" maxlength=\"200\" required>\
+             <input id=\"title\" type=\"text\" name=\"title\" value=\"{title}\" autocomplete=\"off\" maxlength=\"200\" required{title_aria}>\
+             {title_error}\
            </div>\
            {calendar_select}\
            <div class=\"editor__row\">\
              <div class=\"editor__field\">\
                <label for=\"starts_at\">Starts</label>\
-               <input id=\"starts_at\" type=\"datetime-local\" name=\"starts_at\" value=\"{starts}\" required>\
+               <input id=\"starts_at\" type=\"datetime-local\" name=\"starts_at\" value=\"{starts}\" required{starts_aria}>\
+               {starts_error}\
              </div>\
              <div class=\"editor__field\">\
                <label for=\"ends_at\">Ends</label>\
-               <input id=\"ends_at\" type=\"datetime-local\" name=\"ends_at\" value=\"{ends}\">\
+               <input id=\"ends_at\" type=\"datetime-local\" name=\"ends_at\" value=\"{ends}\"{ends_aria}>\
+               {ends_error}\
              </div>\
            </div>\
            <div class=\"editor__field\">\
@@ -2277,11 +3170,18 @@ fn render_event_form(v: &FormView) -> String {
          </form>",
         action = esc(&v.action),
         verb = if v.is_edit { "Edit" } else { "New" },
+        error_summary = event_error_summary(v),
         csrf = esc(&v.csrf),
         title = esc(&v.title),
+        title_aria = field_aria(v, "title"),
+        title_error = field_error(v, "title"),
         calendar_select = render_calendar_select(v),
         starts = esc(&v.starts_local),
+        starts_aria = field_aria(v, "starts_at"),
+        starts_error = field_error(v, "starts_at"),
         ends = esc(&v.ends_local),
+        ends_aria = field_aria(v, "ends_at"),
+        ends_error = field_error(v, "ends_at"),
         checked = if v.all_day { " checked" } else { "" },
         location = esc(&v.location),
         notes = esc(&v.notes),
@@ -2298,7 +3198,7 @@ fn render_event_form(v: &FormView) -> String {
         },
         series_link = if v.is_occurrence {
             format!(
-                "<a class=\"btn btn-secondary\" href=\"/edit/{id}\">Edit series</a>",
+                "<a class=\"btn btn-secondary\" href=\"/edit/{id}?scope=series\">Edit series</a>",
                 id = esc(&v.series_id)
             )
         } else {
@@ -2312,10 +3212,20 @@ fn render_event_form(v: &FormView) -> String {
 
     let (delete_action, delete_label, delete_copy, confirm) = if v.is_occurrence {
         (
-            format!("/delete/{}?occurrence={}", v.series_id, v.occurrence_date),
+            format!(
+                "/delete/{}?scope=occurrence&occurrence={}",
+                v.series_id, v.occurrence_date
+            ),
             "Delete occurrence",
-            "This removes only this occurrence from the series.",
-            "Delete this occurrence?",
+            "Delete only this occurrence. The series and other occurrences stay.",
+            "Delete only this occurrence?",
+        )
+    } else if !v.repeat.trim().is_empty() {
+        (
+            format!("/delete/{}?scope=series", v.id),
+            "Delete series",
+            "Delete the whole series. All future occurrences, overrides, attendee responses, and reminders are removed. Shared .ics files and inboxes are not affected.",
+            "Delete the whole series?",
         )
     } else {
         (
@@ -2338,6 +3248,28 @@ fn render_event_form(v: &FormView) -> String {
         copy = esc(delete_copy),
     );
     format!("{main}{danger}")
+}
+
+fn invalid_event_form_response(headers: &HeaderMap, view: &FormView) -> Response {
+    let content = format!(
+        "{}<div class=\"view-editor\">{}</div>",
+        render::subnav("calendar"),
+        render_event_form(view)
+    );
+    let mut response = html_with_csrf_cookie(
+        layout(
+            if view.is_edit {
+                "Edit event"
+            } else {
+                "New event"
+            },
+            headers,
+            &content,
+        ),
+        &view.csrf,
+    );
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response
 }
 
 /// The validated, normalized fields of a submitted event form.
@@ -2368,40 +3300,102 @@ fn parse_repeat_freq(v: &str) -> Option<Freq> {
 /// interpreted in the owner's timezone (`off` minutes from UTC) and stored as real UTC epoch ms.
 /// All-day events snap to whole LOCAL days; a missing/earlier end collapses to the start so a
 /// range is never negative.
-fn parse_event_form(form: &EventForm, off: i32) -> Result<ParsedEvent, AppError> {
+fn parse_event_form(form: &EventForm, off: i32) -> Result<ParsedEvent, Vec<FormFieldError>> {
+    let mut errors = Vec::new();
     let title = form.title.trim().to_string();
     if title.is_empty() {
-        return Err(AppError::BadRequest("An event needs a title.".to_string()));
+        errors.push(FormFieldError {
+            field: "title",
+            message: "An event needs a title.",
+        });
     }
 
     let all_day = checkbox_on(form.all_day.as_deref());
-    let mut starts_at =
-        calendar::parse_datetime_local_at(&form.starts_at, off).ok_or_else(|| {
-            AppError::BadRequest("A valid start date and time is required.".to_string())
-        })?;
-    let mut ends_at = calendar::parse_datetime_local_at(&form.ends_at, off).unwrap_or(starts_at);
-
-    if all_day {
-        starts_at = calendar::start_of_day_at(starts_at, off);
-        ends_at = calendar::end_of_day_at(ends_at.max(starts_at), off);
-    } else if ends_at < starts_at {
-        ends_at = starts_at;
+    let starts = calendar::parse_datetime_local_at(&form.starts_at, off);
+    if starts.is_none() {
+        errors.push(FormFieldError {
+            field: "starts_at",
+            message: "A valid start date and time is required.",
+        });
+    }
+    let ends = if form.ends_at.trim().is_empty() {
+        None
+    } else {
+        let parsed = calendar::parse_datetime_local_at(&form.ends_at, off);
+        if parsed.is_none() {
+            errors.push(FormFieldError {
+                field: "ends_at",
+                message: "Use a valid end date and time, or leave it blank.",
+            });
+        }
+        parsed
+    };
+    if starts.zip(ends).is_some_and(|(start, end)| end < start) {
+        errors.push(FormFieldError {
+            field: "ends_at",
+            message: "The end cannot be before the start.",
+        });
     }
 
-    let freq = parse_repeat_freq(&form.repeat);
-    let interval = form
-        .repeat_interval
-        .trim()
-        .parse::<u32>()
-        .unwrap_or(1)
-        .max(1);
-    let count = form
-        .repeat_count
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|c| *c > 0);
+    let repeat = form.repeat.trim();
+    let freq = parse_repeat_freq(repeat);
+    if !repeat.is_empty() && freq.is_none() {
+        errors.push(FormFieldError {
+            field: "repeat",
+            message: "Choose one of the supported recurrence rules.",
+        });
+    }
+    let interval = if freq.is_some() {
+        let parsed = form
+            .repeat_interval
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|value| (1..=999).contains(value));
+        if parsed.is_none() {
+            errors.push(FormFieldError {
+                field: "repeat_interval",
+                message: "Repeat interval must be a number from 1 through 999.",
+            });
+        }
+        parsed.unwrap_or(1)
+    } else {
+        1
+    };
+    let count = if form.repeat_count.trim().is_empty() {
+        None
+    } else {
+        let parsed = form
+            .repeat_count
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|value| (1..=9999).contains(value));
+        if parsed.is_none() {
+            errors.push(FormFieldError {
+                field: "repeat_count",
+                message: "Repeat count must be a number from 1 through 9999.",
+            });
+        }
+        parsed
+    };
     let until = Some(form.repeat_until.trim()).filter(|u| !u.is_empty());
+    if until.is_some_and(|date| calendar::parse_date(date).is_none()) {
+        errors.push(FormFieldError {
+            field: "repeat_until",
+            message: "Repeat-until must be a valid date.",
+        });
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let mut starts_at = starts.expect("validated start");
+    let mut ends_at = ends.unwrap_or(starts_at);
+    if all_day {
+        starts_at = calendar::start_of_day_at(starts_at, off);
+        ends_at = calendar::end_of_day_at(ends_at, off);
+    }
     let rrule = rrule::build_rrule(freq, interval, count, until);
 
     Ok(ParsedEvent {
@@ -2520,5 +3514,14 @@ mod tests {
         assert_eq!(reminder_minutes_from_form(&f), vec![10, 60]);
         f.rem_0 = Some("on".to_string());
         assert_eq!(reminder_minutes_from_form(&f), vec![0, 10, 60]);
+    }
+
+    #[test]
+    fn uncertain_commit_copy_requires_calendar_check_not_retry() {
+        let message = quick_add_unavailable_message(true);
+        assert!(message.contains("couldn't confirm"));
+        assert!(message.contains("Check the calendar"));
+        assert!(!message.to_ascii_lowercase().contains("retry"));
+        assert!(!message.to_ascii_lowercase().contains("try again"));
     }
 }

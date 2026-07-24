@@ -11,7 +11,8 @@ use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
 use almanac::calendar;
-use almanac::store::default_calendar_id;
+use almanac::config::EVENT_LIST_LIMIT;
+use almanac::store::{default_calendar_id, Event};
 use almanac::{app, build_dev_state, now_ms, AppState};
 
 #[tokio::test]
@@ -30,7 +31,7 @@ async fn full_event_lifecycle_scoped_to_owner() {
     let (status, _h, body) = call(&state, get_as("/", "u_alice", "alice@steadholme.local")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Calendar"));
-    assert!(body.contains("No upcoming events"));
+    assert!(body.contains("No events in this range."));
 
     // Open the new-event form; capture the minted CSRF token (cookie == hidden field).
     let (status, headers, body) =
@@ -136,7 +137,11 @@ async fn full_event_lifecycle_scoped_to_owner() {
         &[("csrf_token", &csrf2)],
     );
     let (status, _h, _b) = call(&state, bad_del).await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "delete always redirects");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign data is not found or hidden"
+    );
     let (_s, _h, still) = call(
         &state,
         get_as("/?y=2099&m=6", "u_alice", "alice@steadholme.local"),
@@ -614,13 +619,25 @@ async fn recurring_event_expands_in_month_and_agenda() {
         "each weekly occurrence renders (got {occurrences})"
     );
     assert!(
-        month.contains("↻"),
-        "recurring occurrences carry a repeat marker"
+        month.contains("esp--occurrence") && month.contains("Occurrence"),
+        "recurring occurrences carry structural + text lineage"
     );
 
-    // The edit form pre-fills the recurrence controls from the stored RRULE.
-    let id = find_between(&month, "/edit/", "\"").expect("event id");
-    let (_s, _h, edit) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
+    let edit_target = find_between(&month, "/edit/", "\"").expect("event id");
+    let id = edit_target.split('?').next().unwrap();
+
+    // A recurring edit first renders a no-default scope gate.
+    let (_s, _h, scope_gate) =
+        call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
+    assert!(scope_gate.contains("Choose what to edit"));
+    assert!(!scope_gate.contains("name=\"scope\" value=\"series\" checked"));
+
+    // Explicit series scope opens the series editor and pre-fills its RRULE controls.
+    let (_s, _h, edit) = call(
+        &state,
+        get_as(&format!("/edit/{id}?scope=series"), "u_alice", "a@x.co"),
+    )
+    .await;
     assert!(
         edit.contains("value=\"weekly\" selected"),
         "frequency pre-selected"
@@ -631,11 +648,15 @@ async fn recurring_event_expands_in_month_and_agenda() {
     );
 
     // Editing the series (change the title) applies to every occurrence (v1 series semantics).
-    let (_s, h2, _b) = call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
+    let (_s, h2, _b) = call(
+        &state,
+        get_as(&format!("/edit/{id}?scope=series"), "u_alice", "a@x.co"),
+    )
+    .await;
     let cookie2 = set_cookie(&h2).unwrap();
     let csrf2 = cookie_value(&cookie2).unwrap();
     let save2 = post_form(
-        &format!("/edit/{id}"),
+        &format!("/edit/{id}?scope=series"),
         &cookie2,
         "u_alice",
         "a@x.co",
@@ -659,7 +680,7 @@ async fn recurring_event_expands_in_month_and_agenda() {
 
     // Deleting the series removes ALL occurrences.
     let del = post_form(
-        &format!("/delete/{id}"),
+        &format!("/delete/{id}?scope=series"),
         &cookie2,
         "u_alice",
         "a@x.co",
@@ -699,13 +720,18 @@ async fn recurring_single_occurrence_delete_and_edit() {
     assert_eq!(call(&state, save).await.0, StatusCode::SEE_OTHER);
     let (_s, h2, month) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
     assert!(month.matches("Weekly sync").count() >= 3);
-    let id = find_between(&month, "/edit/", "\"").expect("series id");
+    assert!(
+        month.contains("esp--occurrence"),
+        "expanded series occurrences carry a textual lineage hook"
+    );
+    let edit_target = find_between(&month, "/edit/", "\"").expect("series id");
+    let id = edit_target.split('?').next().unwrap();
     let cookie2 = set_cookie(&h2).unwrap();
     let csrf2 = cookie_value(&cookie2).unwrap();
 
     let occ2 = calendar::parse_datetime_local("2099-06-10T09:00").unwrap();
     let del_one = post_form(
-        &format!("/delete/{id}?occurrence={occ2}"),
+        &format!("/delete/{id}?scope=occurrence&occurrence={occ2}"),
         &cookie2,
         "u_alice",
         "a@x.co",
@@ -717,9 +743,15 @@ async fn recurring_single_occurrence_delete_and_edit() {
         after_delete.matches("Weekly sync").count() >= 2,
         "the other occurrences remain"
     );
+    let (_s, _h, series_detail) =
+        call(&state, get_as(&format!("/event/{id}"), "u_alice", "a@x.co")).await;
+    assert!(
+        series_detail.contains("esp--exception") && series_detail.contains("1 removed occurrence"),
+        "series detail reports the removed-occurrence exception"
+    );
 
     let occ3 = calendar::parse_datetime_local("2099-06-17T09:00").unwrap();
-    let (_s, h3, edit_occ) = call(
+    let (_s, _gate_headers, edit_occ) = call(
         &state,
         get_as(
             &format!("/edit/{id}?occurrence={occ3}"),
@@ -729,13 +761,61 @@ async fn recurring_single_occurrence_delete_and_edit() {
     )
     .await;
     assert!(
-        edit_occ.contains("Edit series"),
-        "occurrence form links back to whole-series edit"
+        edit_occ.contains("Choose what to edit"),
+        "legacy occurrence context renders the no-default scope gate"
     );
+    let series_form = find_between(
+        &edit_occ,
+        &format!("<form method=\"get\" action=\"/edit/{id}\" class=\"scope-gate__choice\">"),
+        "</form>",
+    )
+    .expect("series scope is one native GET form");
+    assert!(series_form.contains("name=\"scope\" value=\"series\""));
+    assert!(
+        !series_form.contains("name=\"occurrence\""),
+        "series action sends no occurrence"
+    );
+    assert!(edit_occ.contains(&format!(
+        "name=\"scope\" value=\"occurrence\"><input type=\"hidden\" name=\"occurrence\" value=\"{occ3}\""
+    )));
+    assert!(
+        !edit_occ.contains("type=\"radio\" name=\"scope\""),
+        "scope actions do not depend on a shared radio form"
+    );
+    let gate = find_between(
+        &edit_occ,
+        "<section class=\"card scope-gate view-editor\">",
+        "<div class=\"danger-zone scope-gate__delete\">",
+    )
+    .expect("scope choice region");
+    assert_eq!(
+        gate.matches(&format!(
+            "<form method=\"get\" action=\"/edit/{id}\" class=\"scope-gate__choice\">"
+        ))
+        .count(),
+        2,
+        "series and occurrence are separate native GET forms"
+    );
+    assert_eq!(gate.matches("name=\"scope\" value=\"series\"").count(), 1);
+    assert_eq!(
+        gate.matches("name=\"scope\" value=\"occurrence\"").count(),
+        1
+    );
+    assert_eq!(gate.matches("name=\"occurrence\"").count(), 1);
+    let (_s, h3, edit_occ) = call(
+        &state,
+        get_as(
+            &format!("/edit/{id}?scope=occurrence&occurrence={occ3}"),
+            "u_alice",
+            "a@x.co",
+        ),
+    )
+    .await;
+    assert!(edit_occ.contains("Edit series"));
     let cookie3 = set_cookie(&h3).unwrap();
     let csrf3 = cookie_value(&cookie3).unwrap();
     let save_occ = post_form(
-        &format!("/edit/{id}?occurrence={occ3}"),
+        &format!("/edit/{id}?scope=occurrence&occurrence={occ3}"),
         &cookie3,
         "u_alice",
         "a@x.co",
@@ -753,16 +833,119 @@ async fn recurring_single_occurrence_delete_and_edit() {
         "override occurrence renders"
     );
     assert!(
+        after_edit.contains("esp--override"),
+        "detached override carries the changed-occurrence lineage hook"
+    );
+    assert!(
         after_edit.contains("Weekly sync"),
         "whole series remains editable"
     );
 
-    let (_s, _h, series_edit) =
-        call(&state, get_as(&format!("/edit/{id}"), "u_alice", "a@x.co")).await;
+    let (_s, _h, series_edit) = call(
+        &state,
+        get_as(&format!("/edit/{id}?scope=series"), "u_alice", "a@x.co"),
+    )
+    .await;
     assert!(
         series_edit.contains("value=\"weekly\" selected"),
         "whole-series edit still works"
     );
+}
+
+#[tokio::test]
+async fn recurrence_scope_failures_are_zero_write_and_one_off_rejects_scope() {
+    let state = build_dev_state();
+    let (_s, headers, _b) = call(&state, get_as("/new", "u_alice", "a@x.co")).await;
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+
+    let create_series = post_form(
+        "/new",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("csrf_token", &csrf),
+            ("title", "Scope sentinel"),
+            ("starts_at", "2099-09-01T09:00"),
+            ("ends_at", "2099-09-01T09:30"),
+            ("repeat", "weekly"),
+            ("repeat_interval", "1"),
+            ("repeat_count", "3"),
+        ],
+    );
+    assert_eq!(call(&state, create_series).await.0, StatusCode::SEE_OTHER);
+    let (_s, _h, month) = call(&state, get_as("/?y=2099&m=9", "u_alice", "a@x.co")).await;
+    let target = find_between(&month, "/edit/", "\"").unwrap();
+    let id = target.split('?').next().unwrap();
+    let valid_occurrence = calendar::parse_datetime_local("2099-09-08T09:00").unwrap();
+    let invalid_occurrence = calendar::parse_datetime_local("2099-09-09T09:00").unwrap();
+
+    let edit_pairs = [
+        ("csrf_token", csrf.as_str()),
+        ("title", "Should not persist"),
+        ("starts_at", "2099-09-01T10:00"),
+        ("ends_at", "2099-09-01T10:30"),
+        ("repeat", "weekly"),
+        ("repeat_interval", "1"),
+        ("repeat_count", "3"),
+    ];
+    for uri in [
+        format!("/edit/{id}"),
+        format!("/edit/{id}?scope=series&occurrence={valid_occurrence}"),
+        format!("/edit/{id}?scope=occurrence&occurrence={invalid_occurrence}"),
+    ] {
+        let req = post_form(&uri, &cookie, "u_alice", "a@x.co", &edit_pairs);
+        assert_eq!(
+            call(&state, req).await.0,
+            StatusCode::BAD_REQUEST,
+            "{uri} must fail before mutation"
+        );
+    }
+    for uri in [
+        format!("/delete/{id}"),
+        format!("/delete/{id}?scope=series&occurrence={valid_occurrence}"),
+        format!("/delete/{id}?scope=occurrence&occurrence={invalid_occurrence}"),
+    ] {
+        let req = post_form(&uri, &cookie, "u_alice", "a@x.co", &[("csrf_token", &csrf)]);
+        assert_eq!(
+            call(&state, req).await.0,
+            StatusCode::BAD_REQUEST,
+            "{uri} must fail before mutation"
+        );
+    }
+    let (_s, _h, unchanged) = call(&state, get_as("/?y=2099&m=9", "u_alice", "a@x.co")).await;
+    assert!(unchanged.matches("Scope sentinel").count() >= 3);
+    assert!(!unchanged.contains("Should not persist"));
+
+    create_event_as(
+        &state,
+        "u_alice",
+        "a@x.co",
+        &[
+            ("title", "One-off sentinel"),
+            ("starts_at", "2099-09-20T10:00"),
+            ("ends_at", "2099-09-20T11:00"),
+        ],
+    )
+    .await;
+    let (_s, _h, month) = call(&state, get_as("/?y=2099&m=9", "u_alice", "a@x.co")).await;
+    let one_off_fragment = month
+        .split("One-off sentinel")
+        .next()
+        .and_then(|prefix| prefix.rsplit("/edit/").next())
+        .and_then(|tail| tail.split('"').next())
+        .unwrap();
+    let bad_delete = post_form(
+        &format!("/delete/{one_off_fragment}?scope=series"),
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        &[("csrf_token", &csrf)],
+    );
+    assert_eq!(call(&state, bad_delete).await.0, StatusCode::BAD_REQUEST);
+    let (_s, _h, still_there) = call(&state, get_as("/?y=2099&m=9", "u_alice", "a@x.co")).await;
+    assert!(still_there.contains("One-off sentinel"));
 }
 
 #[tokio::test]
@@ -894,7 +1077,7 @@ async fn csrf_required_on_post() {
         get_as("/?y=2099&m=1", "u_alice", "alice@steadholme.local"),
     )
     .await;
-    assert!(idx.contains("No upcoming events"));
+    assert!(idx.contains("No events in this range."));
 }
 
 #[tokio::test]
@@ -1001,7 +1184,8 @@ async fn settings_timezone_shifts_rendering_and_persists() {
     let (_s, _h, month) = call(&state, get_as("/?y=2099&m=6", "u_alice", "a@x.co")).await;
     assert!(month.contains("Tokyo sync"));
     assert!(
-        month.contains("10:00 Tokyo sync"),
+        month.contains("<span class=\"cal-event__time\">10:00</span>")
+            && month.contains("Tokyo sync"),
         "chip time shown in the owner's timezone"
     );
     assert!(
@@ -1170,6 +1354,31 @@ async fn unknown_route_renders_404() {
     let (status, _h, body) = call(&state, get("/no/such/path")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body.contains("Not found"));
+    assert_authenticated_shell(&body);
+}
+
+#[tokio::test]
+async fn authenticated_static_routes_have_one_skip_target() {
+    let state = build_dev_state();
+    let routes = [
+        ("/", StatusCode::OK),
+        ("/?view=week&date=2099-06-15", StatusCode::OK),
+        ("/?view=day&date=2099-06-15", StatusCode::OK),
+        ("/?view=agenda", StatusCode::OK),
+        ("/search", StatusCode::OK),
+        ("/contacts", StatusCode::OK),
+        ("/settings", StatusCode::OK),
+        ("/new", StatusCode::OK),
+        ("/edit/not-found", StatusCode::NOT_FOUND),
+        ("/no/such/path", StatusCode::NOT_FOUND),
+    ];
+
+    for (route, expected_status) in routes {
+        let (status, _headers, body) =
+            call(&state, get_as(route, "u_shell", "shell@example.test")).await;
+        assert_eq!(status, expected_status, "unexpected status for {route}");
+        assert_authenticated_shell(&body);
+    }
 }
 
 #[tokio::test]
@@ -1179,6 +1388,7 @@ async fn quick_add_json_creates_event_optimistically() {
     let (_s, headers, _b) = call(&state, get_as("/", "u_alice", "a@x.co")).await;
     let cookie = set_cookie(&headers).unwrap();
     let csrf = cookie_value(&cookie).unwrap();
+    let calendar_id = default_calendar_id("u_alice");
 
     // Bad CSRF -> 403 JSON, nothing written.
     let bad = json_post(
@@ -1186,45 +1396,411 @@ async fn quick_add_json_creates_event_optimistically() {
         &cookie,
         "u_alice",
         "a@x.co",
-        r#"{"text":"Dentist tomorrow 12pm","csrf_token":"wrong"}"#.to_string(),
+        format!(
+            r#"{{"text":"Dentist tomorrow 12pm","calendar_id":"{calendar_id}","intent":"review","csrf_token":"wrong"}}"#
+        ),
     );
-    assert_eq!(call(&state, bad).await.0, StatusCode::FORBIDDEN);
+    let (status, _headers, body) = call(&state, bad).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("\"kind\":\"csrf\""));
 
-    // Valid parse -> 200 {ok:true} with the echoed title.
-    let ok = json_post(
+    // Review -> typed interpretation and zero writes.
+    let review = json_post(
         "/quick-add.json",
         &cookie,
         "u_alice",
         "a@x.co",
-        format!(r#"{{"text":"Dentist tomorrow 12pm","csrf_token":"{csrf}"}}"#),
+        format!(
+            r#"{{"text":"Dentist tomorrow 12pm","calendar_id":"{calendar_id}","intent":"review","csrf_token":"{csrf}"}}"#
+        ),
     );
-    let (status, _h, body) = call(&state, ok).await;
+    let (status, _h, body) = call(&state, review).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("\"ok\":true"), "created: {body}");
+    assert!(body.contains("\"kind\":\"review\""), "reviewed: {body}");
     assert!(body.contains("Dentist"), "title echoed in JSON: {body}");
+    let reviewed_start = find_between(&body, "\"starts_at\":", ",").unwrap();
+    let (_s, _h, before_commit) = call(&state, get_as("/?view=agenda", "u_alice", "a@x.co")).await;
+    assert!(!before_commit.contains("Dentist"), "review must not write");
 
-    // The created event shows in the agenda (owner-scoped, no reload needed by the client).
+    // Commit re-evaluates the phrase and writes once.
+    let commit = json_post(
+        "/quick-add.json",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        format!(
+            r#"{{"text":"Dentist tomorrow 12pm","calendar_id":"{calendar_id}","intent":"commit","reviewed_title":"Dentist","reviewed_starts_at":{reviewed_start},"csrf_token":"{csrf}"}}"#
+        ),
+    );
+    let (status, _h, body) = call(&state, commit).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"kind\":\"committed\""), "{body}");
+
+    // The created event shows in the agenda.
     let (_s, _h, agenda) = call(&state, get_as("/?view=agenda", "u_alice", "a@x.co")).await;
     assert!(agenda.contains("Dentist"), "quick-added event is listed");
 
-    // An unparseable phrase -> 200 {ok:false} (the client then falls back to the form editor).
+    // Unparseable input has the same invalid_input semantic kind, not a hidden form fallback.
     let vague = json_post(
         "/quick-add.json",
         &cookie,
         "u_alice",
         "a@x.co",
-        format!(r#"{{"text":"just some notes","csrf_token":"{csrf}"}}"#),
+        format!(
+            r#"{{"text":"just some notes","calendar_id":"{calendar_id}","intent":"review","csrf_token":"{csrf}"}}"#
+        ),
     );
     let (status, _h, body) = call(&state, vague).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body.contains("\"ok\":false"),
-        "unparseable is a soft no: {body}"
+        body.contains("\"kind\":\"invalid_input\""),
+        "unparseable is typed: {body}"
     );
+
+    // A stale/mismatched review is refreshed without a second write.
+    let stale = json_post(
+        "/quick-add.json",
+        &cookie,
+        "u_alice",
+        "a@x.co",
+        format!(
+            r#"{{"text":"Another tomorrow 12pm","calendar_id":"{calendar_id}","intent":"commit","reviewed_title":"tampered","reviewed_starts_at":{reviewed_start},"csrf_token":"{csrf}"}}"#
+        ),
+    );
+    let (status, _h, body) = call(&state, stale).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"kind\":\"review\""), "{body}");
 
     // Owner scoping: Bob never sees Alice's quick-added event.
     let (_s, _h, bob) = call(&state, get_as("/?view=agenda", "u_bob", "b@x.co")).await;
     assert!(!bob.contains("Dentist"), "quick-add is owner-scoped");
+}
+
+#[tokio::test]
+async fn invalid_dates_settings_and_forms_are_typed_preserved_and_zero_write() {
+    let state = build_dev_state();
+
+    for uri in [
+        "/?view=week&date=not-a-date",
+        "/?m=13",
+        "/search?q=review&from=not-a-date",
+        "/search?q=review&from=2099-06-20&to=2099-06-10",
+        "/new?date=not-a-date",
+    ] {
+        let (status, _headers, body) =
+            call(&state, get_as(uri, "u_validation", "v@example.test")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must stay invalid");
+        assert_authenticated_shell(&body);
+    }
+
+    let (_status, settings_headers, _body) = call(
+        &state,
+        get_as("/settings", "u_validation", "v@example.test"),
+    )
+    .await;
+    let settings_cookie = set_cookie(&settings_headers).unwrap();
+    let settings_csrf = cookie_value(&settings_cookie).unwrap();
+    let invalid_settings = post_form(
+        "/settings",
+        &settings_cookie,
+        "u_validation",
+        "v@example.test",
+        &[
+            ("csrf_token", &settings_csrf),
+            ("timezone", "Europe/Paris"),
+            ("week_start", "friday"),
+        ],
+    );
+    let (status, _headers, settings_body) = call(&state, invalid_settings).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(settings_body.contains("Check your settings"));
+    assert!(settings_body.contains("value=\"Europe/Paris\" selected"));
+    assert!(settings_body.contains("value=\"friday\" selected"));
+    assert!(settings_body.contains(
+        "id=\"timezone\" name=\"timezone\" aria-invalid=\"true\" aria-describedby=\"timezone-error\""
+    ));
+    assert!(settings_body.contains(
+        "id=\"week_start\" name=\"week_start\" aria-invalid=\"true\" aria-describedby=\"week-start-error\""
+    ));
+    let saved = state.store.get_settings("u_validation").await.unwrap();
+    assert_eq!(saved.timezone, "UTC");
+    assert_eq!(saved.week_start, "sunday");
+
+    let (_status, event_headers, _body) =
+        call(&state, get_as("/new", "u_validation", "v@example.test")).await;
+    let event_cookie = set_cookie(&event_headers).unwrap();
+    let event_csrf = cookie_value(&event_cookie).unwrap();
+    let invalid_event = post_form(
+        "/new",
+        &event_cookie,
+        "u_validation",
+        "v@example.test",
+        &[
+            ("csrf_token", &event_csrf),
+            ("title", ""),
+            ("starts_at", "not-a-time"),
+            ("ends_at", "also-not-a-time"),
+            ("location", "Preserved glasshouse"),
+            ("repeat", "weekly"),
+            ("repeat_interval", "0"),
+            ("repeat_count", "10000"),
+            ("repeat_until", "not-a-date"),
+        ],
+    );
+    let (status, _headers, event_body) = call(&state, invalid_event).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(event_body.contains("Check the event details"));
+    for field in [
+        "title",
+        "starts_at",
+        "ends_at",
+        "repeat_interval",
+        "repeat_count",
+        "repeat_until",
+    ] {
+        assert!(
+            event_body.contains(&format!("href=\"#{field}\"")),
+            "summary links {field}"
+        );
+        assert!(
+            event_body.contains(&format!(
+                "aria-invalid=\"true\" aria-describedby=\"{field}-error\""
+            )),
+            "{field} has stable ARIA wiring"
+        );
+    }
+    assert!(event_body.contains("value=\"Preserved glasshouse\""));
+    let unsupported_recurrence = post_form(
+        "/new",
+        &event_cookie,
+        "u_validation",
+        "v@example.test",
+        &[
+            ("csrf_token", &event_csrf),
+            ("title", "Preserved recurrence"),
+            ("starts_at", "2099-06-15T10:00"),
+            ("ends_at", "2099-06-15T11:00"),
+            ("repeat", "fortnightly<script>"),
+            ("repeat_interval", "1"),
+        ],
+    );
+    let (status, _headers, recurrence_body) = call(&state, unsupported_recurrence).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(recurrence_body.contains("href=\"#repeat\""));
+    assert!(recurrence_body.contains(
+        "id=\"repeat\" name=\"repeat\" aria-invalid=\"true\" aria-describedby=\"repeat-error\""
+    ));
+    assert!(recurrence_body.contains(
+        "value=\"fortnightly&lt;script&gt;\" selected>Unsupported selection: fortnightly&lt;script&gt;"
+    ));
+    assert!(
+        state
+            .store
+            .list_events("u_validation")
+            .await
+            .unwrap()
+            .events
+            .is_empty(),
+        "invalid event writes nothing"
+    );
+
+    let (_status, contact_headers, _body) = call(
+        &state,
+        get_as("/contacts", "u_validation", "v@example.test"),
+    )
+    .await;
+    let contact_cookie = set_cookie(&contact_headers).unwrap();
+    let contact_csrf = cookie_value(&contact_cookie).unwrap();
+    let invalid_contact = post_form(
+        "/contacts/new",
+        &contact_cookie,
+        "u_validation",
+        "v@example.test",
+        &[
+            ("csrf_token", &contact_csrf),
+            ("name", ""),
+            ("email", "preserved@example.test"),
+            ("phone", "+49 123"),
+            ("notes", "Keep this note"),
+        ],
+    );
+    let (status, _headers, contact_body) = call(&state, invalid_contact).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(contact_body.contains("Check the contact details"));
+    assert!(contact_body.contains("href=\"#name\""));
+    assert!(contact_body.contains(
+        "id=\"name\" type=\"text\" name=\"name\" value=\"\" autocomplete=\"off\" maxlength=\"200\" required aria-invalid=\"true\" aria-describedby=\"contact-name-error\""
+    ));
+    assert!(contact_body.contains("value=\"preserved@example.test\""));
+    assert!(contact_body.contains("Keep this note"));
+    assert!(state
+        .store
+        .list_contacts("u_validation")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn bounded_event_projection_and_frontend_source_remain_truthful() {
+    let state = build_dev_state();
+    let starts_at = calendar::start_of_day(now_ms() + 86_400_000) + 10 * 3_600_000;
+    for index in 0..=EVENT_LIST_LIMIT {
+        state
+            .store
+            .upsert_event(Event {
+                id: format!("event-{index:04}"),
+                owner_sub: "u_dense".to_string(),
+                calendar_id: default_calendar_id("u_dense"),
+                title: format!("Dense event {index}"),
+                starts_at,
+                ends_at: starts_at + 3_600_000,
+                all_day: false,
+                location: String::new(),
+                notes: String::new(),
+                rrule: String::new(),
+                series_id: String::new(),
+                override_occurrence_date: 0,
+                exception_dates: Vec::new(),
+                created_at: index as i64,
+            })
+            .await
+            .unwrap();
+    }
+
+    let (year, month) = calendar::month_of(starts_at);
+    let (status, _headers, page) = call(
+        &state,
+        get_as(
+            &format!("/?y={year}&m={month}"),
+            "u_dense",
+            "dense@example.test",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Showing the first loaded events."));
+    assert!(page.contains("+1997 more loaded"));
+    assert!(!page.contains(".cal-events:has(.cal-more) .cal-event:nth-of-type"));
+    assert!(page.contains("var inFlight = false;"));
+    assert!(page.contains("if (inFlight) return;"));
+    assert!(page.contains("if (trigger) trigger.disabled = true;"));
+
+    let (_status, _headers, agenda) = call(
+        &state,
+        get_as("/?view=agenda", "u_dense", "dense@example.test"),
+    )
+    .await;
+    assert!(agenda.contains("Showing the first loaded events."));
+    assert!(agenda.contains("more loaded events not shown"));
+    assert!(!agenda.contains("more not shown"));
+
+    let (_status, _headers, search) = call(
+        &state,
+        get_as("/search?q=Dense", "u_dense", "dense@example.test"),
+    )
+    .await;
+    assert!(search.contains("bounded set of loaded matches"));
+    let (_status, _headers, no_match) = call(
+        &state,
+        get_as(
+            "/search?q=DefinitelyAbsent",
+            "u_dense",
+            "dense@example.test",
+        ),
+    )
+    .await;
+    assert!(no_match.contains("No loaded events match"));
+    assert!(!no_match.contains("No events match"));
+}
+
+#[tokio::test]
+async fn extractor_rejections_use_safe_html_and_never_write() {
+    let state = build_dev_state();
+    let (_status, headers, _body) =
+        call(&state, get_as("/new", "u_extract", "extract@example.test")).await;
+    let cookie = set_cookie(&headers).unwrap();
+    let csrf = cookie_value(&cookie).unwrap();
+
+    let requests = vec![
+        get_as("/?m=wat", "u_extract", "extract@example.test"),
+        get_as(
+            "/?view=week&date=2099-01-01&date=2099-01-02",
+            "u_extract",
+            "extract@example.test",
+        ),
+        get_as("/edit/%FF", "u_extract", "extract@example.test"),
+        raw_post(
+            "/new",
+            &cookie,
+            "u_extract",
+            "extract@example.test",
+            "text/plain",
+            "not-a-form",
+        ),
+        raw_post(
+            "/new",
+            &cookie,
+            "u_extract",
+            "extract@example.test",
+            "application/x-www-form-urlencoded",
+            &format!("csrf_token={csrf}&title=first&title=second&starts_at=2099-01-01T10%3A00"),
+        ),
+        raw_post(
+            "/contacts/new",
+            &cookie,
+            "u_extract",
+            "extract@example.test",
+            "application/x-www-form-urlencoded",
+            &format!("csrf_token={csrf}&name=first&name=second"),
+        ),
+        raw_post(
+            "/settings",
+            &cookie,
+            "u_extract",
+            "extract@example.test",
+            "application/x-www-form-urlencoded",
+            &format!("csrf_token={csrf}&timezone=UTC&timezone=UTC%2B01%3A00&week_start=sunday"),
+        ),
+    ];
+
+    for request in requests {
+        let (status, _headers, body) = call(&state, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_authenticated_shell(&body);
+        for leaked in [
+            "Failed to deserialize",
+            "duplicate field",
+            "Invalid URL",
+            "Expected request with",
+            "Content-Type",
+        ] {
+            assert!(
+                !body.contains(leaked),
+                "framework rejection text leaked: {leaked}"
+            );
+        }
+    }
+
+    assert!(
+        state
+            .store
+            .list_events("u_extract")
+            .await
+            .unwrap()
+            .events
+            .is_empty(),
+        "malformed event forms write nothing"
+    );
+    assert!(state
+        .store
+        .list_contacts("u_extract")
+        .await
+        .unwrap()
+        .is_empty());
+    let settings = state.store.get_settings("u_extract").await.unwrap();
+    assert_eq!(settings.timezone, "UTC");
+    assert_eq!(settings.week_start, "sunday");
 }
 
 // --- helpers ---------------------------------------------------------------------------
@@ -1266,6 +1842,20 @@ fn get_as(uri: &str, subject: &str, email: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn assert_authenticated_shell(body: &str) {
+    assert_eq!(
+        body.matches("id=\"main-pane\"").count(),
+        1,
+        "authenticated shell must contain exactly one skip target"
+    );
+    assert_eq!(
+        body.matches("class=\"skip-link\" href=\"#main-pane\"")
+            .count(),
+        1,
+        "authenticated shell must contain exactly one matching skip link"
+    );
+}
+
 fn future_slot(days_from_now: i64, start_hour: i64, end_hour: i64) -> (String, String) {
     let day = calendar::start_of_day(now_ms() + days_from_now * 86_400_000);
     (
@@ -1303,6 +1893,25 @@ fn post_form(
         builder = builder.header(header::COOKIE, cookie);
     }
     builder.body(Body::from(body)).unwrap()
+}
+
+fn raw_post(
+    uri: &str,
+    cookie: &str,
+    subject: &str,
+    email: &str,
+    content_type: &str,
+    body: &str,
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::COOKIE, cookie)
+        .header("x-auth-subject", subject)
+        .header("x-auth-email", email)
+        .body(Body::from(body.to_string()))
+        .unwrap()
 }
 
 fn form_encode(pairs: &[(&str, &str)]) -> String {

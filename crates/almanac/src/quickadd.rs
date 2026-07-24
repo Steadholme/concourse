@@ -231,21 +231,36 @@ mod tests {
     fn resolves_relative_days() {
         // 2026-06-15 is a Monday.
         let today = parse_date("2026-06-15").unwrap();
-        assert_eq!(fmt_date_input(resolve_local_midnight(DaySpec::Today, today)), "2026-06-15");
-        assert_eq!(fmt_date_input(resolve_local_midnight(DaySpec::Tomorrow, today)), "2026-06-16");
+        assert_eq!(
+            fmt_date_input(resolve_local_midnight(DaySpec::Today, today)),
+            "2026-06-15"
+        );
+        assert_eq!(
+            fmt_date_input(resolve_local_midnight(DaySpec::Tomorrow, today)),
+            "2026-06-16"
+        );
         // "wednesday" from a Monday => the same week's Wednesday (Jun 17).
         assert_eq!(
-            fmt_date_input(resolve_local_midnight(DaySpec::Weekday(Weekday::Wednesday), today)),
+            fmt_date_input(resolve_local_midnight(
+                DaySpec::Weekday(Weekday::Wednesday),
+                today
+            )),
             "2026-06-17"
         );
         // The current weekday resolves to today (Monday -> Jun 15).
         assert_eq!(
-            fmt_date_input(resolve_local_midnight(DaySpec::Weekday(Weekday::Monday), today)),
+            fmt_date_input(resolve_local_midnight(
+                DaySpec::Weekday(Weekday::Monday),
+                today
+            )),
             "2026-06-15"
         );
         // "sunday" from a Monday => the coming Sunday (Jun 21).
         assert_eq!(
-            fmt_date_input(resolve_local_midnight(DaySpec::Weekday(Weekday::Sunday), today)),
+            fmt_date_input(resolve_local_midnight(
+                DaySpec::Weekday(Weekday::Sunday),
+                today
+            )),
             "2026-06-21"
         );
     }

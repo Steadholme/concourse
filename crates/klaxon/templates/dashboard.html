@@ -4,480 +4,267 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Notifications · Steadholme Klaxon</title>
+  <title>Signal Muster · Steadholme Klaxon</title>
   <style>{{CSS}}</style>
 </head>
-<body class="page-reading">
+<body class="page-reading page-signal-muster">
+<a class="skip-link" href="#main">Skip to signal muster</a>
 {{TOPBAR}}
-<main class="reader">
-  <div class="reader__head">
-    <div>
-      <h1 class="reader__title">Notifications<span class="count" data-zero="0">{{UNREAD}}</span></h1>
-      <p class="reader__sub">Alerts and updates from across the Steadholme estate.</p>
+<main id="main" class="signal-muster">
+  <header class="muster-head">
+    <p class="muster-head__folio" aria-hidden="true">KLX / OWNER SIGNAL OFFICE / DAILY MUSTER</p>
+    <div class="muster-head__title">
+      <p class="docket-kicker">Operational correspondence · bounded owner view</p>
+      <h1>Signal Muster</h1>
+      <p class="muster-head__window">Unread first, newest within each read-state group. The register is a bounded operational view, never a claim of complete history.</p>
     </div>
-    <div class="reader__actions">
-      <a class="btn btn-ghost btn-sm" href="/settings/prefs">Preferences</a>
-      <a class="btn btn-ghost btn-sm" href="/settings/webhooks">Webhooks</a>
-      {{MARK_ALL}}
-    </div>
+    <nav class="muster-links" aria-label="Klaxon settings">
+      <a href="/settings/prefs"><span aria-hidden="true">01</span> Delivery calibration</a>
+      <a href="/settings/webhooks"><span aria-hidden="true">02</span> Relay manifest</a>
+    </nav>
+    <div class="muster-head__unread" aria-label="Unread signals in filtered view">{{UNREAD}}</div>
+  </header>
+
+  <div id="live-notice" class="live-notice" role="status" aria-live="polite" aria-atomic="true" hidden>
+    <span>New signal received. The bounded register has not changed yet.</span>
+    <a href="/">Refresh view</a>
   </div>
 
-  <section class="prefs">
-    <div class="prefs__text">
-      <strong>Web Push</strong>
-      <span>Get desktop notifications in this browser. {{PUSH_STATE}}</span>
-    </div>
-    <div class="prefs__status">
-      <span id="push-msg"></span>
-      <button id="push-btn" class="btn btn-secondary btn-sm" type="button" hidden>Enable push</button>
-      <form class="inline-form" method="post" action="/api/test">
-        <input type="hidden" name="csrf_token" value="{{CSRF}}">
-        <button class="btn btn-ghost btn-sm" type="submit">Send test notification</button>
-      </form>
+  {{SEVERITY_LEGEND}}
+  {{GOVERNANCE_RAIL}}
+
+  <section class="muster-board" aria-labelledby="muster-board-title">
+    <header class="muster-board__head">
+      <div>
+        <p class="register-label">03 / Muster board</p>
+        <h2 id="muster-board-title">Signal register</h2>
+      </div>
+      <div class="muster-board__bulk">{{MARK_ALL}}</div>
+    </header>
+    {{FILTER_RAIL}}
+    {{ITEMS}}
+  </section>
+
+  <section class="delivery-board" aria-labelledby="delivery-tools-title" data-vapid-public="{{VAPID_PUBLIC}}">
+    <header class="delivery-board__head">
+      <div>
+        <p class="register-label">04 / Delivery instruments</p>
+        <h2 id="delivery-tools-title">Browser capability desk</h2>
+      </div>
+      <div class="delivery-board__authority">{{PUSH_STATE}}</div>
+    </header>
+    <div class="delivery-board__body">
+      <div class="delivery-board__copy">
+        <p>Web Push is a browser capability layered over this retained inbox. A control appears only after this browser and the server both expose the required capability.</p>
+        <p id="push-msg" class="delivery-board__status" role="status" aria-live="polite" aria-atomic="true"></p>
+      </div>
+      <div class="delivery-board__actions">
+        <button id="push-btn" class="btn btn-secondary" type="button" hidden>Enable push</button>
+        <form class="inline-form" method="post" action="/api/test">
+          <input type="hidden" name="csrf_token" value="{{CSRF}}">
+          <button class="btn btn-ghost" type="submit">Send test signal</button>
+        </form>
+      </div>
     </div>
   </section>
 
-  <div class="tabs note-filter" role="tablist" aria-label="Filter notifications">
-    <button class="tab is-active" type="button" role="tab" aria-selected="true" data-filter="all">All</button>
-    <button class="tab" type="button" role="tab" aria-selected="false" data-filter="unread">Unread<span class="note-filter__count" id="unread-tab-count">{{UNREAD}}</span></button>
-  </div>
-
-  <!-- Source filter chips: built by the inbox JS from the sources present in the list, so a new
-       source appears automatically without any hard-coded list. Empty (and hidden) with JS off. -->
-  <div class="source-chips" id="source-chips" role="tablist" aria-label="Filter by source"></div>
-
-  <div class="note-list" id="note-list">
-    {{ITEMS}}
-  </div>
-  <div class="empty" id="filter-empty" hidden>
-    <div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></div>
-    <h3 id="filter-empty-title">No unread notifications</h3>
-    <p>Nothing matches the current filter. <button class="linklike" type="button" data-filter-reset>Clear filters</button> to see everything.</p>
-  </div>
-
-  <p class="klaxon-foot">Steadholme · Sovereign infrastructure · one sign-on across every service</p>
+  <footer class="klaxon-foot">
+    <span>Steadholme Signal Office</span>
+    <span aria-hidden="true">KLX · REGISTER / 200</span>
+    <span>Sovereign infrastructure · one sign-on</span>
+  </footer>
 </main>
 
-<div id="live-toast" class="live-toast">
-  <span id="live-toast-text">New notification</span>
-  <a href="/">Refresh</a>
-</div>
-
-<div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="true"></div>
-
-<script>
-// Progressive enhancement for the inbox: optimistic mark-read / dismiss (fetch + local DOM update,
-// rollback + toast on failure) and instant All/Unread filter tabs. The underlying <form> routes
-// (/api/read, /api/dismiss) still work with JS off — this only intercepts them.
-(function () {
-  var list = document.getElementById("note-list");
-  if (!list) return;
-  function csrf() {
-    var el = document.querySelector('input[name="csrf_token"]');
-    return el ? el.value : "";
-  }
-  var toastHost = document.getElementById("toast-host");
-  function toast(text, kind) {
-    if (!toastHost) return;
-    var el = document.createElement("div");
-    el.className = "toast " + (kind === "err" ? "toast--err" : "toast--ok");
-    el.setAttribute("role", "status");
-    el.textContent = String(text);
-    toastHost.appendChild(el);
-    requestAnimationFrame(function () { el.classList.add("is-in"); });
-    setTimeout(function () {
-      el.classList.remove("is-in");
-      setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 200);
-    }, 2600);
-  }
-
-  var countEl = document.querySelector(".reader__title .count");
-  var tabCountEl = document.getElementById("unread-tab-count");
-  function unreadCards() { return list.querySelectorAll('.card-note[data-read="0"]').length; }
-  function setUnread(n) {
-    if (countEl) countEl.textContent = String(n);
-    if (tabCountEl) {
-      tabCountEl.textContent = String(n);
-      tabCountEl.classList.toggle("is-empty", n === 0);
-    }
-    var markAll = document.querySelector('.reader__actions form[action="/api/read"]');
-    if (markAll) markAll.style.display = n > 0 ? "" : "none";
-    syncChips();
-    applyFilter();
-  }
-
-  function postJson(path, id) {
-    return fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",
-      cache: "no-store",
-      body: JSON.stringify({ id: id || "", csrf_token: csrf() })
-    }).then(function (r) { return r.ok ? r.json() : Promise.reject(); });
-  }
-
-  function markCardRead(card) {
-    card.setAttribute("data-read", "1");
-    card.classList.remove("card-note--unread");
-    var dot = card.querySelector(".note-dot"); if (dot) dot.remove();
-    var f = card.querySelector(".note__read"); if (f) f.remove();
-  }
-
-  function ensureListEmpty() {
-    if (list.querySelector(".card-note")) return;
-    if (list.querySelector("#inbox-empty")) return;
-    // Reuse the server's empty markup shape (kept in sync with EMPTY_INBOX_HTML).
-    list.innerHTML =
-      '<div class="empty" id="inbox-empty">' +
-      '<div class="empty__ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></div>' +
-      "<h3>You're all caught up</h3>" +
-      "<p>New notifications from across the Steadholme estate will land here.</p>" +
-      '<a class="btn btn-primary btn-sm" href="/settings/prefs">Delivery preferences</a></div>';
-  }
-
-  list.addEventListener("submit", function (ev) {
-    var form = ev.target.closest("form");
-    if (!form) return;
-    var action = form.getAttribute("action");
-    var card = form.closest(".card-note");
-    if (!card) return;
-    var id = card.getAttribute("data-id");
-    if (action === "/api/read") {
-      ev.preventDefault();
-      markCardRead(card); // optimistic
-      setUnread(unreadCards());
-      postJson("/api/read.json", id)
-        .then(function (d) { setUnread(d.unread); })
-        .catch(function () { toast("Couldn't mark as read", "err"); location.reload(); });
-    } else if (action === "/api/dismiss") {
-      ev.preventDefault();
-      var next = card.nextElementSibling;
-      card.classList.add("is-leaving"); // optimistic fade
-      var placeholder = card;
-      setTimeout(function () { if (placeholder.parentNode) placeholder.parentNode.removeChild(placeholder); ensureListEmpty(); setUnread(unreadCards()); }, 140);
-      setUnread(card.getAttribute("data-read") === "0" ? unreadCards() - 1 : unreadCards());
-      postJson("/api/dismiss.json", id)
-        .then(function (d) { setUnread(d.unread); toast("Dismissed"); })
-        .catch(function () {
-          card.classList.remove("is-leaving");
-          if (!card.parentNode) { next ? list.insertBefore(card, next) : list.appendChild(card); }
-          setUnread(unreadCards());
-          toast("Couldn't dismiss", "err");
-        });
-    }
-  });
-
-  // Mark-all-read (the header form) also upgrades to the no-reload path.
-  var markAllForm = document.querySelector('.reader__actions form[action="/api/read"]');
-  if (markAllForm) {
-    markAllForm.addEventListener("submit", function (ev) {
-      ev.preventDefault();
-      var cards = list.querySelectorAll('.card-note[data-read="0"]');
-      for (var i = 0; i < cards.length; i++) markCardRead(cards[i]);
-      setUnread(0);
-      postJson("/api/read.json", "")
-        .then(function () { toast("All caught up"); })
-        .catch(function () { toast("Couldn't mark all read", "err"); location.reload(); });
-    });
-  }
-
-  // --- Filters: All/Unread (read state) × source chips, applied together ----
-  var filter = "all";           // read state: "all" | "unread"
-  var sourceFilter = "all";     // source: "all" | a specific data-source value
-  var filterEmpty = document.getElementById("filter-empty");
-  var emptyTitle = document.getElementById("filter-empty-title");
-  var chipBar = document.getElementById("source-chips");
-
-  // Deterministic, on-palette accent dot per source (decorative — the same source always
-  // hashes to the same colour). Kept to a small, restrained token set.
-  var DOT_COLORS = ["var(--accent)", "var(--ok)", "var(--info)", "var(--down)"];
-  function dotColor(s) {
-    var h = 0;
-    for (var i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) >>> 0; }
-    return DOT_COLORS[h % DOT_COLORS.length];
-  }
-
-  // Build one chip. The source name is set via textContent (user data → escaped) and stored
-  // as an attribute we set through the DOM API — it is never interpolated into a CSS selector.
-  function makeChip(src) {
-    var b = document.createElement("button");
-    b.className = "source-chip";
-    b.type = "button";
-    b.setAttribute("role", "tab");
-    b.setAttribute("aria-selected", "false");
-    b.setAttribute("data-source-filter", src);
-    if (src !== "all") {
-      var dot = document.createElement("span");
-      dot.className = "source-chip__dot";
-      dot.setAttribute("aria-hidden", "true");
-      dot.style.background = dotColor(src);
-      b.appendChild(dot);
-    }
-    var label = document.createElement("span");
-    label.className = "source-chip__label";
-    label.textContent = src === "all" ? "All sources" : src;
-    b.appendChild(label);
-    var count = document.createElement("span");
-    count.className = "source-chip__count";
-    b.appendChild(count);
-    b._count = count;
-    return b;
-  }
-
-  // Rebuild the chip bar from the live DOM: new sources appear automatically, a source whose
-  // last card was dismissed drops out, and each chip's unread badge stays in sync. Idempotent —
-  // safe to call after every mutation. Leaving cards are excluded so optimistic dismiss shows at once.
-  function syncChips() {
-    if (!chipBar) return;
-    var order = [], tally = {}, totalUnread = 0;
-    var cards = list.querySelectorAll('.card-note:not(.is-leaving)');
-    for (var i = 0; i < cards.length; i++) {
-      var s = cards[i].getAttribute("data-source") || "";
-      if (!Object.prototype.hasOwnProperty.call(tally, s)) { tally[s] = 0; order.push(s); }
-      if (cards[i].getAttribute("data-read") === "0") { tally[s]++; totalUnread++; }
-    }
-    // One source (or none) needs no source filter — keep the bar out of the way.
-    if (order.length < 2) { chipBar.textContent = ""; sourceFilter = "all"; return; }
-    if (sourceFilter !== "all" && !Object.prototype.hasOwnProperty.call(tally, sourceFilter)) {
-      sourceFilter = "all";
-    }
-    var have = {}, existing = chipBar.querySelectorAll(".source-chip");
-    for (var j = 0; j < existing.length; j++) {
-      have[existing[j].getAttribute("data-source-filter")] = existing[j];
-    }
-    var wanted = ["all"].concat(order), seen = {};
-    for (var k = 0; k < wanted.length; k++) {
-      var src = wanted[k];
-      seen[src] = true;
-      var chip = have[src] || makeChip(src);
-      var u = src === "all" ? totalUnread : tally[src];
-      chip._count.textContent = String(u);
-      chip._count.classList.toggle("is-empty", u === 0);
-      var on = src === sourceFilter;
-      chip.classList.toggle("is-active", on);
-      chip.setAttribute("aria-selected", on ? "true" : "false");
-      chipBar.appendChild(chip); // append in order → stable left-to-right layout
-    }
-    existing = chipBar.querySelectorAll(".source-chip");
-    for (var m = 0; m < existing.length; m++) {
-      if (!seen[existing[m].getAttribute("data-source-filter")]) { chipBar.removeChild(existing[m]); }
-    }
-  }
-
-  // Apply both filter dimensions to the list. Unread hiding rides a list class (CSS); source
-  // hiding tags each non-matching card. A card shows only when it clears both.
-  function applyFilter() {
-    var showUnreadOnly = filter === "unread";
-    list.classList.toggle("filter-unread", showUnreadOnly);
-    var cards = list.querySelectorAll(".card-note");
-    var visible = 0, hasCards = false;
-    for (var i = 0; i < cards.length; i++) {
-      var c = cards[i];
-      var srcMatch = sourceFilter === "all" || c.getAttribute("data-source") === sourceFilter;
-      c.classList.toggle("is-source-hidden", !srcMatch);
-      if (c.classList.contains("is-leaving")) continue;
-      hasCards = true;
-      if (srcMatch && (!showUnreadOnly || c.getAttribute("data-read") === "0")) visible++;
-    }
-    if (filterEmpty) {
-      var show = hasCards && visible === 0;
-      filterEmpty.hidden = !show;
-      if (show && emptyTitle) {
-        var scope = sourceFilter === "all" ? "" : sourceFilter + " ";
-        emptyTitle.textContent = (showUnreadOnly ? "No unread " : "No ") + scope + "notifications";
-      }
-    }
-  }
-
-  function setFilter(next) {
-    filter = next;
-    var tabs = document.querySelectorAll(".note-filter .tab");
-    for (var i = 0; i < tabs.length; i++) {
-      var on = tabs[i].getAttribute("data-filter") === next;
-      tabs[i].classList.toggle("is-active", on);
-      tabs[i].setAttribute("aria-selected", on ? "true" : "false");
-    }
-    applyFilter();
-  }
-  function setSource(next) {
-    sourceFilter = next;
-    if (chipBar) {
-      var chips = chipBar.querySelectorAll(".source-chip");
-      for (var i = 0; i < chips.length; i++) {
-        var on = chips[i].getAttribute("data-source-filter") === next;
-        chips[i].classList.toggle("is-active", on);
-        chips[i].setAttribute("aria-selected", on ? "true" : "false");
-      }
-    }
-    applyFilter();
-  }
-  document.addEventListener("click", function (ev) {
-    if (ev.target.closest("[data-filter-reset]")) { setFilter("all"); setSource("all"); return; }
-    var chip = ev.target.closest("[data-source-filter]");
-    if (chip) { setSource(chip.getAttribute("data-source-filter")); return; }
-    var t = ev.target.closest("[data-filter]");
-    if (!t) return;
-    setFilter(t.getAttribute("data-filter"));
-  });
-  setUnread(unreadCards());
-})();
-</script>
-
 <script>
 (function () {
-  var CSRF = "{{CSRF}}";
-  var VAPID_PUBLIC = "{{VAPID_PUBLIC}}";
+  "use strict";
 
-  // ---- Live updates over SSE ------------------------------------------------
-  try {
-    var es = new EventSource("/api/stream");
-    es.addEventListener("notification", function (ev) {
-      var title = "New notification";
-      try { title = (JSON.parse(ev.data).title) || title; } catch (e) {}
-      var toast = document.getElementById("live-toast");
-      document.getElementById("live-toast-text").textContent = title;
-      toast.style.display = "flex";
-    });
-  } catch (e) { /* SSE unsupported — the page still works on reload */ }
+  var notice = document.getElementById("live-notice");
+  var noticePending = false;
+  if ("EventSource" in window && notice) {
+    try {
+      var stream = new EventSource("/api/stream");
+      stream.addEventListener("notification", function () {
+        if (noticePending) return;
+        noticePending = true;
+        notice.hidden = false;
+      });
+    } catch (_) {
+      /* The native page remains complete when SSE is unavailable. */
+    }
+  }
 
-  // ---- Web Push registration ------------------------------------------------
-  var btn = document.getElementById("push-btn");
-  var msg = document.getElementById("push-msg");
+  var desk = document.querySelector(".delivery-board");
+  var button = document.getElementById("push-btn");
+  var message = document.getElementById("push-msg");
+  if (!desk || !button || !message) return;
+
+  var vapidPublic = desk.getAttribute("data-vapid-public") || "";
+  var csrfInput = desk.querySelector('input[name="csrf_token"]');
+  var csrfToken = csrfInput ? csrfInput.value : "";
   var subscribed = false;
 
-  function setMsg(t) { if (msg) msg.textContent = t; }
-  function setBtn(label, disabled) {
-    if (!btn) { return; }
-    btn.hidden = false;
-    btn.textContent = label;
-    btn.disabled = !!disabled;
+  function setMessage(text) {
+    message.textContent = String(text || "");
   }
+
+  function setButton(label, disabled) {
+    button.hidden = false;
+    button.textContent = label;
+    button.disabled = Boolean(disabled);
+  }
+
   function permissionDenied() {
-    setMsg("Notifications are blocked for this site — allow them in your browser settings first.");
-    setBtn("Enable push", true);
+    setMessage("Push permission is blocked in this browser. Signals still remain in the muster.");
+    setButton("Enable push", true);
   }
 
-  function urlB64ToUint8Array(base64String) {
-    var padding = "=".repeat((4 - (base64String.length % 4)) % 4);
-    var base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  function urlB64ToUint8Array(value) {
+    var padding = "=".repeat((4 - (value.length % 4)) % 4);
+    var base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
     var raw = atob(base64);
-    var out = new Uint8Array(raw.length);
-    for (var i = 0; i < raw.length; ++i) { out[i] = raw.charCodeAt(i); }
-    return out;
+    var bytes = new Uint8Array(raw.length);
+    for (var index = 0; index < raw.length; index += 1) {
+      bytes[index] = raw.charCodeAt(index);
+    }
+    return bytes;
   }
 
-  function b64(buf) {
-    var bytes = new Uint8Array(buf);
-    var bin = "";
-    for (var i = 0; i < bytes.length; i++) { bin += String.fromCharCode(bytes[i]); }
-    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  function encodeKey(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var binary = "";
+    for (var index = 0; index < bytes.length; index += 1) {
+      binary += String.fromCharCode(bytes[index]);
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
-  // Graceful fallbacks: no SW/Push support, or no server keypair — text only, no button.
-  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
-    setMsg("Push is not supported in this browser — notifications still collect in this inbox.");
-    return;
-  }
-  if (!VAPID_PUBLIC) {
-    setMsg("Server push keys not configured");
-    return;
-  }
-
-  // The application-server key, fetched fresh (falls back to the page-embedded copy).
-  function serverKey() {
-    return fetch("/vapidPublicKey", { credentials: "same-origin" }).then(function (resp) {
-      return resp.ok ? resp.text() : "";
-    }).catch(function () {
-      return "";
-    }).then(function (key) {
-      key = (key || "").trim() || VAPID_PUBLIC;
-      if (!key) { throw new Error("push keys not configured"); }
-      return urlB64ToUint8Array(key);
-    });
-  }
-
-  // POST a CSRF-carrying form body to a same-origin endpoint; reject on a non-2xx answer.
   function postForm(path, fields) {
     var body = new URLSearchParams();
-    body.set("csrf_token", CSRF);
-    Object.keys(fields || {}).forEach(function (k) { body.set(k, fields[k]); });
+    body.set("csrf_token", csrfToken);
+    Object.keys(fields || {}).forEach(function (key) {
+      body.set(key, fields[key]);
+    });
     return fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       credentials: "same-origin",
+      cache: "no-store",
       body: body.toString()
-    }).then(function (resp) {
-      if (!resp.ok) { throw new Error("server said " + resp.status); }
+    }).then(function (response) {
+      if (!response.ok) throw new Error("server rejected the request");
     });
   }
 
   function currentSubscription() {
-    return navigator.serviceWorker.getRegistration("/").then(function (reg) {
-      return reg ? reg.pushManager.getSubscription() : null;
+    return navigator.serviceWorker.getRegistration("/").then(function (registration) {
+      return registration ? registration.pushManager.getSubscription() : null;
     });
   }
 
-  // Reflect the browser's actual state into the button on load.
-  function refresh() {
-    currentSubscription().then(function (sub) {
-      subscribed = !!sub;
-      if (Notification.permission === "denied") { permissionDenied(); return; }
-      setMsg(subscribed ? "This browser receives push" : "");
-      setBtn(subscribed ? "Disable push" : "Enable push", false);
+  function serverKey() {
+    return fetch("/vapidPublicKey", {
+      credentials: "same-origin",
+      cache: "no-store"
+    }).then(function (response) {
+      return response.ok ? response.text() : "";
     }).catch(function () {
-      setBtn("Enable push", false);
+      return "";
+    }).then(function (value) {
+      var key = (value || "").trim() || vapidPublic;
+      if (!key) throw new Error("server push keys are not configured");
+      return urlB64ToUint8Array(key);
     });
   }
 
-  function enable() {
-    setBtn("Enable push", true);
-    setMsg("Registering…");
-    navigator.serviceWorker.register("/sw.js", { scope: "/" }).then(function (reg) {
-      return Notification.requestPermission().then(function (perm) {
-        if (perm !== "granted") { throw new Error("permission " + perm); }
+  function refreshCapability() {
+    currentSubscription().then(function (subscription) {
+      subscribed = Boolean(subscription);
+      if (Notification.permission === "denied") {
+        permissionDenied();
+        return;
+      }
+      setMessage(subscribed
+        ? "A browser subscription is present. Use Disable push to revoke it."
+        : "Push is available in this browser but is not enabled.");
+      setButton(subscribed ? "Disable push" : "Enable push", false);
+    }).catch(function () {
+      setMessage("Push capability could not be inspected. The retained inbox is unaffected.");
+      setButton("Enable push", false);
+    });
+  }
+
+  function enablePush() {
+    setButton("Enable push", true);
+    setMessage("Registering browser capability…");
+    navigator.serviceWorker.register("/sw.js", { scope: "/" }).then(function (registration) {
+      return Notification.requestPermission().then(function (permission) {
+        if (permission !== "granted") throw new Error("permission was not granted");
         return serverKey().then(function (key) {
-          return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+          return registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: key
+          });
         });
       });
-    }).then(function (sub) {
-      var json = sub.toJSON();
+    }).then(function (subscription) {
+      var json = subscription.toJSON();
       return postForm("/api/subscribe", {
-        endpoint: sub.endpoint,
-        p256dh: (json.keys && json.keys.p256dh) || b64(sub.getKey("p256dh")),
-        auth: (json.keys && json.keys.auth) || b64(sub.getKey("auth"))
+        endpoint: subscription.endpoint,
+        p256dh: (json.keys && json.keys.p256dh) || encodeKey(subscription.getKey("p256dh")),
+        auth: (json.keys && json.keys.auth) || encodeKey(subscription.getKey("auth"))
       });
     }).then(function () {
       subscribed = true;
-      setMsg("This browser receives push");
-      setBtn("Disable push", false);
-    }).catch(function (err) {
-      if (Notification.permission === "denied") { permissionDenied(); return; }
-      setMsg("Could not register: " + err.message);
-      setBtn("Enable push", false);
+      setMessage("Push registration confirmed by the server for this browser.");
+      setButton("Disable push", false);
+    }).catch(function (error) {
+      if (Notification.permission === "denied") {
+        permissionDenied();
+        return;
+      }
+      setMessage("Push registration failed: " + error.message + ". The retained inbox is unaffected.");
+      setButton("Enable push", false);
     });
   }
 
-  function disable() {
-    setBtn("Disable push", true);
-    setMsg("Unregistering…");
-    currentSubscription().then(function (sub) {
-      if (!sub) { return null; }
-      var endpoint = sub.endpoint;
-      return sub.unsubscribe().then(function () {
+  function disablePush() {
+    setButton("Disable push", true);
+    setMessage("Revoking browser capability…");
+    currentSubscription().then(function (subscription) {
+      if (!subscription) return null;
+      var endpoint = subscription.endpoint;
+      return subscription.unsubscribe().then(function () {
         return postForm("/api/unsubscribe", { endpoint: endpoint });
       });
     }).then(function () {
       subscribed = false;
-      setMsg("Push disabled in this browser");
-      setBtn("Enable push", false);
-    }).catch(function (err) {
-      setMsg("Could not disable: " + err.message);
-      setBtn(subscribed ? "Disable push" : "Enable push", false);
+      setMessage("Push is disabled in this browser. Signals remain in the muster.");
+      setButton("Enable push", false);
+    }).catch(function (error) {
+      setMessage("Push could not be disabled: " + error.message + ". Reload before trying again.");
+      setButton(subscribed ? "Disable push" : "Enable push", false);
     });
   }
 
-  btn.addEventListener("click", function () { subscribed ? disable() : enable(); });
-  refresh();
+  if (!("serviceWorker" in navigator) ||
+      !("PushManager" in window) ||
+      !("Notification" in window) ||
+      !vapidPublic) {
+    setMessage(vapidPublic
+      ? "Web Push is unavailable in this browser. Signals still remain in the muster."
+      : "Server push keys are not configured. Signals still remain in the muster.");
+    return;
+  }
+
+  button.addEventListener("click", function () {
+    if (subscribed) {
+      disablePush();
+    } else {
+      enablePush();
+    }
+  });
+  refreshCapability();
 })();
 </script>
 </body>

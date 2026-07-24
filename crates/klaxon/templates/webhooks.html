@@ -4,49 +4,71 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Webhooks · Steadholme Klaxon</title>
+  <title>Relay Manifest · Steadholme Klaxon</title>
   <style>{{CSS}}</style>
 </head>
-<body class="page-reading">
+<body class="page-reading page-relays">
+<a class="skip-link" href="#main">Skip to relay manifest</a>
 {{TOPBAR}}
-<main class="reader">
-  <div class="reader__head">
-    <div>
-      <h1 class="reader__title">Webhooks<span class="count" data-zero="0">{{COUNT}}</span></h1>
-      <p class="reader__sub">Forward your notifications to an external endpoint. Each delivery is a JSON <code class="code">POST</code> of the notification.</p>
+<main id="main" class="relay-manifest">
+  <header class="sheet-head">
+    <p class="sheet-head__folio" aria-hidden="true">KLX / OUTBOUND RELAY OFFICE / OWNER COPY</p>
+    <div class="sheet-head__title">
+      <p class="docket-kicker">Registered delivery endpoints</p>
+      <h1>Relay Manifest</h1>
+      <p>Authorize outbound JSON delivery to endpoints you control. Stored signing-secret values are never displayed again.</p>
     </div>
-    <div class="reader__actions">
-      <a class="btn btn-ghost btn-sm" href="/settings/prefs">Preferences</a>
-      <a class="btn btn-ghost btn-sm" href="/">Back to inbox</a>
+    <nav class="sheet-links" aria-label="Klaxon pages">
+      <a href="/"><span aria-hidden="true">00</span> Signal muster</a>
+      <a href="/settings/prefs"><span aria-hidden="true">01</span> Delivery calibration</a>
+    </nav>
+    <div class="manifest-count">
+      <span class="register-label">Registered relays</span>
+      <span class="count" data-zero="0">{{COUNT}}</span>
     </div>
-  </div>
+  </header>
 
-  <section class="card">
-    <div class="card__head"><h2>Add a webhook</h2></div>
-    <div class="card__body">
-      <form method="post" action="/settings/webhooks">
-        <input type="hidden" name="csrf_token" value="{{CSRF}}">
-        <div class="field">
-          <label for="wh-url">Endpoint URL</label>
-          <input id="wh-url" type="url" name="url" placeholder="https://example.com/hooks/klaxon" required>
+  <section class="relay-drafting" aria-labelledby="new-relay-title">
+    <form method="post" action="/settings/webhooks">
+      <input type="hidden" name="csrf_token" value="{{CSRF}}">
+      <fieldset>
+        <legend id="new-relay-title"><span class="band-number" aria-hidden="true">01</span><span>New relay</span></legend>
+        <p class="band-intro">Register one HTTP or HTTPS endpoint. The optional secret signs each delivery but cannot be retrieved from this desk.</p>
+        <div class="relay-form-grid">
+          <label for="wh-url">
+            <span>Endpoint URL</span>
+            <small>Destination under your control</small>
+            <input id="wh-url" type="url" name="url" placeholder="https://example.com/hooks/klaxon" inputmode="url" spellcheck="false" required>
+          </label>
+          <label for="wh-secret">
+            <span>Signing secret <small>(optional)</small></span>
+            <small>Write-only shared verification secret</small>
+            <input id="wh-secret" type="password" name="secret" placeholder="Shared delivery secret" autocomplete="new-password" spellcheck="false">
+          </label>
+          <div class="relay-form-grid__action">
+            <button class="btn btn-primary" type="submit">Register relay</button>
+          </div>
         </div>
-        <div class="field">
-          <label for="wh-secret">Signing secret <span class="hint">(optional)</span></label>
-          <input id="wh-secret" type="text" name="secret" placeholder="shared secret for verifying deliveries">
-        </div>
-        <button class="btn btn-primary" type="submit">Add webhook</button>
-      </form>
-    </div>
+      </fieldset>
+    </form>
   </section>
 
-  <section class="card">
-    <div class="card__head"><h2>Your webhooks</h2></div>
-    <div class="card__body">
+  <section class="relay-register" aria-labelledby="registered-relays-title">
+    <header>
+      <p class="register-label">02 / Active manifest</p>
+      <h2 id="registered-relays-title">Registered relays</h2>
+      <p>Endpoint, registration date, secret-presence status, and owner-scoped revocation.</p>
+    </header>
+    <div class="relay-register__body">
       {{ITEMS}}
     </div>
   </section>
 
-  <p class="klaxon-foot">Steadholme · Sovereign infrastructure · one sign-on across every service</p>
+  <footer class="klaxon-foot">
+    <span>Steadholme Signal Office</span>
+    <span aria-hidden="true">KLX · RELAYS / OWNER</span>
+    <span>Sovereign infrastructure · one sign-on</span>
+  </footer>
 </main>
 </body>
 </html>

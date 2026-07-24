@@ -35,6 +35,14 @@ pub struct Notification {
     pub read_at: i64,
 }
 
+/// A checked, bounded inbox read. `truncated` is true only when at least one matching row exists
+/// beyond [`LIST_LIMIT`]; a snapshot containing exactly `LIST_LIMIT` rows is not truncated.
+#[derive(Clone, Debug)]
+pub struct InboxListSnapshot {
+    pub notifications: Vec<Notification>,
+    pub truncated: bool,
+}
+
 /// Per-owner delivery preferences (maps to a `notify_prefs` row plus its `notify_mutes` children).
 ///
 /// Read is idempotent: [`Store::get_prefs`] returns [`NotifyPrefs::defaults`] (everything off) when
@@ -81,8 +89,14 @@ impl NotifyPrefs {
         self.mute_all
             || self.digest
             || self.in_quiet_hours(minute)
-            || self.muted_sources.iter().any(|s| s.eq_ignore_ascii_case(source))
-            || self.muted_severities.iter().any(|s| s.eq_ignore_ascii_case(severity))
+            || self
+                .muted_sources
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(source))
+            || self
+                .muted_severities
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(severity))
     }
 
     /// True when `minute` (minute-of-day UTC) falls inside the configured quiet-hours window. An
@@ -137,11 +151,22 @@ pub trait Store: Send + Sync {
     /// is matched by ANY of `keys` (the subject and/or the email, since a producer may address by
     /// either).
     async fn list_notifications(&self, keys: &[String]) -> Vec<Notification>;
+    /// The same ordered/capped inbox read, but fail-loud and with exact over-limit evidence for the
+    /// server-rendered Signal Muster. Existing callers keep using [`Store::list_notifications`].
+    async fn list_notifications_checked(
+        &self,
+        keys: &[String],
+    ) -> Result<InboxListSnapshot, StoreError>;
     /// A user's notifications created at-or-after `since` epoch seconds (the SSE poll tail).
     async fn list_since(&self, keys: &[String], since: i64) -> Vec<Notification>;
     /// Mark one notification read (when `id` is `Some`) or all of the user's unread (when `None`).
     /// Returns the number of rows updated.
-    async fn mark_read(&self, keys: &[String], id: Option<&str>, now: i64) -> Result<u64, StoreError>;
+    async fn mark_read(
+        &self,
+        keys: &[String],
+        id: Option<&str>,
+        now: i64,
+    ) -> Result<u64, StoreError>;
     /// Delete (dismiss) one of a user's notifications by id. Owner-scoped: only a row whose
     /// `user_sub` matches ANY of `keys` AND whose id matches is removed. Returns rows deleted (0/1).
     async fn delete_notification(&self, keys: &[String], id: &str) -> Result<u64, StoreError>;
@@ -165,6 +190,9 @@ pub trait Store: Send + Sync {
     /// An owner's delivery preferences. Idempotent: returns [`NotifyPrefs::defaults`] (everything
     /// off) when the owner has never saved any.
     async fn get_prefs(&self, key: &str) -> NotifyPrefs;
+    /// Fail-loud preference read used by the Signal Muster governance rail. A missing saved row is
+    /// still a successful [`NotifyPrefs::defaults`] value; only backend failure is `Err`.
+    async fn get_prefs_checked(&self, key: &str) -> Result<NotifyPrefs, StoreError>;
     /// Store (replace) an owner's delivery preferences, keyed by `prefs.user_sub`. Idempotent: the
     /// prefs row is upserted and the mute set is replaced wholesale.
     async fn set_prefs(&self, prefs: &NotifyPrefs) -> Result<(), StoreError>;
@@ -206,8 +234,15 @@ impl Store for InMemoryStore {
     }
 
     async fn list_notifications(&self, keys: &[String]) -> Vec<Notification> {
-        let all = self.notifications.lock().expect("notifications lock poisoned");
-        let mut v: Vec<Notification> = all.iter().filter(|n| matches(&n.user_sub, keys)).cloned().collect();
+        let all = self
+            .notifications
+            .lock()
+            .expect("notifications lock poisoned");
+        let mut v: Vec<Notification> = all
+            .iter()
+            .filter(|n| matches(&n.user_sub, keys))
+            .cloned()
+            .collect();
         // Unread (read_at == 0) first; within each group newest-first, ties broken by id.
         v.sort_by(|a, b| {
             let ar = (a.read_at != 0) as u8;
@@ -220,19 +255,62 @@ impl Store for InMemoryStore {
         v
     }
 
+    async fn list_notifications_checked(
+        &self,
+        keys: &[String],
+    ) -> Result<InboxListSnapshot, StoreError> {
+        let all = self
+            .notifications
+            .lock()
+            .expect("notifications lock poisoned");
+        let mut notifications: Vec<Notification> = all
+            .iter()
+            .filter(|n| matches(&n.user_sub, keys))
+            .cloned()
+            .collect();
+        notifications.sort_by(|a, b| {
+            let ar = (a.read_at != 0) as u8;
+            let br = (b.read_at != 0) as u8;
+            ar.cmp(&br)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        let truncated = notifications.len() > LIST_LIMIT;
+        notifications.truncate(LIST_LIMIT);
+        Ok(InboxListSnapshot {
+            notifications,
+            truncated,
+        })
+    }
+
     async fn list_since(&self, keys: &[String], since: i64) -> Vec<Notification> {
-        let all = self.notifications.lock().expect("notifications lock poisoned");
+        let all = self
+            .notifications
+            .lock()
+            .expect("notifications lock poisoned");
         let mut v: Vec<Notification> = all
             .iter()
             .filter(|n| matches(&n.user_sub, keys) && n.created_at >= since)
             .cloned()
             .collect();
-        v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        v.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         v
     }
 
-    async fn mark_read(&self, keys: &[String], id: Option<&str>, now: i64) -> Result<u64, StoreError> {
-        let mut all = self.notifications.lock().expect("notifications lock poisoned");
+    async fn mark_read(
+        &self,
+        keys: &[String],
+        id: Option<&str>,
+        now: i64,
+    ) -> Result<u64, StoreError> {
+        let mut all = self
+            .notifications
+            .lock()
+            .expect("notifications lock poisoned");
         let mut updated = 0u64;
         for n in all.iter_mut() {
             if !matches(&n.user_sub, keys) || n.read_at != 0 {
@@ -250,7 +328,10 @@ impl Store for InMemoryStore {
     }
 
     async fn delete_notification(&self, keys: &[String], id: &str) -> Result<u64, StoreError> {
-        let mut all = self.notifications.lock().expect("notifications lock poisoned");
+        let mut all = self
+            .notifications
+            .lock()
+            .expect("notifications lock poisoned");
         let before = all.len();
         all.retain(|n| !(matches(&n.user_sub, keys) && n.id == id));
         Ok((before - all.len()) as u64)
@@ -266,7 +347,10 @@ impl Store for InMemoryStore {
     }
 
     async fn upsert_subscription(&self, sub: &PushSubscription) -> Result<(), StoreError> {
-        let mut subs = self.subscriptions.lock().expect("subscriptions lock poisoned");
+        let mut subs = self
+            .subscriptions
+            .lock()
+            .expect("subscriptions lock poisoned");
         match subs.iter_mut().find(|s| s.endpoint == sub.endpoint) {
             Some(existing) => {
                 existing.user_sub = sub.user_sub.clone();
@@ -289,7 +373,10 @@ impl Store for InMemoryStore {
     }
 
     async fn delete_subscription(&self, key: &str, endpoint: &str) -> Result<u64, StoreError> {
-        let mut subs = self.subscriptions.lock().expect("subscriptions lock poisoned");
+        let mut subs = self
+            .subscriptions
+            .lock()
+            .expect("subscriptions lock poisoned");
         let before = subs.len();
         subs.retain(|s| !(s.user_sub == key && s.endpoint == endpoint));
         Ok((before - subs.len()) as u64)
@@ -313,7 +400,11 @@ impl Store for InMemoryStore {
             .cloned()
             .collect();
         // Newest-first for stable UI rendering, ties broken by id.
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        v.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         v
     }
 
@@ -332,6 +423,10 @@ impl Store for InMemoryStore {
             .find(|p| p.user_sub == key)
             .cloned()
             .unwrap_or_else(|| NotifyPrefs::defaults(key))
+    }
+
+    async fn get_prefs_checked(&self, key: &str) -> Result<NotifyPrefs, StoreError> {
+        Ok(self.get_prefs(key).await)
     }
 
     async fn set_prefs(&self, prefs: &NotifyPrefs) -> Result<(), StoreError> {
@@ -535,7 +630,10 @@ impl PgStore {
         Ok(())
     }
 
-    async fn list_notifications_async(&self, keys: &[String]) -> Result<Vec<Notification>, sqlx::Error> {
+    async fn list_notifications_async(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<Notification>, sqlx::Error> {
         let (k1, k2) = Self::key_pair(keys);
         let rows = sqlx::query(
             "SELECT id, user_sub, source, severity, title, body, url, created_at, read_at \
@@ -550,7 +648,38 @@ impl PgStore {
         rows.iter().map(Self::notification_from_row).collect()
     }
 
-    async fn list_since_async(&self, keys: &[String], since: i64) -> Result<Vec<Notification>, sqlx::Error> {
+    async fn list_notifications_checked_async(
+        &self,
+        keys: &[String],
+    ) -> Result<InboxListSnapshot, sqlx::Error> {
+        let (k1, k2) = Self::key_pair(keys);
+        let rows = sqlx::query(
+            "SELECT id, user_sub, source, severity, title, body, url, created_at, read_at \
+             FROM notifications WHERE user_sub = $1 OR user_sub = $2 \
+             ORDER BY CASE WHEN read_at = 0 THEN 0 ELSE 1 END, created_at DESC, id DESC LIMIT $3",
+        )
+        .bind(&k1)
+        .bind(&k2)
+        .bind((LIST_LIMIT + 1) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let truncated = rows.len() > LIST_LIMIT;
+        let mut notifications = rows
+            .iter()
+            .map(Self::notification_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        notifications.truncate(LIST_LIMIT);
+        Ok(InboxListSnapshot {
+            notifications,
+            truncated,
+        })
+    }
+
+    async fn list_since_async(
+        &self,
+        keys: &[String],
+        since: i64,
+    ) -> Result<Vec<Notification>, sqlx::Error> {
         let (k1, k2) = Self::key_pair(keys);
         let rows = sqlx::query(
             "SELECT id, user_sub, source, severity, title, body, url, created_at, read_at \
@@ -566,7 +695,12 @@ impl PgStore {
         rows.iter().map(Self::notification_from_row).collect()
     }
 
-    async fn mark_read_async(&self, keys: &[String], id: Option<&str>, now: i64) -> Result<u64, sqlx::Error> {
+    async fn mark_read_async(
+        &self,
+        keys: &[String],
+        id: Option<&str>,
+        now: i64,
+    ) -> Result<u64, sqlx::Error> {
         let (k1, k2) = Self::key_pair(keys);
         let result = match id {
             Some(target) => {
@@ -596,7 +730,11 @@ impl PgStore {
         Ok(result.rows_affected())
     }
 
-    async fn delete_notification_async(&self, keys: &[String], id: &str) -> Result<u64, sqlx::Error> {
+    async fn delete_notification_async(
+        &self,
+        keys: &[String],
+        id: &str,
+    ) -> Result<u64, sqlx::Error> {
         let (k1, k2) = Self::key_pair(keys);
         let result = sqlx::query(
             "DELETE FROM notifications WHERE id = $1 AND (user_sub = $2 OR user_sub = $3)",
@@ -640,7 +778,10 @@ impl PgStore {
         Ok(())
     }
 
-    async fn list_subscriptions_async(&self, key: &str) -> Result<Vec<PushSubscription>, sqlx::Error> {
+    async fn list_subscriptions_async(
+        &self,
+        key: &str,
+    ) -> Result<Vec<PushSubscription>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT id, user_sub, endpoint, p256dh, auth, created_at \
              FROM push_subscriptions WHERE user_sub = $1",
@@ -651,12 +792,17 @@ impl PgStore {
         rows.iter().map(Self::subscription_from_row).collect()
     }
 
-    async fn delete_subscription_async(&self, key: &str, endpoint: &str) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_sub = $2")
-            .bind(endpoint)
-            .bind(key)
-            .execute(&self.pool)
-            .await?;
+    async fn delete_subscription_async(
+        &self,
+        key: &str,
+        endpoint: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let result =
+            sqlx::query("DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_sub = $2")
+                .bind(endpoint)
+                .bind(key)
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected())
     }
 
@@ -730,6 +876,46 @@ impl PgStore {
         Ok(prefs)
     }
 
+    /// Read the base preference row and mute children from one PostgreSQL statement snapshot.
+    /// `set_prefs_async` replaces both atomically; using one joined statement here prevents a
+    /// concurrent save from producing a checked governance value that never existed.
+    async fn get_prefs_checked_async(&self, key: &str) -> Result<NotifyPrefs, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT p.user_sub AS prefs_user_sub, p.mute_all, p.quiet_start, p.quiet_end, \
+                    p.digest, p.updated_at, m.kind AS mute_kind, m.value AS mute_value \
+             FROM notify_prefs AS p \
+             LEFT JOIN notify_mutes AS m ON m.user_sub = p.user_sub \
+             WHERE p.user_sub = $1 \
+             ORDER BY m.kind ASC, m.value ASC",
+        )
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+        let Some(first) = rows.first() else {
+            return Ok(NotifyPrefs::defaults(key));
+        };
+        let mut prefs = NotifyPrefs {
+            user_sub: first.try_get("prefs_user_sub")?,
+            mute_all: first.try_get("mute_all")?,
+            quiet_start: first.try_get("quiet_start")?,
+            quiet_end: first.try_get("quiet_end")?,
+            digest: first.try_get("digest")?,
+            updated_at: first.try_get("updated_at")?,
+            muted_sources: Vec::new(),
+            muted_severities: Vec::new(),
+        };
+        for row in &rows {
+            let kind: Option<String> = row.try_get("mute_kind")?;
+            let value: Option<String> = row.try_get("mute_value")?;
+            match (kind.as_deref(), value) {
+                (Some("severity"), Some(value)) => prefs.muted_severities.push(value),
+                (Some(_), Some(value)) => prefs.muted_sources.push(value),
+                _ => {}
+            }
+        }
+        Ok(prefs)
+    }
+
     async fn set_prefs_async(&self, p: &NotifyPrefs) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -788,20 +974,38 @@ impl Store for PgStore {
     }
 
     async fn list_notifications(&self, keys: &[String]) -> Vec<Notification> {
-        self.list_notifications_async(keys).await.unwrap_or_else(|e| {
-            tracing::error!(error = %e, "pg list_notifications failed");
-            Vec::new()
-        })
+        self.list_notifications_async(keys)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_notifications failed");
+                Vec::new()
+            })
+    }
+
+    async fn list_notifications_checked(
+        &self,
+        keys: &[String],
+    ) -> Result<InboxListSnapshot, StoreError> {
+        self.list_notifications_checked_async(keys)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     async fn list_since(&self, keys: &[String], since: i64) -> Vec<Notification> {
-        self.list_since_async(keys, since).await.unwrap_or_else(|e| {
-            tracing::error!(error = %e, "pg list_since failed");
-            Vec::new()
-        })
+        self.list_since_async(keys, since)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_since failed");
+                Vec::new()
+            })
     }
 
-    async fn mark_read(&self, keys: &[String], id: Option<&str>, now: i64) -> Result<u64, StoreError> {
+    async fn mark_read(
+        &self,
+        keys: &[String],
+        id: Option<&str>,
+        now: i64,
+    ) -> Result<u64, StoreError> {
         self.mark_read_async(keys, id, now)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))
@@ -827,10 +1031,12 @@ impl Store for PgStore {
     }
 
     async fn list_subscriptions(&self, key: &str) -> Vec<PushSubscription> {
-        self.list_subscriptions_async(key).await.unwrap_or_else(|e| {
-            tracing::error!(error = %e, "pg list_subscriptions failed");
-            Vec::new()
-        })
+        self.list_subscriptions_async(key)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "pg list_subscriptions failed");
+                Vec::new()
+            })
     }
 
     async fn delete_subscription(&self, key: &str, endpoint: &str) -> Result<u64, StoreError> {
@@ -863,6 +1069,12 @@ impl Store for PgStore {
             tracing::error!(error = %e, "pg get_prefs failed");
             NotifyPrefs::defaults(key)
         })
+    }
+
+    async fn get_prefs_checked(&self, key: &str) -> Result<NotifyPrefs, StoreError> {
+        self.get_prefs_checked_async(key)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     async fn set_prefs(&self, prefs: &NotifyPrefs) -> Result<(), StoreError> {
@@ -953,6 +1165,9 @@ mod tests {
 
         let got = store.get_prefs("u_1").await;
         assert!(got.mute_all);
-        assert_eq!(got.muted_sources, vec!["loom".to_string(), "sanctum".to_string()]);
+        assert_eq!(
+            got.muted_sources,
+            vec!["loom".to_string(), "sanctum".to_string()]
+        );
     }
 }

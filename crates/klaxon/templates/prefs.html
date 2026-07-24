@@ -4,64 +4,94 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Preferences · Steadholme Klaxon</title>
+  <title>Delivery Calibration Sheet · Steadholme Klaxon</title>
   <style>{{CSS}}</style>
 </head>
-<body class="page-reading">
+<body class="page-reading page-calibration">
+<a class="skip-link" href="#main">Skip to delivery calibration</a>
 {{TOPBAR}}
-<main class="reader">
-  <div class="reader__head">
-    <div>
-      <h1 class="reader__title">Delivery preferences</h1>
-      <p class="reader__sub">Control when Klaxon pings you in real time. Muted or quiet notifications still land in your inbox — only push, webhook, and email delivery is skipped.</p>
+<main id="main" class="calibration-sheet">
+  <header class="sheet-head">
+    <p class="sheet-head__folio" aria-hidden="true">KLX / DELIVERY AUTHORITY / OWNER COPY</p>
+    <div class="sheet-head__title">
+      <p class="docket-kicker">Operational delivery policy</p>
+      <h1>Delivery Calibration Sheet</h1>
+      <p>Set the conditions for real-time dispatch. Every signal remains in the retained inbox even when an outbound channel is paused or suppressed.</p>
     </div>
-    <div class="reader__actions">
-      <a class="btn btn-ghost btn-sm" href="/settings/webhooks">Webhooks</a>
-      <a class="btn btn-ghost btn-sm" href="/">Back to inbox</a>
-    </div>
-  </div>
+    <nav class="sheet-links" aria-label="Klaxon pages">
+      <a href="/"><span aria-hidden="true">00</span> Signal muster</a>
+      <a href="/settings/webhooks"><span aria-hidden="true">02</span> Relay manifest</a>
+    </nav>
+  </header>
 
-  <section class="card">
-    <div class="card__body">
-      <form method="post" action="/settings/prefs">
-        <input type="hidden" name="csrf_token" value="{{CSRF}}">
+  <form class="calibration-form" method="post" action="/settings/prefs">
+    <input type="hidden" name="csrf_token" value="{{CSRF}}">
 
-        <div class="field">
-          <label><input type="checkbox" name="mute_all" value="on" {{MUTE_ALL_CHECKED}}> Mute all real-time delivery</label>
-          <span class="hint">Nothing is pushed, webhooked, or emailed — the inbox still fills as usual.</span>
-        </div>
+    <fieldset class="calibration-band calibration-band--tempo">
+      <legend><span class="band-number" aria-hidden="true">01</span><span>Tempo</span></legend>
+      <p class="band-intro">Choose whether real-time fan-out runs continuously or waits for a later review cycle.</p>
+      <div class="calibration-options">
+        <label class="calibration-check">
+          <input type="checkbox" name="mute_all" value="on" {{MUTE_ALL_CHECKED}}>
+          <span>
+            <strong>Pause real-time delivery</strong>
+            <small>Skip Push, webhook, and email fan-out while inbox copies continue to accumulate.</small>
+          </span>
+        </label>
+        <label class="calibration-check">
+          <input type="checkbox" name="digest" value="on" {{DIGEST_CHECKED}}>
+          <span>
+            <strong>Collect for digest</strong>
+            <small>Hold real-time dispatch for a later digest without removing any retained signal.</small>
+          </span>
+        </label>
+      </div>
+    </fieldset>
 
-        <div class="field">
-          <label><input type="checkbox" name="digest" value="on" {{DIGEST_CHECKED}}> Digest mode</label>
-          <span class="hint">Collect notifications for a later digest instead of pinging in real time.</span>
-        </div>
+    <fieldset class="calibration-band calibration-band--quiet">
+      <legend><span class="band-number" aria-hidden="true">02</span><span>Quiet interval</span></legend>
+      <p class="band-intro">UTC interval for suppressing real-time delivery. Leave both fields blank to disable; a start later than the end wraps past midnight.</p>
+      <div class="quiet-range">
+        <label for="quiet-start">
+          <span>Quiet begins</span>
+          <input id="quiet-start" type="time" name="quiet_start" value="{{QUIET_START}}">
+        </label>
+        <span class="quiet-range__join" aria-hidden="true">to</span>
+        <label for="quiet-end">
+          <span>Quiet ends</span>
+          <input id="quiet-end" type="time" name="quiet_end" value="{{QUIET_END}}">
+        </label>
+      </div>
+    </fieldset>
 
-        <div class="field">
-          <label for="quiet-start">Quiet hours (UTC)</label>
-          <div class="actions">
-            <input id="quiet-start" type="time" name="quiet_start" value="{{QUIET_START}}">
-            <span class="hint">to</span>
-            <input id="quiet-end" type="time" name="quiet_end" value="{{QUIET_END}}">
-          </div>
-          <span class="hint">Real-time delivery is skipped inside this window. Leave both blank to disable. A start later than the end wraps past midnight.</span>
-        </div>
-
-        <div class="field">
-          <label for="muted-sources">Muted sources <span class="hint">(comma-separated)</span></label>
+    <fieldset class="calibration-band calibration-band--vocabulary">
+      <legend><span class="band-number" aria-hidden="true">03</span><span>Suppression vocabulary</span></legend>
+      <p class="band-intro">Comma-separated producer tokens. These rules affect outbound fan-out only; the Signal Muster remains authoritative for retained copies.</p>
+      <div class="vocabulary-grid">
+        <label for="muted-sources">
+          <span>Muted sources</span>
+          <small>Exact producer source names</small>
           <input id="muted-sources" type="text" name="muted_sources" value="{{MUTED_SOURCES}}" placeholder="beacon, loom">
-        </div>
-
-        <div class="field">
-          <label for="muted-severities">Muted severities <span class="hint">(comma-separated)</span></label>
+        </label>
+        <label for="muted-severities">
+          <span>Muted severities</span>
+          <small>Exact producer severity names</small>
           <input id="muted-severities" type="text" name="muted_severities" value="{{MUTED_SEVERITIES}}" placeholder="info, warning">
-        </div>
+        </label>
+      </div>
+    </fieldset>
 
-        <button class="btn btn-primary" type="submit">Save preferences</button>
-      </form>
+    <div class="sheet-action">
+      <p>Saving replaces the current owner-scoped delivery policy.</p>
+      <button class="btn btn-primary" type="submit">Save preferences</button>
     </div>
-  </section>
+  </form>
 
-  <p class="klaxon-foot">Steadholme · Sovereign infrastructure · one sign-on across every service</p>
+  <footer class="klaxon-foot">
+    <span>Steadholme Signal Office</span>
+    <span aria-hidden="true">KLX · CALIBRATION / OWNER</span>
+    <span>Sovereign infrastructure · one sign-on</span>
+  </footer>
 </main>
 </body>
 </html>

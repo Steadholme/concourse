@@ -1,14 +1,17 @@
-//! The unified activity inbox: `GET /` renders the "what's new for me" triage river.
+//! The unified activity inbox: `GET /` renders the Dispatch Rotunda — one bounded view of the
+//! viewer's unread activity across the estate.
 //!
-//! A sticky app-bar, a compact source gauge, and one chronological river merge Chat,
-//! Notifications, and Feeds while preserving redundant source words and glyphs. Native action
-//! forms keep the triage path usable without JavaScript; progressive enhancement can still update
-//! it in place.
+//! An annunciator panel records what this view holds from each office (Chat / Notifications /
+//! Feeds); the sorting table lays out this view's dispatch slips ordered by the time each source
+//! put on them. Native action forms keep the triage path usable without JavaScript; progressive
+//! enhancement can still update it in place.
 //!
 //! Every source is best-effort: data comes from one cached (~10 s), concurrent federation of the
-//! three source databases ([`crate::inbox`]). Unreachable sources are named in a degraded-state
-//! notice while available activity keeps flowing; the page never errors or hangs. All federated
-//! text is HTML-escaped (untrusted cross-service content).
+//! three source databases ([`crate::inbox`]). A source that errored is named in a notice slip
+//! while available activity keeps flowing; the page never errors or hangs. The view is bounded
+//! (per-source slice, per-viewer overlay, search/filter) and says so — it never claims source
+//! reachability, coverage, or freshness. All federated text is HTML-escaped (untrusted
+//! cross-service content).
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap};
@@ -18,7 +21,7 @@ use crate::audit::AuditEvent;
 use crate::auth;
 use crate::config::SECTION_LIMIT;
 use crate::csrf;
-use crate::handlers::{app_css, esc, rel_time, topbar, truncate, InboxQuery};
+use crate::handlers::{app_css, esc, fmt_date, rel_time, topbar, truncate, InboxQuery};
 use crate::inbox::{self, Inbox, SectionState, ViewFilter};
 use crate::source::{InboxRow, SectionKind};
 use crate::AppState;
@@ -27,7 +30,8 @@ const DASHBOARD_HTML: &str = include_str!("../../templates/dashboard.html");
 
 /// `GET /` — the unified inbox. Renders for any request the gateway forwards; the viewer identity
 /// (and the per-viewer federation scope) comes from the injected `X-Auth-Subject` / `X-Auth-Email`.
-/// An unauthenticated probe (no subject) still renders an empty, calm inbox rather than erroring.
+/// A request with no gateway identity gets the signed-out branch: no federation, no counts, no
+/// forms — never a fake, signed-in-looking empty inbox.
 pub async fn dashboard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -42,12 +46,12 @@ pub async fn dashboard(
     // present it back in the X-CSRF-Token header.
     let token = csrf::cookie_token(&headers).unwrap_or_else(csrf::issue_token);
 
-    // No gateway identity -> nothing to scope a federation by; render the empty inbox shell.
+    // No gateway identity -> nothing to scope a federation by; render the signed-out shell.
     let Some(sub) = subject else {
         let empty = empty_inbox();
         let view = inbox::view(&empty, &Default::default(), &filter);
         return page(
-            render(&view, &email, &filter, &token, crate::now_secs()),
+            render(&view, &email, &filter, &token, crate::now_secs(), false),
             &token,
         );
     };
@@ -79,18 +83,26 @@ pub async fn dashboard(
     let hidden = state.store.hidden(&sub).await.unwrap_or_default();
     let view = inbox::view(&raw, &hidden, &filter);
     page(
-        render(&view, &email, &filter, &token, crate::now_secs()),
+        render(&view, &email, &filter, &token, crate::now_secs(), true),
         &token,
     )
 }
 
-/// Wrap the rendered HTML in a response that (re-)plants the CSRF cookie on every page load.
+/// Wrap the rendered HTML in a response that (re-)plants the CSRF cookie on every page load and
+/// marks the viewer-private page uncacheable beyond this response.
 fn page(html: String, token: &str) -> Response {
-    ([(header::SET_COOKIE, csrf::set_cookie(token))], Html(html)).into_response()
+    (
+        [
+            (header::SET_COOKIE, csrf::set_cookie(token)),
+            (header::CACHE_CONTROL, "private, no-store".to_string()),
+        ],
+        Html(html),
+    )
+        .into_response()
 }
 
-/// The empty inbox shown to an unauthenticated probe (all columns empty + available). Shared with
-/// the JSON poll endpoint so both surfaces render the same calm shell.
+/// The empty inbox behind the signed-out branch (all sections empty + available). Shared with the
+/// JSON poll endpoint so both surfaces render the same shell.
 pub(crate) fn empty_inbox() -> Inbox {
     use crate::source::Section;
     Inbox {
@@ -100,12 +112,24 @@ pub(crate) fn empty_inbox() -> Inbox {
     }
 }
 
-fn render(inbox: &Inbox, email: &str, filter: &ViewFilter, token: &str, now: i64) -> String {
+fn render(
+    inbox: &Inbox,
+    email: &str,
+    filter: &ViewFilter,
+    token: &str,
+    now: i64,
+    signed_in: bool,
+) -> String {
     let csrf = esc(token);
     let bar = topbar("Inbox", email);
-    let search = render_search(filter);
-    let summary = render_summary(inbox);
-    let columns = render_columns(inbox, now, token, filter);
+    // The signed-out branch renders no search/filter form at all (nothing personal to filter).
+    let search = if signed_in {
+        render_search(filter)
+    } else {
+        String::new()
+    };
+    let summary = render_summary(inbox, filter, signed_in);
+    let columns = render_columns(inbox, now, token, filter, signed_in);
     fill_template(
         DASHBOARD_HTML,
         &[
@@ -180,9 +204,10 @@ pub(crate) fn render_search(filter: &ViewFilter) -> String {
     )
 }
 
-/// One chronological river fragment shared by the full page and JSON poll. Slot ids belong to the
-/// K3-owned page shell and are deliberately absent here.
-fn compare_river_rows(left: &InboxRow, right: &InboxRow) -> std::cmp::Ordering {
+/// The dispatches-table fragment shared by the full page and JSON poll. Slot ids belong to the
+/// page shell and are deliberately absent here. Ordering is over RETURNED rows only, by each
+/// row's own source-provided timestamp — never a claim about the source as a whole.
+fn compare_dispatch_rows(left: &InboxRow, right: &InboxRow) -> std::cmp::Ordering {
     match (left.at, right.at) {
         (Some(left), Some(right)) => right.cmp(&left),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -191,7 +216,18 @@ fn compare_river_rows(left: &InboxRow, right: &InboxRow) -> std::cmp::Ordering {
     }
 }
 
-pub(crate) fn render_columns(inbox: &Inbox, now: i64, token: &str, filter: &ViewFilter) -> String {
+pub(crate) fn render_columns(
+    inbox: &Inbox,
+    now: i64,
+    token: &str,
+    filter: &ViewFilter,
+    signed_in: bool,
+) -> String {
+    if !signed_in {
+        // Signed-out: a neutral statement, no forms, no counts, no fake empty inbox.
+        return r#"<section class="dispatches" aria-label="Activity in this view"><div class="dispatches__empty">There is nothing personal to show on this page.</div></section>"#.to_string();
+    }
+
     let states = [
         (SectionKind::Chat, &inbox.chat),
         (SectionKind::Notifications, &inbox.notifications),
@@ -205,7 +241,7 @@ pub(crate) fn render_columns(inbox: &Inbox, now: i64, token: &str, filter: &View
     }
     // `sort_by` is stable: equal timestamps retain the fixed source order above and each source's
     // original order. Explicit Option ordering keeps `None` last even beside `Some(i64::MIN)`.
-    rows.sort_by(|(_, left), (_, right)| compare_river_rows(left, right));
+    rows.sort_by(|(_, left), (_, right)| compare_dispatch_rows(left, right));
 
     let mut body = String::new();
     let unavailable = inbox.unavailable_kinds();
@@ -214,58 +250,118 @@ pub(crate) fn render_columns(inbox: &Inbox, now: i64, token: &str, filter: &View
             .iter()
             .map(|kind| {
                 format!(
-                    r#"<span class="river__degraded-item" data-source="{slug}">{word} unavailable</span>"#,
+                    r#"<span class="dispatches__notice-item" data-source="{slug}">{word} — unavailable in this view</span>"#,
                     slug = kind.slug(),
                     word = source_word(*kind),
                 )
             })
             .collect::<String>();
         body.push_str(&format!(
-            r#"<div class="river__degraded"><strong>Some activity is unavailable right now.</strong>{details}</div>"#
+            r#"<div class="dispatches__notice"><strong>This view does not include:</strong>{details}</div>"#
         ));
     }
 
     if rows.is_empty() {
-        let message = if filter.is_empty() {
-            "You're all caught up."
+        if filter.is_empty() {
+            body.push_str(
+                r#"<div class="dispatches__empty">No entries appear in this bounded Atrium view.</div>"#,
+            );
         } else {
-            "No matching activity."
-        };
-        body.push_str(&format!(r#"<div class="river__empty">{message}</div>"#));
+            body.push_str(
+                r#"<div class="dispatches__empty">Nothing in this view matches the search or filter above. <a href="/">Clear</a></div>"#,
+            );
+        }
     } else {
         for (kind, row) in rows {
-            body.push_str(&river_row(kind, row, now, token, filter));
+            body.push_str(&dispatch_slip(kind, row, now, token, filter));
         }
     }
 
-    format!(r#"<section class="river" aria-label="Activity, newest first">{body}</section>"#)
+    format!(r#"<section class="dispatches" aria-label="Activity in this view">{body}</section>"#)
 }
 
-/// Compact reach gauge: total unread plus a word/glyph/count channel for every source. It is a
-/// programmatic refresh focus target, not an ordinary Tab stop.
-pub(crate) fn render_summary(inbox: &Inbox) -> String {
+/// The annunciator panel: this view's total plus a word/glyph/count channel for every office. It
+/// is a programmatic refresh focus target, not an ordinary Tab stop. Counts are VIEW totals
+/// (source bound + overlay + search + filter), never source-wide totals.
+pub(crate) fn render_summary(inbox: &Inbox, filter: &ViewFilter, signed_in: bool) -> String {
+    if !signed_in {
+        return r#"<section class="annun is-signedout" tabindex="-1" aria-label="Inbox summary"><p class="annun__lead">No viewer on this request</p><p class="annun__qual">Atrium shows your own activity once the gateway signs you in.</p></section>"#.to_string();
+    }
+
+    let states = [
+        (SectionKind::Chat, &inbox.chat),
+        (SectionKind::Notifications, &inbox.notifications),
+        (SectionKind::Feed, &inbox.feed),
+    ];
+    let unavailable = inbox.unavailable_kinds();
+    let all_down = unavailable.len() == states.len();
     let grand = inbox.total_unread();
-    let lead = if grand == 0 {
-        "You're all caught up".to_string()
+    let filtered = !filter.is_empty();
+
+    let lead = if all_down {
+        "No source is available in this view".to_string()
+    } else if filtered {
+        if grand == 0 {
+            "No matches in this view".to_string()
+        } else {
+            format!("{grand} matching in this view")
+        }
+    } else if grand == 0 {
+        "Nothing to show in this view".to_string()
     } else {
-        format!("{grand} unread")
+        format!("{grand} unread in this view")
     };
+
+    let qualifier = if all_down {
+        r#"<p class="annun__qual">This view does not include Chat, Notifications, or Feeds.</p>"#
+            .to_string()
+    } else if unavailable.is_empty() {
+        String::new()
+    } else {
+        let words = unavailable
+            .iter()
+            .map(|kind| source_word(*kind))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"<p class="annun__qual">Not in this view: {} — unavailable.</p>"#,
+            esc(&words)
+        )
+    };
+
+    let mut bays = String::new();
+    for (kind, state) in states {
+        bays.push_str(&annun_bay(kind, state, filter));
+    }
+
     format!(
-        r#"<p class="gauge" tabindex="-1" aria-label="Inbox reach"><span class="gauge__total">{lead}</span><span class="gauge__reach">{chat}{notifications}{feed}</span></p>"#,
+        r#"<section class="annun" tabindex="-1" aria-label="Inbox summary"><p class="annun__lead">{lead}</p>{qualifier}<div class="annun__bays">{bays}</div></section>"#,
         lead = esc(&lead),
-        chat = gauge_reach(SectionKind::Chat, &inbox.chat),
-        notifications = gauge_reach(SectionKind::Notifications, &inbox.notifications),
-        feed = gauge_reach(SectionKind::Feed, &inbox.feed),
+        qualifier = qualifier,
+        bays = bays,
     )
 }
 
-fn gauge_reach(kind: SectionKind, state: &SectionState) -> String {
-    let value = match state {
-        SectionState::Unavailable => "—".to_string(),
-        SectionState::Ready(section) => section.total.to_string(),
+/// One annunciator bay: office word + glyph + this view's count, or a plain-text state. An
+/// unavailable office is named before any filter blanking (the engine passes `Unavailable`
+/// through untouched); a filtered-out office says "outside this filter", never "unavailable".
+fn annun_bay(kind: SectionKind, state: &SectionState, filter: &ViewFilter) -> String {
+    let (class, value) = match state {
+        SectionState::Unavailable => (
+            "annun__bay is-unavailable",
+            "— unavailable in this view".to_string(),
+        ),
+        SectionState::Ready(section) => {
+            if filter.source.map(|only| only != kind).unwrap_or(false) {
+                ("annun__bay is-outside", "— outside this filter".to_string())
+            } else {
+                ("annun__bay", section.total.to_string())
+            }
+        }
     };
     format!(
-        r#"<span class="gauge__reach-item" data-source="{slug}"><span class="gauge__glyph" aria-hidden="true">{glyph}</span><span class="gauge__word">{word}</span><span class="gauge__count">{value}</span></span>"#,
+        r#"<span class="{class}" data-source="{slug}"><span class="annun__glyph" aria-hidden="true">{glyph}</span><span class="annun__word">{word}</span><span class="annun__count">{value}</span></span>"#,
+        class = class,
         slug = kind.slug(),
         glyph = source_glyph(kind),
         word = source_word(kind),
@@ -273,7 +369,7 @@ fn gauge_reach(kind: SectionKind, state: &SectionState) -> String {
     )
 }
 
-fn river_row(
+fn dispatch_slip(
     kind: SectionKind,
     row: &InboxRow,
     now: i64,
@@ -288,7 +384,7 @@ fn river_row(
     let badge = if kind == SectionKind::Chat {
         match row.count {
             Some(count) if count > 0 => {
-                format!(r#"<span class="row__badge">{count}</span>"#)
+                format!(r#"<span class="slip__badge">{count}</span>"#)
             }
             _ => String::new(),
         }
@@ -299,20 +395,31 @@ fn river_row(
     let snippet = if snippet.is_empty() {
         String::new()
     } else {
-        format!(r#"<div class="row__snippet">{}</div>"#, esc(&snippet))
+        format!(r#"<div class="slip__snippet">{}</div>"#, esc(&snippet))
     };
     let origin = if kind == SectionKind::Feed {
         row.source.trim()
     } else {
         ""
     };
-    let when = row.at.map(|at| rel_time(at, now)).unwrap_or_default();
+    // A row's time describes that row's own source stamp only. A future/skewed stamp is shown as
+    // the absolute UTC date it carries — "just now" would falsely imply the source is recent.
+    let when = row
+        .at
+        .map(|at| {
+            if at > now {
+                fmt_date(at)
+            } else {
+                rel_time(at, now)
+            }
+        })
+        .unwrap_or_default();
     let meta = match (origin.is_empty(), when.is_empty()) {
         (true, true) => String::new(),
-        (false, true) => format!(r#"<div class="row__meta">{}</div>"#, esc(origin)),
-        (true, false) => format!(r#"<div class="row__meta">{}</div>"#, esc(&when)),
+        (false, true) => format!(r#"<div class="slip__meta">{}</div>"#, esc(origin)),
+        (true, false) => format!(r#"<div class="slip__meta">{}</div>"#, esc(&when)),
         (false, false) => format!(
-            r#"<div class="row__meta">{} · {}</div>"#,
+            r#"<div class="slip__meta">{} · {}</div>"#,
             esc(origin),
             esc(&when)
         ),
@@ -320,9 +427,10 @@ fn river_row(
     let link = safe_row_link(&row.link);
 
     format!(
-        r#"<div class="row" data-source="{slug}" data-key="{key}">
-  <span class="river__source" data-source="{slug}"><span class="river__glyph" aria-hidden="true">{glyph}</span><span class="river__source-word">{word}</span></span>
-  <a class="row__link" href="{link}"><div class="row__top"><span class="row__title">{title}</span>{badge}</div>{snippet}{meta}</a>
+        r#"<div class="slip" data-source="{slug}" data-key="{key}">
+  <span class="slip__stamp" data-source="{slug}"><span class="slip__glyph" aria-hidden="true">{glyph}</span><span class="slip__word">{word}</span></span>
+  <a class="slip__link" href="{link}"><div class="slip__top"><span class="slip__title">{title}</span>{badge}</div>{snippet}</a>
+  {meta}
   {actions}
 </div>"#,
         slug = kind.slug(),
@@ -334,7 +442,7 @@ fn river_row(
         badge = badge,
         snippet = snippet,
         meta = meta,
-        actions = river_actions(kind, &row.key, token, filter),
+        actions = dispatch_actions(kind, &row.key, token, filter),
     )
 }
 
@@ -359,17 +467,17 @@ fn safe_row_link(raw: &str) -> String {
     }
 }
 
-fn river_actions(kind: SectionKind, key: &str, token: &str, filter: &ViewFilter) -> String {
+fn dispatch_actions(kind: SectionKind, key: &str, token: &str, filter: &ViewFilter) -> String {
     if key.trim().is_empty() {
         return String::new();
     }
     format!(
-        r#"<div class="row__actions">{}{}</div>"#,
-        action_form("read", "Mark read", "row__act", kind, key, token, filter),
+        r#"<div class="slip__actions">{}{}</div>"#,
+        action_form("read", "Mark seen", "slip__act", kind, key, token, filter),
         action_form(
             "dismiss",
             "Dismiss",
-            "row__act row__act--dismiss",
+            "slip__act slip__act--dismiss",
             kind,
             key,
             token,
@@ -392,8 +500,10 @@ fn action_form(
         .source
         .map(|source| source.slug())
         .unwrap_or_default();
+    // Both buttons point at the persistent disclosure block so "hides from this Atrium view only"
+    // is programmatically linked from the control itself.
     format!(
-        r#"<form class="river__actform" method="post" action="/api/inbox/{action}"><input type="hidden" name="source" value="{source}"><input type="hidden" name="key" value="{key}"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="return_q" value="{return_q}"><input type="hidden" name="return_source" value="{return_source}"><button type="submit" class="{button_class}" data-action="{action}">{label}</button></form>"#,
+        r#"<form class="slip__form" method="post" action="/api/inbox/{action}"><input type="hidden" name="source" value="{source}"><input type="hidden" name="key" value="{key}"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="return_q" value="{return_q}"><input type="hidden" name="return_source" value="{return_source}"><button type="submit" class="{button_class}" data-action="{action}" aria-describedby="viewtruth">{label}</button></form>"#,
         source = kind.slug(),
         key = esc(key),
         csrf = esc(token),
@@ -472,8 +582,15 @@ mod tests {
         crate::build_state_with_engine(engine)
     }
 
+    async fn body_string(res: Response) -> String {
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
     #[tokio::test]
-    async fn dashboard_renders_columns_summary_and_resilience() {
+    async fn dashboard_renders_dispatches_annunciator_and_resilience() {
         let app = crate::app(state_with_sources());
         let res = app
             .oneshot(
@@ -487,22 +604,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("#general"), "chat row rendered");
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "private, no-store",
+            "viewer-private page carries the frozen cache suppression"
+        );
+        let html = body_string(res).await;
+        assert!(html.contains("#general"), "chat slip rendered");
         assert!(
-            html.contains("Notifications unavailable"),
-            "down source is named in the river"
+            html.contains("Notifications — unavailable in this view"),
+            "down office is named in the notice slip"
         );
         assert!(
-            html.contains(r#"class="river""#),
-            "single activity river rendered"
+            html.contains(r#"class="dispatches""#),
+            "single dispatches table rendered"
+        );
+        assert!(
+            html.contains(r#"aria-label="Activity in this view""#),
+            "table is labelled as a bounded view"
+        );
+        assert!(
+            html.contains(r#"aria-label="Inbox summary""#),
+            "annunciator is labelled as a summary"
         );
         assert!(
             html.contains(r#"data-source="feed""#),
-            "feed reach remains visible at zero"
+            "feed bay remains visible at zero"
         );
         assert!(html.contains("ops@w33d.xyz"), "signed-in email in app bar");
         // Live auto-refresh wiring: the poll targets + fetch of the JSON endpoint are present.
@@ -517,6 +647,14 @@ mod tests {
         assert!(
             html.contains("/api/inbox"),
             "poll fetches the JSON endpoint"
+        );
+        assert!(
+            html.contains("What this view is"),
+            "persistent disclosure block present"
+        );
+        assert!(
+            html.contains(r#"id="refresh-status""#),
+            "browser-side status line present"
         );
     }
 
@@ -547,13 +685,7 @@ mod tests {
             set_cookie.contains("SameSite=Strict"),
             "csrf cookie is strict"
         );
-        let html = String::from_utf8(
-            axum::body::to_bytes(res.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
+        let html = body_string(res).await;
         assert!(
             html.contains(r#"class="searchbar""#),
             "unified search bar rendered"
@@ -561,11 +693,16 @@ mod tests {
         assert!(html.contains(r#"name="source""#), "source filter present");
         assert!(
             html.contains(r#"data-action="dismiss""#),
-            "row dismiss control present"
+            "slip dismiss control present"
         );
         assert!(
             html.contains(r#"data-action="read""#),
-            "row mark-read control present"
+            "slip mark-seen control present"
+        );
+        assert!(html.contains("Mark seen"), "frozen verb on the read action");
+        assert!(
+            html.contains(r#"aria-describedby="viewtruth""#),
+            "actions point at the persistent disclosure"
         );
         assert!(
             html.contains(r#"meta name="csrf-token""#),
@@ -596,19 +733,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let html = String::from_utf8(
-            axum::body::to_bytes(res.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(html.contains("#random"), "matching row kept");
-        assert!(!html.contains("#general"), "non-matching row filtered out");
+        let html = body_string(res).await;
+        assert!(html.contains("#random"), "matching slip kept");
+        assert!(!html.contains("#general"), "non-matching slip filtered out");
         // The query is echoed back into the search input, escaped.
         assert!(
             html.contains(r#"value="random""#),
             "query reflected in the search box"
+        );
+        assert!(
+            html.contains("matching in this view"),
+            "filtered lead names the bounded view"
         );
     }
 
@@ -630,36 +765,59 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
-            let html = String::from_utf8(
-                axum::body::to_bytes(res.into_body(), usize::MAX)
-                    .await
-                    .unwrap()
-                    .to_vec(),
-            )
-            .unwrap();
+            let html = body_string(res).await;
             assert!(
                 html.contains(&format!(r#"value="{{{{{token}}}}}""#)),
                 "query token must remain inert text"
             );
-            assert_eq!(html.matches(r#"class="river""#).count(), 1);
-            assert_eq!(html.matches(r#"class="gauge""#).count(), 1);
+            assert_eq!(html.matches(r#"class="dispatches""#).count(), 1);
+            assert_eq!(html.matches(r#"class="annun""#).count(), 1);
             assert_eq!(html.matches(r#"id="summary-slot""#).count(), 1);
             assert_eq!(html.matches(r#"id="columns-slot""#).count(), 1);
         }
     }
 
     #[tokio::test]
-    async fn dashboard_without_identity_still_renders_200() {
+    async fn dashboard_without_identity_renders_signed_out_branch() {
         let app = crate::app(crate::build_dev_state());
         let res = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "private, no-store",
+            "signed-out page also carries the frozen cache suppression"
+        );
+        let html = body_string(res).await;
+        assert!(
+            html.contains("No viewer on this request"),
+            "signed-out annunciator lead"
+        );
+        assert!(
+            html.contains("There is nothing personal to show on this page."),
+            "signed-out table copy"
+        );
+        let main = html.split("<main").nth(1).unwrap_or_default();
+        assert!(!main.contains("<form"), "signed-out view renders no forms");
+        assert!(
+            !main.contains(r#"class="searchbar""#),
+            "signed-out view renders no search bar"
+        );
+        // Scope to the body (not the whole page): the inlined stylesheet in <head> legitimately
+        // defines `.annun__count` for the signed-in view; what must be absent is a rendered count.
+        assert!(
+            !main.contains("annun__count"),
+            "signed-out view renders no counts"
+        );
     }
 
     #[test]
-    fn river_merges_sources_stably_newest_first_and_none_last() {
+    fn dispatches_merge_sources_stably_by_row_time_and_none_last() {
         let row = |key: &str, at: Option<i64>| InboxRow {
             key: key.to_string(),
             title: key.to_string(),
@@ -685,8 +843,8 @@ mod tests {
                 rows: vec![row("feed-mid", Some(100))],
             }),
         };
-        let html = render_columns(&inbox, 300, "tok", &ViewFilter::default());
-        let pos = |needle: &str| html.find(needle).expect("row rendered");
+        let html = render_columns(&inbox, 300, "tok", &ViewFilter::default(), true);
+        let pos = |needle: &str| html.find(needle).expect("slip rendered");
         assert!(pos("notify-new") < pos("feed-mid"));
         assert!(pos("feed-mid") < pos("chat-tie"));
         assert!(
@@ -701,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn river_timestamp_comparator_keeps_exact_min_before_none() {
+    fn dispatch_timestamp_comparator_keeps_exact_min_before_none() {
         let row = |key: &str, at: Option<i64>| InboxRow {
             key: key.to_string(),
             title: key.to_string(),
@@ -712,31 +870,126 @@ mod tests {
         let minimum = row("minimum", Some(i64::MIN));
         let absent = row("absent", None);
         assert_eq!(
-            compare_river_rows(&minimum, &absent),
+            compare_dispatch_rows(&minimum, &absent),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_river_rows(&absent, &minimum),
+            compare_dispatch_rows(&absent, &minimum),
             std::cmp::Ordering::Greater
         );
     }
 
     #[test]
-    fn fragments_have_no_slot_ids_and_one_programmatic_gauge_target() {
+    fn future_source_time_renders_absolute_date_never_just_now() {
+        let now = 1_700_000_000;
+        let future = now + 3600;
+        let inbox = Inbox {
+            chat: SectionState::Ready(Section {
+                total: 1,
+                rows: vec![InboxRow {
+                    key: "future".into(),
+                    title: "Skewed clock row".into(),
+                    link: "/".into(),
+                    at: Some(future),
+                    ..Default::default()
+                }],
+            }),
+            notifications: SectionState::Ready(Section {
+                total: 1,
+                rows: vec![InboxRow {
+                    key: "present".into(),
+                    title: "Present clock row".into(),
+                    link: "/".into(),
+                    at: Some(now),
+                    ..Default::default()
+                }],
+            }),
+            feed: SectionState::Ready(Section::empty()),
+        };
+        let html = render_columns(&inbox, now, "tok", &ViewFilter::default(), true);
+        let future_pos = html.find("Skewed clock row").expect("future slip");
+        let present_pos = html.find("Present clock row").expect("present slip");
+        assert!(future_pos < present_pos, "future stamp still sorts first");
+        let slip_end = html[future_pos..].find("</div>").unwrap_or(0) + future_pos;
+        let slip_region =
+            &html[future_pos..slip_end.max(future_pos) + 400.min(html.len() - future_pos)];
+        assert!(
+            !slip_region.contains("just now"),
+            "a future stamp never reads as recent: {slip_region}"
+        );
+        assert!(
+            html.contains(&fmt_date(future)),
+            "future stamp shows its absolute UTC date"
+        );
+    }
+
+    #[test]
+    fn fragments_have_no_slot_ids_and_one_programmatic_annun_target() {
         let inbox = empty_inbox();
-        let summary = render_summary(&inbox);
-        let river = render_columns(&inbox, 0, "tok", &ViewFilter::default());
-        let combined = format!("{summary}{river}");
+        let summary = render_summary(&inbox, &ViewFilter::default(), true);
+        let dispatches = render_columns(&inbox, 0, "tok", &ViewFilter::default(), true);
+        let combined = format!("{summary}{dispatches}");
         assert!(!combined.contains("summary-slot"));
         assert!(!combined.contains("columns-slot"));
-        assert!(!combined.contains("river-live"));
-        assert_eq!(summary.matches(r#"class="gauge""#).count(), 1);
+        assert!(
+            !combined.contains("aria-live"),
+            "a swapped fragment announces nothing on its own"
+        );
+        assert_eq!(summary.matches(r#"class="annun""#).count(), 1);
         assert_eq!(summary.matches(r#"tabindex="-1""#).count(), 1);
         assert!(!summary.contains(r#"tabindex="0""#));
     }
 
     #[test]
-    fn keyless_row_is_read_only() {
+    fn signed_out_fragments_are_neutral_and_formless() {
+        let inbox = empty_inbox();
+        let summary = render_summary(&inbox, &ViewFilter::default(), false);
+        let dispatches = render_columns(&inbox, 0, "tok", &ViewFilter::default(), false);
+        assert!(summary.contains("No viewer on this request"));
+        assert!(summary.contains("is-signedout"));
+        assert!(!summary.contains("annun__bay"));
+        assert!(dispatches.contains("There is nothing personal to show on this page."));
+        assert!(!dispatches.contains("<form"));
+    }
+
+    #[test]
+    fn annunciator_states_follow_the_frozen_copy_table() {
+        // Neutral zero: no rows, nothing unavailable, no filter.
+        let zero = render_summary(&empty_inbox(), &ViewFilter::default(), true);
+        assert!(zero.contains("Nothing to show in this view"));
+        assert!(zero.contains(r#"data-source="chat""#));
+        // Filtered zero.
+        let filtered = ViewFilter::new(Some("missing".into()), None);
+        let fzero = render_summary(&empty_inbox(), &filtered, true);
+        assert!(fzero.contains("No matches in this view"));
+        // All unavailable: never a "nothing unread"-style lead.
+        let down = Inbox {
+            chat: SectionState::Unavailable,
+            notifications: SectionState::Unavailable,
+            feed: SectionState::Unavailable,
+        };
+        let all = render_summary(&down, &ViewFilter::default(), true);
+        assert!(all.contains("No source is available in this view"));
+        assert!(all.contains("This view does not include Chat, Notifications, or Feeds."));
+        assert!(!all.contains("Nothing"));
+        assert_eq!(all.matches("unavailable in this view").count(), 3);
+        // Source filter: excluded offices say "outside this filter", never "unavailable".
+        let inbox = Inbox {
+            chat: SectionState::Ready(section(2, &["#general"])),
+            notifications: SectionState::Unavailable,
+            feed: SectionState::Ready(Section::empty()),
+        };
+        let only_chat = ViewFilter::new(None, Some("chat".into()));
+        let scoped = render_summary(&inbox, &only_chat, true);
+        assert!(scoped.contains("— outside this filter"));
+        assert!(!scoped.contains("Notifications — unavailable in this view"));
+        // The unavailable office is still named as unavailable under a source filter (E7).
+        assert!(scoped.contains(r#"data-source="notifications""#));
+        assert!(scoped.contains("— unavailable in this view"));
+    }
+
+    #[test]
+    fn keyless_slip_is_read_only() {
         let inbox = Inbox {
             chat: SectionState::Ready(Section {
                 total: 1,
@@ -749,21 +1002,21 @@ mod tests {
             notifications: SectionState::Ready(Section::empty()),
             feed: SectionState::Ready(Section::empty()),
         };
-        let html = render_columns(&inbox, 0, "tok", &ViewFilter::default());
+        let html = render_columns(&inbox, 0, "tok", &ViewFilter::default(), true);
         assert!(html.contains("Visible but unaddressable"));
         assert!(!html.contains("<form"));
     }
 
     #[test]
-    fn keyed_row_emits_both_native_forms_and_return_context() {
+    fn keyed_slip_emits_both_native_forms_and_return_context() {
         let inbox = Inbox {
             chat: SectionState::Ready(section(2, &["room-1"])),
             notifications: SectionState::Ready(Section::empty()),
             feed: SectionState::Ready(Section::empty()),
         };
         let filter = ViewFilter::new(Some("urgent".into()), Some("chat".into()));
-        let html = render_columns(&inbox, crate::now_secs(), "csrf-token", &filter);
-        assert_eq!(html.matches(r#"class="river__actform""#).count(), 2);
+        let html = render_columns(&inbox, crate::now_secs(), "csrf-token", &filter, true);
+        assert_eq!(html.matches(r#"class="slip__form""#).count(), 2);
         assert!(html.contains(r#"method="post" action="/api/inbox/read""#));
         assert!(html.contains(r#"method="post" action="/api/inbox/dismiss""#));
         for name in ["source", "key", "csrf", "return_q", "return_source"] {
@@ -775,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn hostile_row_and_hidden_values_are_escaped() {
+    fn hostile_slip_and_hidden_values_are_escaped() {
         let inbox = Inbox {
             chat: SectionState::Ready(Section {
                 total: 1,
@@ -793,7 +1046,7 @@ mod tests {
             feed: SectionState::Ready(Section::empty()),
         };
         let filter = ViewFilter::new(Some("<query>\"".into()), None);
-        let html = render_columns(&inbox, 0, "tok\"<", &filter);
+        let html = render_columns(&inbox, 0, "tok\"<", &filter, true);
         assert!(!html.contains("<script>"));
         assert!(!html.contains("<img src=x>"));
         assert!(html.contains("&lt;script&gt;"));
@@ -803,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn row_links_allow_safe_classes_and_escape_the_attribute() {
+    fn slip_links_allow_safe_classes_and_escape_the_attribute() {
         assert_eq!(
             safe_row_link("https://example.test/a?x=1&y=\"<"),
             "https://example.test/a?x=1&amp;y=&quot;&lt;"
@@ -820,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_row_links_fail_closed_for_executable_or_ambiguous_urls() {
+    fn rendered_slip_links_fail_closed_for_executable_or_ambiguous_urls() {
         for unsafe_link in [
             "javascript:alert(1)",
             "JaVaScRiPt:alert(1)",
@@ -843,9 +1096,9 @@ mod tests {
                 feed: SectionState::Ready(Section::empty()),
             };
 
-            let html = render_columns(&inbox, 0, "tok", &ViewFilter::default());
+            let html = render_columns(&inbox, 0, "tok", &ViewFilter::default(), true);
             assert!(
-                html.contains(r#"<a class="row__link" href="/">"#),
+                html.contains(r#"<a class="slip__link" href="/">"#),
                 "unsafe link must fail closed: {unsafe_link:?}"
             );
             assert!(!html.contains(unsafe_link));
@@ -853,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_row_links_reject_backslash_normalization_bypasses() {
+    fn rendered_slip_links_reject_backslash_normalization_bypasses() {
         for unsafe_link in [
             "/\\evil.example",
             "/\\/evil.example",
@@ -874,9 +1127,9 @@ mod tests {
                 feed: SectionState::Ready(Section::empty()),
             };
 
-            let html = render_columns(&inbox, 0, "tok", &ViewFilter::default());
+            let html = render_columns(&inbox, 0, "tok", &ViewFilter::default(), true);
             assert!(
-                html.contains(r#"<a class="row__link" href="/">"#),
+                html.contains(r#"<a class="slip__link" href="/">"#),
                 "backslash-normalized URL must fail closed: {unsafe_link:?}"
             );
             assert!(!html.contains(unsafe_link));
@@ -891,19 +1144,69 @@ mod tests {
             notifications: SectionState::Unavailable,
             feed: SectionState::Ready(Section::empty()),
         };
-        let html = render_columns(&inbox, crate::now_secs(), "tok", &ViewFilter::default());
-        assert!(html.contains(r#"class="river__degraded""#));
-        assert!(html.contains(r#"data-source="notifications">Notifications unavailable"#));
-        assert!(html.contains(r#"class="river__glyph" aria-hidden="true""#));
-        assert!(html.contains(r#"class="river__source-word">Chat"#));
+        let html = render_columns(
+            &inbox,
+            crate::now_secs(),
+            "tok",
+            &ViewFilter::default(),
+            true,
+        );
+        assert!(html.contains(r#"class="dispatches__notice""#));
+        assert!(html.contains("This view does not include:"));
+        assert!(html
+            .contains(r#"data-source="notifications">Notifications — unavailable in this view"#));
+        assert!(html.contains(r#"class="slip__glyph" aria-hidden="true""#));
+        assert!(html.contains(r#"class="slip__word">Chat"#));
     }
 
     #[test]
-    fn filtered_empty_state_is_distinct_from_caught_up() {
+    fn filtered_empty_state_is_distinct_from_neutral_zero() {
         let inbox = empty_inbox();
         let filtered = ViewFilter::new(Some("missing".into()), None);
-        assert!(render_columns(&inbox, 0, "tok", &filtered).contains("No matching activity."));
-        assert!(render_columns(&inbox, 0, "tok", &ViewFilter::default())
-            .contains("You're all caught up."));
+        let filtered_html = render_columns(&inbox, 0, "tok", &filtered, true);
+        assert!(filtered_html.contains("Nothing in this view matches the search or filter above."));
+        assert!(filtered_html.contains(r#"<a href="/">Clear</a>"#));
+        assert!(
+            render_columns(&inbox, 0, "tok", &ViewFilter::default(), true)
+                .contains("No entries appear in this bounded Atrium view.")
+        );
+    }
+
+    #[test]
+    fn enhancement_locks_exact_url_integer_payload_and_menu_state_contracts() {
+        assert!(DASHBOARD_HTML.contains("var request = {"));
+        assert!(DASHBOARD_HTML.contains("gen: ++readGen"));
+        assert!(DASHBOARD_HTML.contains("sentUrl: window.location.href"));
+        assert!(DASHBOARD_HTML.contains("controlsSnapshot: currentControls()"));
+        assert!(DASHBOARD_HTML.contains("window.location.href === request.sentUrl"));
+        assert!(
+            DASHBOARD_HTML.contains("controlsEqual(currentControls(), request.controlsSnapshot)")
+        );
+        assert!(DASHBOARD_HTML.contains("Number.isFinite(d.total_unread)"));
+        assert!(DASHBOARD_HTML.contains("Number.isInteger(d.total_unread)"));
+        assert!(DASHBOARD_HTML.contains("userMenuButton.setAttribute("));
+        assert!(DASHBOARD_HTML.contains("'aria-expanded'"));
+    }
+
+    #[test]
+    fn service_layer_freezes_a_forty_four_pixel_target_floor() {
+        let css = crate::handlers::SERVICE_CSS;
+        assert!(css.contains("--atrium-target: 44px"));
+        for selector in [
+            ".appbar__brand",
+            ".appnav",
+            ".iconbtn",
+            ".usermenu__btn",
+            ".menuitem",
+            ".searchbar__clear",
+            ".slip__link",
+            ".slip__act",
+            ".quicklinks__link",
+        ] {
+            assert!(
+                css.contains(selector),
+                "missing target-floor selector {selector}"
+            );
+        }
     }
 }

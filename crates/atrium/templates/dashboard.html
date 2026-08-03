@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -12,9 +12,17 @@
 {{TOPBAR}}
 <main class="shell">
   <div class="shell__head">
+    <span class="rotunda-mark" aria-hidden="true">
+      <svg viewBox="0 0 48 28" width="46" height="27" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 25 A20 20 0 0 1 44 25" stroke-width="1.5"/>
+        <path d="M24 25 L24 7" stroke-width="1.5"/>
+        <path d="M9 22 L11.5 20 M39 22 L36.5 20 M24 25 L24 5.5" stroke-width="1.1"/>
+        <circle cx="24" cy="25" r="1.7" fill="currentColor" stroke="none"/>
+      </svg>
+    </span>
     <div>
       <h1 class="shell__title">Activity inbox</h1>
-      <p class="shell__sub">Everything new across the keep — chat, notifications, and your feeds in one pane.</p>
+      <p class="shell__sub">A bounded view of your unread chat, notifications, and feed items in one pane.</p>
     </div>
   </div>
 
@@ -22,9 +30,21 @@
 
   <div id="summary-slot">{{SUMMARY}}</div>
 
-  <div class="columns" id="columns-slot">
+  <p id="refresh-status" class="refresh-status" role="status" hidden></p>
+
+  <div id="columns-slot" tabindex="-1">
     {{COLUMNS}}
   </div>
+
+  <section class="viewtruth" id="viewtruth" aria-labelledby="viewtruth-title">
+    <h2 class="viewtruth__title" id="viewtruth-title">What this view is</h2>
+    <ul class="viewtruth__list">
+      <li>Each source contributes a bounded slice — at most 50 entries — so this view can be shorter than what a source holds.</li>
+      <li>Counts cover only this view, after your search, filter, and anything you have hidden — never a whole source.</li>
+      <li>Entries are ordered by the time each source put on them, latest first within this view; an entry's time describes that entry only.</li>
+      <li>Mark seen and Dismiss hide entries from this Atrium view only. The source services are never changed, and hidden entries can reappear.</li>
+    </ul>
+  </section>
 
   <nav class="quicklinks" aria-label="Quick links">
     <span class="quicklinks__label">Jump to</span>
@@ -38,24 +58,49 @@
 </main>
 <div class="toast-host" id="toast-host" aria-live="polite" aria-atomic="true"></div>
 <script>
-// Live auto-refresh: poll the aggregated inbox JSON (~20 s) and swap the freshly server-rendered
-// summary + columns fragments into their slots WITHOUT a full page reload. Because only the inner
-// HTML of the two slots is replaced, the window scroll position is preserved. Every fragment is
-// server-escaped (identical to the initial render), so assigning innerHTML carries no new XSS risk.
-// A transient network error is swallowed — the last good render simply stays on screen.
+// Dispatch Rotunda view. One monotonically increasing read generation governs the 20 s poll,
+// the debounced search, and the post-action reconcile, so an out-of-order or stale response can
+// never overwrite a newer view (the server inbox cache is deliberately NOT single-flight). Every
+// /api/inbox payload is fully validated before EITHER slot is replaced; on any failure the on-screen
+// view is kept intact atomically and a status line says it may be stale — it never asserts anything
+// about the sources themselves. All fragments are server-escaped, so assigning innerHTML adds no new
+// XSS surface. cache:'no-store' is only a browser HTTP-cache hint; it does not bypass the server
+// cache. No console output, storage, inline handlers, eval, or added scripts/routes.
 (function () {
   var INTERVAL_MS = 20000;
-  function csrf() {
-    var m = document.querySelector('meta[name="csrf-token"]');
-    return m ? m.getAttribute('content') : '';
-  }
-  function apply(id, html) {
-    if (typeof html !== 'string') return;
-    var el = document.getElementById(id);
-    if (el) el.innerHTML = html;
-  }
-  // Transient write feedback via the Odyssey v2 .toast kit (text set as textContent only).
+  var SEARCH_DEBOUNCE_MS = 250;
+
+  var summarySlot = document.getElementById('summary-slot');
+  var columnsSlot = document.getElementById('columns-slot');
+  var statusLine = document.getElementById('refresh-status');
   var toastHost = document.getElementById('toast-host');
+  var qInput = document.querySelector('.searchbar__q');
+  var sourceSel = document.querySelector('.searchbar__source');
+  var searchForm = document.querySelector('.searchbar');
+  var userMenu = document.querySelector('.usermenu');
+  var userMenuButton = document.querySelector('.usermenu__btn');
+
+  // Browser-local clocks only. These describe browser receipt / a browser update attempt — never
+  // source freshness, sync, or "last updated" time.
+  var lastReceivedAt = new Date();
+  // 'ok' steady | 'stale' after a failed attempt | 'recovered' first success after a failure.
+  var viewState = 'ok';
+  var readGen = 0;
+
+  function fmtClock(d) { try { return d.toLocaleTimeString(); } catch (e) { return ''; } }
+
+  function setStatus(text) {
+    if (!statusLine) return;
+    statusLine.hidden = false;
+    statusLine.textContent = text;
+  }
+  function clearStatus() {
+    if (!statusLine) return;
+    statusLine.textContent = '';
+    statusLine.hidden = true;
+  }
+
+  // --- transient write feedback via the Odyssey .toast kit (text as textContent only) ----------
   function toast(text, kind) {
     if (!toastHost) return;
     var el = document.createElement('div');
@@ -69,106 +114,230 @@
       setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 200);
     }, 2600);
   }
-  async function refresh() {
-    try {
-      // Carry the current ?q= / ?source= so a live refresh preserves the active filter.
-      var res = await fetch('/api/inbox' + window.location.search, {
-        headers: { 'Accept': 'application/json' },
-        credentials: 'same-origin',
-        cache: 'no-store'
-      });
-      if (!res.ok) return;
-      var data = await res.json();
-      apply('summary-slot', data.summary);
-      apply('columns-slot', data.columns);
-    } catch (e) {
-      /* transient error — keep the current view */
-    }
-  }
-  // In-place row actions (mark-read / dismiss). Delegated so it keeps working after the columns
-  // fragment is swapped by a poll. On success the row is removed immediately and a refresh
-  // reconciles the counts; the double-submit CSRF token rides the X-CSRF-Token header.
-  async function onActionClick(ev) {
-    var btn = ev.target.closest('.row__act');
-    if (!btn) return;
-    var row = btn.closest('.row');
-    if (!row) return;
-    var action = btn.getAttribute('data-action'); // "read" | "dismiss"
-    var source = row.getAttribute('data-source');
-    var key = row.getAttribute('data-key');
-    if (!source || !key) return;
-    ev.preventDefault();
-    // Disable the row's buttons while the request is in flight.
-    row.querySelectorAll('.row__act').forEach(function (b) { b.disabled = true; });
-    try {
-      var res = await fetch('/api/inbox/' + action, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-CSRF-Token': csrf()
-        },
-        credentials: 'same-origin',
-        cache: 'no-store',
-        body: JSON.stringify({ source: source, key: key })
-      });
-      if (res.ok) {
-        row.parentNode && row.parentNode.removeChild(row);
-        toast(action === 'dismiss' ? 'Dismissed' : 'Marked read');
-        refresh();
-      } else {
-        row.querySelectorAll('.row__act').forEach(function (b) { b.disabled = false; });
-        toast("Couldn't update — try again", 'err');
-      }
-    } catch (e) {
-      row.querySelectorAll('.row__act').forEach(function (b) { b.disabled = false; });
-      toast("Couldn't update — check your connection", 'err');
-    }
-  }
-  var cols = document.getElementById('columns-slot');
-  if (cols) cols.addEventListener('click', onActionClick);
-  setInterval(refresh, INTERVAL_MS);
 
-  // --- Debounced live search ------------------------------------------------
-  // Typing in the unified search box (or changing the source filter) fetches the same JSON
-  // aggregate and swaps the summary + columns in place — no full reload. The GET <form> still
-  // works with JS off; here we just enhance it. The shareable URL is kept in sync via replaceState
-  // so the ~20 s live poll (which reads window.location.search) preserves the active query.
-  var qInput = document.querySelector('.searchbar__q');
-  var sourceSel = document.querySelector('.searchbar__source');
-  var searchForm = document.querySelector('.searchbar');
-  function liveQuery() {
-    var params = new URLSearchParams();
-    if (qInput && qInput.value.trim()) params.set('q', qInput.value.trim());
-    if (sourceSel && sourceSel.value && sourceSel.value !== 'all') params.set('source', sourceSel.value);
-    return params.toString();
+  // --- controls / query snapshotting ------------------------------------------------------------
+  function currentControls() {
+    var q = qInput ? qInput.value.trim() : '';
+    var source = (sourceSel && sourceSel.value && sourceSel.value !== 'all') ? sourceSel.value : '';
+    return { q: q, source: source };
   }
-  function liveSearch() {
-    var qs = liveQuery();
-    fetch('/api/inbox' + (qs ? '?' + qs : ''), {
+  function parseControls(qs) {
+    var p = new URLSearchParams(qs || '');
+    var q = (p.get('q') || '').trim();
+    var source = p.get('source') || '';
+    if (source === 'all') source = '';
+    return { q: q, source: source };
+  }
+  function controlsEqual(a, b) { return a.q === b.q && a.source === b.source; }
+  function currentQuery() { return window.location.search.replace(/^\?/, ''); }
+
+  // A response may only touch the DOM when the COMPLETE request state still matches: the newest
+  // generation, the byte-exact document URL it was sent for, and the controls snapshot. Semantic
+  // query equivalence is deliberately insufficient: a navigation to a differently encoded or
+  // otherwise distinct URL must retire the old response even if it parses to the same controls.
+  function requestIsCurrent(request) {
+    return request.gen === readGen &&
+      window.location.href === request.sentUrl &&
+      controlsEqual(currentControls(), request.controlsSnapshot);
+  }
+
+  // --- payload validation: keys are EXACTLY {summary, columns, total_unread} --------------------
+  function validPayload(d) {
+    if (!d || typeof d !== 'object') return false;
+    if (Object.keys(d).length !== 3) return false;
+    if (typeof d.summary !== 'string') return false;
+    if (typeof d.columns !== 'string') return false;
+    if (typeof d.total_unread !== 'number' ||
+        !Number.isFinite(d.total_unread) || !Number.isInteger(d.total_unread)) return false;
+    return true;
+  }
+
+  // --- focus preservation across an atomic swap -------------------------------------------------
+  function captureFocus() {
+    var active = document.activeElement;
+    if (!columnsSlot || !active || active === document.body || !columnsSlot.contains(active)) {
+      return null;
+    }
+    var slip = active.closest ? active.closest('.slip') : null;
+    var btn = active.closest ? active.closest('.slip__act') : null;
+    return {
+      key: slip ? slip.getAttribute('data-key') : null,
+      source: slip ? slip.getAttribute('data-source') : null,
+      action: btn ? btn.getAttribute('data-action') : null
+    };
+  }
+  function restoreFocus(f) {
+    if (!f || !columnsSlot) return;
+    if (f.key !== null) {
+      var slips = columnsSlot.querySelectorAll('.slip');
+      for (var i = 0; i < slips.length; i++) {
+        if (slips[i].getAttribute('data-key') === f.key &&
+            slips[i].getAttribute('data-source') === f.source) {
+          var btn = f.action
+            ? slips[i].querySelector('.slip__act[data-action="' + f.action + '"]')
+            : null;
+          if (btn) { btn.focus(); return; }
+        }
+      }
+    }
+    var annun = document.querySelector('.annun[tabindex="-1"]');
+    if (annun) annun.focus();
+  }
+
+  // --- atomic apply: both slots replaced in one synchronous block (no interleaved await) --------
+  function applyView(d) {
+    var f = captureFocus();
+    if (summarySlot) summarySlot.innerHTML = d.summary;
+    if (columnsSlot) columnsSlot.innerHTML = d.columns;
+    restoreFocus(f);
+  }
+
+  // --- unified read: poll, search, and reconcile all flow through here -------------------------
+  function loadView() {
+    var request = {
+      gen: ++readGen,
+      sentUrl: window.location.href,
+      controlsSnapshot: currentControls()
+    };
+    var queryString = currentQuery();
+    fetch('/api/inbox' + (queryString ? ('?' + queryString) : ''), {
       headers: { 'Accept': 'application/json' },
       credentials: 'same-origin',
       cache: 'no-store'
     })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (data) {
-        if (!data) return;
-        apply('summary-slot', data.summary);
-        apply('columns-slot', data.columns);
-        try { history.replaceState(null, '', qs ? ('/?' + qs) : '/'); } catch (e) {}
+      .then(function (res) {
+        if (!res.ok) throw new Error('http ' + res.status);
+        return res.json();
       })
-      .catch(function () { /* keep the last good view */ });
+      .then(function (data) {
+        if (!validPayload(data)) throw new Error('invalid payload');
+        // Superseded by a newer request, or the user has moved past this query: drop it silently.
+        // A dropped stale/racing response is NOT a failure and never writes the status line.
+        if (!requestIsCurrent(request)) return;
+        applyView(data);
+        lastReceivedAt = new Date();
+        if (viewState === 'stale') {
+          setStatus('A view was received in this browser at ' + fmtClock(lastReceivedAt) + '.');
+          viewState = 'recovered';
+        } else if (viewState === 'recovered') {
+          clearStatus();
+          viewState = 'ok';
+        }
+      })
+      .catch(function () {
+        // Only the newest request's failure keeps the view and reports it may be stale.
+        if (!requestIsCurrent(request)) return;
+        var t1 = fmtClock(new Date());
+        var t0 = fmtClock(lastReceivedAt);
+        setStatus('An update attempted in this browser at ' + t1 +
+          ' did not produce a usable view. The view on screen was received in this browser at ' +
+          t0 + ' and may be stale; source freshness is unknown.');
+        viewState = 'stale';
+      });
+  }
+
+  // --- 20 s poll: reads the address bar so a shared/filtered URL keeps its query ---------------
+  setInterval(loadView, INTERVAL_MS);
+
+  // --- in-place actions (mark seen / dismiss); delegated so it survives a fragment swap ---------
+  function csrf() {
+    var m = document.querySelector('meta[name="csrf-token"]');
+    return m ? m.getAttribute('content') : '';
+  }
+  function onActionClick(ev) {
+    var btn = ev.target.closest ? ev.target.closest('.slip__act') : null;
+    if (!btn) return;
+    var slip = btn.closest('.slip');
+    if (!slip) return;
+    var action = btn.getAttribute('data-action'); // "read" | "dismiss"
+    var source = slip.getAttribute('data-source');
+    var key = slip.getAttribute('data-key');
+    if (!source || !key) return;
+    ev.preventDefault();
+    slip.setAttribute('aria-busy', 'true');
+    var buttons = slip.querySelectorAll('.slip__act');
+    buttons.forEach(function (b) { b.disabled = true; });
+    fetch('/api/inbox/' + action, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf() },
+      credentials: 'same-origin',
+      cache: 'no-store',
+      body: JSON.stringify({ source: source, key: key })
+    })
+      .then(function (res) {
+        if (res.ok) {
+          if (slip.parentNode) slip.parentNode.removeChild(slip);
+          toast(action === 'dismiss'
+            ? 'Dismissed from this Atrium view.'
+            : 'Marked seen in this Atrium view.');
+          loadView();
+          return;
+        }
+        slip.removeAttribute('aria-busy');
+        buttons.forEach(function (b) { b.disabled = false; });
+        toast(res.status === 403
+          ? "Couldn't update — reload the page and try again."
+          : "Couldn't update — try again.", 'err');
+      })
+      .catch(function () {
+        slip.removeAttribute('aria-busy');
+        buttons.forEach(function (b) { b.disabled = false; });
+        toast("Couldn't update — check your connection.", 'err');
+      });
+  }
+  if (columnsSlot) columnsSlot.addEventListener('click', onActionClick);
+
+  // --- debounced search: enhances the plain GET form (no-JS falls back to the GET) -------------
+  function liveQuery() {
+    var params = new URLSearchParams();
+    var c = currentControls();
+    if (c.q) params.set('q', c.q);
+    if (c.source) params.set('source', c.source);
+    return params.toString();
+  }
+  function liveSearch() {
+    var qs = liveQuery();
+    // Keep the shareable URL matching the query BEFORE sending, so the exact URL lock agrees.
+    try { history.replaceState(null, '', qs ? ('/?' + qs) : '/'); } catch (e) {}
+    loadView();
   }
   var searchTimer;
   if (qInput) {
     qInput.addEventListener('input', function () {
       clearTimeout(searchTimer);
-      searchTimer = setTimeout(liveSearch, 250);
+      searchTimer = setTimeout(liveSearch, SEARCH_DEBOUNCE_MS);
     });
   }
   if (sourceSel) sourceSel.addEventListener('change', liveSearch);
   if (searchForm) {
-    // Enter submits without a reload when JS is on (no-JS falls back to the plain GET).
-    searchForm.addEventListener('submit', function (ev) { ev.preventDefault(); clearTimeout(searchTimer); liveSearch(); });
+    searchForm.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      clearTimeout(searchTimer);
+      liveSearch();
+    });
+  }
+
+  // Back/Forward restores the server-visible controls before issuing a read. The exact URL guard
+  // above still owns response eligibility; this handler only keeps the visible form truthful.
+  window.addEventListener('popstate', function () {
+    var restored = parseControls(currentQuery());
+    if (qInput) qInput.value = restored.q;
+    if (sourceSel) sourceSel.value = restored.source || 'all';
+    loadView();
+  });
+
+  // The Odyssey menu is exposed by :focus-within. Mirror that real open state onto the trigger so
+  // assistive technology never hears a permanently false aria-expanded value while traversing it.
+  function syncMenuExpanded() {
+    if (!userMenu || !userMenuButton) return;
+    userMenuButton.setAttribute(
+      'aria-expanded',
+      userMenu.contains(document.activeElement) ? 'true' : 'false'
+    );
+  }
+  if (userMenu && userMenuButton) {
+    userMenu.addEventListener('focusin', syncMenuExpanded);
+    userMenu.addEventListener('focusout', function () { setTimeout(syncMenuExpanded, 0); });
   }
 })();
 </script>

@@ -2,9 +2,10 @@
 //!
 //! `health` is the unauthenticated liveness probe; `dashboard` renders the unified activity inbox.
 //!
-//! The shared design tokens / CSS are embedded (via `include_str!`) and inlined into every page,
-//! matching the Steadholme service UI kit (the same polished, light-canvas look as the apex portal):
-//! shield wordmark, refined app-bar (All-apps pill + user chip), indigo accent, cards, WCAG-AA contrast.
+//! The shared Odyssey Foundation tokens / CSS are embedded (via `include_str!`) and inlined into
+//! every page, with Atrium's service layer on top. The inbox renders as the Dispatch Rotunda — an
+//! annunciator summary panel over one dispatches table — on Odyssey's mineral-paper canvas, with a
+//! refined app-bar (All-apps pill + user chip) and WCAG-AA contrast.
 
 pub mod actions;
 pub mod api;
@@ -133,7 +134,8 @@ pub fn topbar(page_title: &str, email: &str) -> String {
     <span class="app-tile" style="--app:#2563eb;--app-soft:#e6effe" aria-hidden="true">{tile}</span>
     <span class="appbar__name"><b>Atrium</b><span>inbox.w33d.xyz</span></span>
   </a>
-  <nav class="appbar__nav" aria-label="Atrium"><a class="appnav is-active" href="/">{tab}Inbox</a></nav>
+  <nav class="appbar__nav" aria-label="Atrium"><a class="appnav is-active" href="/" aria-current="page">{tab}Inbox</a></nav>
+  <a class="skip-link" href='#columns-slot'>Skip to the inbox table</a>
   <div class="appbar__spacer"></div>
   <div class="appbar__right">
     <a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps">{grid}</a>
@@ -239,5 +241,19 @@ mod tests {
         assert_eq!(rel_time(1000, 1000 + 600), "10m");
         assert_eq!(rel_time(1000, 1000 + 7200), "2h");
         assert_eq!(rel_time(1000, 1000 + 3 * 86400), "3d");
+    }
+
+    #[test]
+    fn topbar_freezes_current_navigation_and_primary_keyboard_prefix() {
+        let html = topbar("Inbox", "browser@example.invalid");
+        let brand = html.find(r#"class="appbar__brand""#).expect("brand link");
+        let nav = html
+            .find(r#"class="appnav is-active""#)
+            .expect("current inbox nav");
+        let skip = html.find(r#"class="skip-link""#).expect("skip link");
+        assert!(brand < nav && nav < skip, "brand → nav → skip DOM order");
+        assert!(html.contains(r#"aria-current="page""#));
+        assert!(html.contains("href='#columns-slot'"));
+        assert!(html.contains(r#"aria-haspopup="menu" aria-expanded="false""#));
     }
 }
